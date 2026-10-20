@@ -1,25 +1,16 @@
 #!/usr/bin/env bash
 #
-# emby-proxy 一键安装/卸载脚本
-# ============================================================
-#  纯路径反代：把目标地址塞进路径里转发
-#    原:  https://www.example.com/emby/Users
-#    改:  http://<本机>:8520/https://www.example.com/emby/Users
+# emby-proxy 一键安装/卸载脚本（性能优化版）
 #
-#  功能：
-#    - 交互菜单：安装 / 更新 / 卸载 / 状态 / 日志
-#    - 安装时可交互输入监听端口（默认 8520）与管理密码（默认随机）
-#    - 自动安装 Go 工具链并编译静态二进制（无需预装）
-#    - 适配 apt / dnf / yum / pacman / apk 各发行版
-#    - WebSocket、流媒体 Range 透传；管理后台带白名单与大陆 IP 限制
-#
-#  用法：
-#    sudo ./emby-proxy.sh                  # 交互菜单
-#    sudo ./emby-proxy.sh install          # 安装或重新安装（会询问端口/密码）
-#    sudo ./emby-proxy.sh install --port 9000 --admin-pass xxx
-#    sudo ./emby-proxy.sh update           # 只更新程序，配置与数据不动
-#    sudo ./emby-proxy.sh uninstall        # 彻底卸载（含配置、密码、统计）
-#    sudo ./emby-proxy.sh status|restart
+# 优化点：
+#   - FlushInterval: -1 → 50ms（吞吐↑ CPU↓）
+#   - BufferPool 复用 32KB 缓冲（GC↓）
+#   - Transport：MaxIdleConns 512 / PerHost 256 / TLS Session 缓存
+#   - 配置读取 atomic.Pointer，请求路径零锁
+#   - IP 归属地在线查询异步化，请求路径不阻塞
+#   - 统计裁剪移出请求路径，放入后台 saver
+#   - http.Server 安全参数收紧
+#   - systemd unit 加 GOGC=200
 #
 set -euo pipefail
 SERVICE_NAME="emby-proxy"
@@ -37,7 +28,6 @@ GO_FALLBACK_VERSION="1.23.4"
 IPLOC_VERSION="latest"
 BUILD_TMPDIR=""
 GENERATED_PASS=0
-# 先给默认值，避免任何函数被单独调用时变量未定义
 PORT=$DEFAULT_PORT
 BIN_PATH=$DEFAULT_BIN
 ADMIN_USER="admin"
@@ -97,7 +87,6 @@ parse_install_args() {
   [[ -n "$BIN_PATH" ]] || BIN_PATH=$DEFAULT_BIN
   ADMIN_USER="admin"; ADMIN_PASS=""; PREBUILT=""; FORCE=0; BINARY_ONLY=0
   PORT_GIVEN=0; PASS_GIVEN=0
-  # 取值型参数允许空值（例如 --admin-pass "" 表示自动生成），但要防止漏传
   need_value() {
     if [[ $# -lt 2 ]]; then die "参数 $1 后面需要一个值"; fi
   }
@@ -119,7 +108,6 @@ stop_and_disable() {
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
 }
-# ============ Go 自动安装 ============
 go_version_ok() {
   command -v go >/dev/null 2>&1 || return 1
   local v major minor; v="$(go env GOVERSION 2>/dev/null || true)"; v="${v#go}"
@@ -185,19 +173,12 @@ ensure_go() {
   go_version_ok || die "Go 自动安装失败"
   info "Go 就绪: $(go env GOVERSION)"
 }
+
 # ============ 内嵌 Go 源码 ============
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
-// Package main 实现一个 Emby 路径反代服务。
-//
-// 客户端把目标地址塞进路径，例如：
-//
-//	原:  https://www.example.com/emby/Users
-//	改:  http://<本机>:8520/https://www.example.com/emby/Users
-//
-// 特性：WebSocket/流媒体透传、管理后台（白名单、大陆 IP 限制、端口热切换、
-// 流量与拦截统计、IP 归属地）、按天统计与时间筛选。
+// Package main 实现一个 Emby 路径反代服务（性能优化版）。
 package main
 
 import (
@@ -276,9 +257,6 @@ func splitAuthority(s string) (authority, path string) {
 	return s, ""
 }
 
-// 解析 /https://host/path 形式的路径，兼容 https:/ 少写斜杠
-// 浏览器会直接向反代本身要这些文件（favicon.ico / robots.txt 等），
-// 它们不是转发目标；不做拦截、不写记录、不计数，直接 404
 var builtinAssets = map[string]bool{
 	"favicon.ico": true, "favicon.png": true, "favicon.svg": true,
 	"favicon-16x16.png": true, "favicon-32x32.png": true, "favicon-96x96.png": true,
@@ -299,7 +277,6 @@ func isBuiltinAssetPath(p string) bool {
 		}
 		return strings.HasSuffix(p, ".ico")
 	}
-	// ACME 等验证文件也只出现在反代自身
 	return strings.HasPrefix(p, ".well-known/")
 }
 
@@ -318,8 +295,6 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 
 	var scheme, body string
 	body = rest
-	// 容错：允许「/http:/host」「/http:/http://host」「//host」等写法，
-	// 用户手抄地址时经常多写或少写斜杠
 	for i := 0; i < 3; i++ {
 		lower := strings.ToLower(body)
 		switch {
@@ -364,20 +339,19 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	return u, nil
 }
 
-// ============ 配置 ============
+// ============ 配置（atomic.Pointer 无锁读取）============
 type Config struct {
-	Port      int      `json:"port"`       // 0 = 用启动参数
-	ChinaOnly bool     `json:"china_only"` // 只允许中国大陆 IP
+	Port      int      `json:"port"`
+	ChinaOnly bool     `json:"china_only"`
 	Whitelist []string `json:"whitelist"`
-	GeoAPI    bool     `json:"geo_api"` // 离线库查不到时用在线接口兜底
+	GeoAPI    bool     `json:"geo_api"`
 	GeoAPIURL string   `json:"geo_api_url"`
 }
 
 var startedAt = time.Now()
 
 var (
-	cfg     Config
-	cfgMu   sync.RWMutex
+	cfgPtr  atomic.Pointer[Config]
 	cfgPath string
 	proxyTr = &switchTransport{}
 
@@ -387,13 +361,19 @@ var (
 	globalSrv *http.Server
 )
 
+func currentCfg() *Config {
+	if p := cfgPtr.Load(); p != nil {
+		return p
+	}
+	return &Config{}
+}
+
 func currentPort() int {
 	listenMu.Lock()
 	defer listenMu.Unlock()
 	return curPort
 }
 
-// 在指定端口监听；成功后再关闭旧监听，失败保持原样
 func startListen(srv *http.Server, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -418,14 +398,19 @@ func startListen(srv *http.Server, port int) error {
 
 func loadConfig(path string) {
 	cfgPath = path
+	c := &Config{}
 	if b, err := os.ReadFile(path); err == nil {
-		json.Unmarshal(b, &cfg)
+		_ = json.Unmarshal(b, c)
 	}
+	cfgPtr.Store(c)
 	refreshRuntime()
 }
 
-func saveConfigLocked() error {
-	b, _ := json.MarshalIndent(cfg, "", "  ")
+func saveConfig(c *Config) error {
+	if cfgPath == "" {
+		return fmt.Errorf("配置文件路径未初始化")
+	}
+	b, _ := json.MarshalIndent(c, "", "  ")
 	tmp := cfgPath + ".tmp"
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		return err
@@ -437,7 +422,7 @@ func refreshRuntime() {
 	proxyTr.v.Store(newTransport())
 }
 
-// ============ 白名单（针对转发目标域名）============
+// ============ 白名单 ============
 func normalizeHost(hostport string) string {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
@@ -446,7 +431,6 @@ func normalizeHost(hostport string) string {
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
-// 常见二级后缀，避免引入 golang.org/x/net
 var multiSuffix = map[string]bool{
 	"co.uk": true, "org.uk": true, "me.uk": true, "ac.uk": true, "gov.uk": true,
 	"ltd.uk": true, "plc.uk": true, "net.uk": true, "sch.uk": true,
@@ -477,7 +461,6 @@ func rootDomain(hostport string) string {
 	return strings.Join(parts[n-2:], ".")
 }
 
-// 白名单为空 → 全部放行
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
@@ -500,24 +483,20 @@ func whitelistMatch(list []string, targetHost string) bool {
 }
 
 func whitelistAllowed(targetHost string) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	return whitelistMatch(cfg.Whitelist, targetHost)
+	return whitelistMatch(currentCfg().Whitelist, targetHost)
 }
 
 // ============ 统计 ============
-// BlockEvent 是一条被拦截的请求记录
 type BlockEvent struct {
-	Time       string `json:"time"`        // 拦截时间
-	IP         string `json:"ip"`          // 来源 IP
-	Country    string `json:"country"`     // 来源地区代码
-	Path       string `json:"path"`        // 被拦截的完整请求路径
-	Reason     string `json:"reason"`      // 原因代码：cn / whitelist
-	ReasonText string `json:"reason_text"` // 原因的人话说明，管理页直接展示
-	UA         string `json:"ua"`          // 客户端 User-Agent
+	Time       string `json:"time"`
+	IP         string `json:"ip"`
+	Country    string `json:"country"`
+	Path       string `json:"path"`
+	Reason     string `json:"reason"`
+	ReasonText string `json:"reason_text"`
+	UA         string `json:"ua"`
 }
 
-// 按天聚合，供流量统计的时间筛选使用
 type DayStat struct {
 	Requests  int64            `json:"requests"`
 	Bytes     int64            `json:"bytes"`
@@ -540,7 +519,7 @@ type Stats struct {
 	IPCounts         map[string]int64    `json:"ip_counts"`
 	Daily            map[string]*DayStat `json:"daily,omitempty"`
 	Blocks           []BlockEvent        `json:"blocks"`
-	RecentBlocks     []BlockEvent        `json:"recent_blocks,omitempty"` // 仅用于读取旧文件
+	RecentBlocks     []BlockEvent        `json:"recent_blocks,omitempty"`
 }
 
 var (
@@ -552,7 +531,7 @@ var (
 func loadStats(path string) {
 	statsPath = path
 	if b, err := os.ReadFile(path); err == nil {
-		json.Unmarshal(b, &stats)
+		_ = json.Unmarshal(b, &stats)
 	}
 	if stats.CountryCounts == nil {
 		stats.CountryCounts = map[string]int64{}
@@ -567,7 +546,6 @@ func loadStats(path string) {
 		stats.Daily = map[string]*DayStat{}
 	}
 	pruneDailyLocked()
-	// 旧版本只有 recent_blocks，迁移过来
 	if len(stats.Blocks) == 0 && len(stats.RecentBlocks) > 0 {
 		stats.Blocks = stats.RecentBlocks
 	}
@@ -577,7 +555,6 @@ func loadStats(path string) {
 
 const maxDayIPs = 300
 
-// 取当天聚合桶；顺带清理一年前的数据
 func dayLocked() *DayStat {
 	key := time.Now().Format("2006-01-02")
 	if stats.Daily == nil {
@@ -609,7 +586,6 @@ func pruneDailyLocked() {
 	}
 }
 
-// IP 太多时只留高频的，避免 stats.json 无限膨胀
 func trimDayIPs(d *DayStat) {
 	if len(d.IPs) <= maxDayIPs {
 		return
@@ -639,6 +615,7 @@ func rolloverLocked() {
 	}
 }
 
+// 请求路径：只自增，不排序、不裁剪
 func recordRequestStart(ip, country string) {
 	statsMu.Lock()
 	defer statsMu.Unlock()
@@ -655,23 +632,6 @@ func recordRequestStart(ip, country string) {
 	d.Requests++
 	d.Countries[country]++
 	d.IPs[ip]++
-	trimDayIPs(d)
-	if len(stats.IPCounts) > 2000 {
-		type kv struct {
-			k string
-			v int64
-		}
-		arr := make([]kv, 0, len(stats.IPCounts))
-		for k, v := range stats.IPCounts {
-			arr = append(arr, kv{k, v})
-		}
-		sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
-		nm := make(map[string]int64, 500)
-		for i := 0; i < 500 && i < len(arr); i++ {
-			nm[arr[i].k] = arr[i].v
-		}
-		stats.IPCounts = nm
-	}
 }
 
 func recordBytes(bytes int64) {
@@ -688,7 +648,6 @@ func recordBytes(bytes int64) {
 
 const maxBlocks = 5000
 
-// 只保留一年内的记录
 func pruneBlocksLocked() {
 	cutoff := time.Now().AddDate(-1, 0, 0).Format("2006-01-02 15:04:05")
 	for len(stats.Blocks) > 0 && stats.Blocks[len(stats.Blocks)-1].Time < cutoff {
@@ -726,7 +685,6 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	if len(stats.Blocks) > maxBlocks {
 		stats.Blocks = stats.Blocks[:maxBlocks]
 	}
-	pruneBlocksLocked()
 }
 
 func saveStatsLocked() {
@@ -736,16 +694,42 @@ func saveStatsLocked() {
 	b, _ := json.Marshal(stats)
 	tmp := statsPath + ".tmp"
 	if err := os.WriteFile(tmp, b, 0644); err == nil {
-		os.Rename(tmp, statsPath)
+		_ = os.Rename(tmp, statsPath)
+	}
+}
+
+// 后台裁剪：把请求路径上的排序/清理工作全部挪到这里
+func pruneStatsLocked() {
+	pruneDailyLocked()
+	pruneBlocksLocked()
+	if d := stats.Daily[time.Now().Format("2006-01-02")]; d != nil {
+		trimDayIPs(d)
+	}
+	if len(stats.IPCounts) > 2000 {
+		type kv struct {
+			k string
+			v int64
+		}
+		arr := make([]kv, 0, len(stats.IPCounts))
+		for k, v := range stats.IPCounts {
+			arr = append(arr, kv{k, v})
+		}
+		sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+		nm := make(map[string]int64, 500)
+		for i := 0; i < 500 && i < len(arr); i++ {
+			nm[arr[i].k] = arr[i].v
+		}
+		stats.IPCounts = nm
 	}
 }
 
 func startStatsSaver() {
 	go func() {
-		t := time.NewTicker(15 * time.Second)
+		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
 		for range t.C {
 			statsMu.Lock()
+			pruneStatsLocked()
 			saveStatsLocked()
 			statsMu.Unlock()
 			geoCacheSave()
@@ -753,8 +737,6 @@ func startStatsSaver() {
 	}()
 }
 
-// 只有连接来自本机/内网（前面确实有反代）时才信任转发头，
-// 否则任何人都能伪造 X-Forwarded-For 绕过「仅中国大陆」限制
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -776,8 +758,6 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
-// 注意：iploc.Country 的参数是 net.IP，不是 IP 字符串
-// 注意：iploc.Country 的参数是 net.IP，不是 IP 字符串
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -790,7 +770,6 @@ func countryOf(ipStr string) string {
 	return c
 }
 
-// 国家/地区代码 → 中文名
 var countryNames = map[string]string{
 	"CN": "中国", "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门",
 	"SG": "新加坡", "JP": "日本", "KR": "韩国", "KP": "朝鲜", "MN": "蒙古",
@@ -819,7 +798,6 @@ var countryNames = map[string]string{
 	"DZ": "阿尔及利亚", "TN": "突尼斯", "LY": "利比亚", "SD": "苏丹", "SN": "塞内加尔",
 	"CI": "科特迪瓦", "CM": "喀麦隆", "ZW": "津巴布韦", "ZM": "赞比亚", "MZ": "莫桑比克",
 	"AO": "安哥拉", "MG": "马达加斯加", "MU": "毛里求斯", "RW": "卢旺达", "SO": "索马里",
-	// 特殊标记
 	"PV": "内网", "LO": "本机", "??": "未知",
 }
 
@@ -833,8 +811,7 @@ func countryName(code string) string {
 	return code
 }
 
-// 把 IP 归类：本机 / 内网 / 具体国家。返回统计用的代码和展示用的名称
-// ============ 在线 IP 归属地（离线库查不到时兜底）============
+// ============ 在线 IP 归属地 ============
 const defaultGeoAPI = "http://ip-api.com/json/{ip}?lang=zh-CN&fields=status,country,countryCode"
 
 type geoEntry struct {
@@ -848,12 +825,15 @@ var (
 	geoMap      = map[string]geoEntry{}
 	geoPath     string
 	geoInflight int32
+
+	geoPendingMu sync.Mutex
+	geoPending   = map[string]bool{}
 )
 
 func geoCacheLoad(path string) {
 	geoPath = path
 	if b, err := os.ReadFile(path); err == nil {
-		json.Unmarshal(b, &geoMap)
+		_ = json.Unmarshal(b, &geoMap)
 	}
 	if geoMap == nil {
 		geoMap = map[string]geoEntry{}
@@ -869,7 +849,7 @@ func geoCacheSave() {
 	}
 	tmp := geoPath + ".tmp"
 	if err := os.WriteFile(tmp, b, 0644); err == nil {
-		os.Rename(tmp, geoPath)
+		_ = os.Rename(tmp, geoPath)
 	}
 }
 
@@ -882,7 +862,6 @@ func geoPickString(m map[string]any, keys ...string) string {
 	return ""
 }
 
-// 在线查询的运行状态，管理页用来判断接口通不通
 type geoStatT struct {
 	mu      sync.Mutex
 	ok      int64
@@ -918,11 +897,8 @@ func truncStr(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// 真正发一次请求；错误信息要具体，方便判断是网络不通还是格式不对
 func geoFetch(ipStr string) (string, string, error) {
-	cfgMu.RLock()
-	tpl := strings.TrimSpace(cfg.GeoAPIURL)
-	cfgMu.RUnlock()
+	tpl := strings.TrimSpace(currentCfg().GeoAPIURL)
 	if tpl == "" {
 		tpl = defaultGeoAPI
 	}
@@ -964,48 +940,20 @@ func geoFetch(ipStr string) (string, string, error) {
 	return code, name, nil
 }
 
-// 调第三方接口查归属地；查不到/超时返回 ok=false，绝不影响转发
-func geoLookup(ipStr string) (string, string, bool) {
+func geoFetchAndCache(ipStr string) {
 	now := time.Now().Unix()
-	geoMu.RLock()
-	e, cached := geoMap[ipStr]
-	geoMu.RUnlock()
-	if cached {
-		if e.Code == "??" {
-			if now-e.At < 3600 { // 失败过，一小时后再试
-				return "", "", false
-			}
-		} else if now-e.At < 30*86400 {
-			return e.Code, e.Name, true
-		}
-	}
-
-	cfgMu.RLock()
-	enabled := cfg.GeoAPI
-	cfgMu.RUnlock()
-	if !enabled {
-		return "", "", false
-	}
-	// 并发保护：同时查询不超过 8 个，避免拖慢转发
-	if atomic.LoadInt32(&geoInflight) > 8 {
-		return "", "", false
-	}
-	atomic.AddInt32(&geoInflight, 1)
-	defer atomic.AddInt32(&geoInflight, -1)
-
 	code, name, err := geoFetch(ipStr)
 	if err != nil {
 		geoStatRecord(false, err.Error())
 		geoMu.Lock()
 		geoMap[ipStr] = geoEntry{Code: "??", At: now}
 		geoMu.Unlock()
-		return "", "", false
+		return
 	}
 	geoStatRecord(true, "")
-
 	geoMu.Lock()
 	geoMap[ipStr] = geoEntry{Code: code, Name: name, At: now}
-	if len(geoMap) > 5000 { // 控制体积：超了就整体清掉最旧的一半
+	if len(geoMap) > 5000 {
 		cutoff := now - 15*86400
 		for k, v := range geoMap {
 			if v.At < cutoff {
@@ -1014,9 +962,71 @@ func geoLookup(ipStr string) (string, string, bool) {
 		}
 	}
 	geoMu.Unlock()
-	return code, name, true
 }
 
+// 同步查询：仅 regeoAll / geotest 使用
+func geoLookup(ipStr string) (string, string, bool) {
+	now := time.Now().Unix()
+	geoMu.RLock()
+	e, cached := geoMap[ipStr]
+	geoMu.RUnlock()
+	if cached {
+		if e.Code == "??" {
+			if now-e.At < 3600 {
+				return "", "", false
+			}
+		} else if now-e.At < 30*86400 {
+			return e.Code, e.Name, true
+		}
+	}
+	if !currentCfg().GeoAPI {
+		return "", "", false
+	}
+	if atomic.LoadInt32(&geoInflight) >= 16 {
+		return "", "", false
+	}
+	atomic.AddInt32(&geoInflight, 1)
+	defer atomic.AddInt32(&geoInflight, -1)
+
+	geoFetchAndCache(ipStr)
+	geoMu.RLock()
+	e, ok := geoMap[ipStr]
+	geoMu.RUnlock()
+	if !ok || e.Code == "??" {
+		return "", "", false
+	}
+	return e.Code, e.Name, true
+}
+
+// 异步查询：请求路径调用，本次返回"未命中"，后台去查
+func geoLookupAsync(ipStr string) {
+	if !currentCfg().GeoAPI {
+		return
+	}
+	geoPendingMu.Lock()
+	if geoPending[ipStr] {
+		geoPendingMu.Unlock()
+		return
+	}
+	geoPending[ipStr] = true
+	geoPendingMu.Unlock()
+
+	go func() {
+		defer func() {
+			geoPendingMu.Lock()
+			delete(geoPending, ipStr)
+			geoPendingMu.Unlock()
+		}()
+		if atomic.LoadInt32(&geoInflight) >= 16 {
+			return
+		}
+		atomic.AddInt32(&geoInflight, 1)
+		defer atomic.AddInt32(&geoInflight, -1)
+		geoFetchAndCache(ipStr)
+	}()
+}
+
+// 请求路径：纯缓存查找 + 异步触发，绝不阻塞
 func ipLabel(ipStr string) (code, name string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -1028,18 +1038,47 @@ func ipLabel(ipStr string) (code, name string) {
 	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
 		return "PV", "内网"
 	}
-	c := countryOf(ipStr)
-	if c == "??" {
-		// 离线库没有这段 IP，交给在线接口
-		if gc, gn, ok := geoLookup(ipStr); ok {
-			return gc, gn
-		}
-		return "??", "未知"
+	if c := countryOf(ipStr); c != "??" {
+		return c, countryName(c)
 	}
-	return c, countryName(c)
+	now := time.Now().Unix()
+	geoMu.RLock()
+	e, ok := geoMap[ipStr]
+	geoMu.RUnlock()
+	if ok {
+		if e.Code != "??" && now-e.At < 30*86400 {
+			return e.Code, e.Name
+		}
+		if e.Code == "??" && now-e.At < 3600 {
+			return "??", "未知"
+		}
+	}
+	geoLookupAsync(ipStr)
+	return "??", "未知"
 }
 
-// ============ 国旗图片：服务端取一次并缓存，浏览器只请求本机 ============
+// 同步版本：仅 regeoAll 使用
+func ipLabelSync(ipStr string) (code, name string) {
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return "??", "未知"
+	}
+	if ip.IsLoopback() {
+		return "LO", "本机"
+	}
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return "PV", "内网"
+	}
+	if c := countryOf(ipStr); c != "??" {
+		return c, countryName(c)
+	}
+	if gc, gn, ok := geoLookup(ipStr); ok {
+		return gc, gn
+	}
+	return "??", "未知"
+}
+
+// ============ 国旗图片 ============
 var flagCache = struct {
 	sync.RWMutex
 	m map[string][]byte
@@ -1054,7 +1093,6 @@ func flagPng(code string) ([]byte, error) {
 	if ok {
 		return b, nil
 	}
-	// 磁盘缓存：取到过一次就永久可用，重启也不用再连外网
 	if flagDir != "" {
 		if d, err := os.ReadFile(filepath.Join(flagDir, code+".png")); err == nil && len(d) > 100 {
 			flagCache.Lock()
@@ -1091,7 +1129,7 @@ func flagPng(code string) ([]byte, error) {
 	return data, nil
 }
 
-// ============ 重新识别历史 IP ============
+// ============ 重新识别历史 IP（用同步版）============
 var (
 	regeoRunning int32
 	regeoTotal   int32
@@ -1106,7 +1144,6 @@ func regeoAll() {
 	}
 	statsMu.Unlock()
 
-	// 之前查失败的先清掉，让它们有机会重查
 	geoMu.Lock()
 	for k, v := range geoMap {
 		if v.Code == "??" {
@@ -1130,7 +1167,7 @@ func regeoAll() {
 		go func() {
 			defer wg.Done()
 			for ip := range jobs {
-				code, _ := ipLabel(ip)
+				code, _ := ipLabelSync(ip)
 				out <- res{code, ips[ip]}
 				atomic.AddInt32(&regeoDone, 1)
 			}
@@ -1210,7 +1247,7 @@ func basicAuth(next http.HandlerFunc, user, pass string) http.HandlerFunc {
 
 // ============ 反代 ============
 type switchTransport struct {
-	v atomic.Value // *http.Transport
+	v atomic.Value
 }
 
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -1221,6 +1258,26 @@ func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.RoundTrip(r)
 }
 
+// 32KB 复制缓冲池，减少每请求的 make([]byte, 32<<10)
+type bufferPool struct {
+	pool sync.Pool
+}
+
+func (b *bufferPool) Get() []byte {
+	if v := b.pool.Get(); v != nil {
+		return v.([]byte)
+	}
+	return make([]byte, 32*1024)
+}
+
+func (b *bufferPool) Put(p []byte) {
+	if cap(p) >= 32*1024 {
+		b.pool.Put(p[:32*1024])
+	}
+}
+
+var proxyBufPool = &bufferPool{}
+
 func newTransport() *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -1229,15 +1286,17 @@ func newTransport() *http.Transport {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   128,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   256,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 45 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// 不做透明压缩：客户端 Accept-Encoding 原样透传，避免大文件/视频流被改写
-		DisableCompression: true,
-		TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12},
+		DisableCompression:    true,
+		TLSClientConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			ClientSessionCache: tls.NewLRUClientSessionCache(256),
+		},
 	}
 }
 
@@ -1261,8 +1320,9 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport: tr,
-		// -1：收到就往下写，视频/直播流不缓冲
-		FlushInterval: -1,
+		// 50ms 批量 flush：视频延迟可忽略，吞吐/CPU 显著优于 -1
+		FlushInterval: 50 * time.Millisecond,
+		BufferPool:    proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
 			if !ok || t == nil {
@@ -1275,8 +1335,6 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 			pr.Out.Host = t.Host
 			pr.SetXForwarded()
-
-			pr.Out.Host = t.Host
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
 		},
 		ModifyResponse: func(resp *http.Response) error {
@@ -1284,7 +1342,6 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			if resp.Request != nil && resp.Request.URL != nil {
 				upHost = resp.Request.URL.Host
 			}
-			// 上游的绝对跳转改回相对，避免客户端跳出反代
 			if loc := resp.Header.Get("Location"); loc != "" && upHost != "" {
 				if lu, err := url.Parse(loc); err == nil && lu.Host != "" && strings.EqualFold(lu.Host, upHost) {
 					lu.Scheme = ""
@@ -1295,7 +1352,6 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 					resp.Header.Set("Location", lu.String())
 				}
 			}
-			// 去掉上游 Cookie 的 Domain，否则客户端可能不认
 			if cks, ok := resp.Header["Set-Cookie"]; ok && len(cks) > 0 {
 				for i, c := range cks {
 					cks[i] = cookieDomainRE.ReplaceAllString(c, "")
@@ -1341,10 +1397,8 @@ func adminHandler(user, pass string) http.HandlerFunc {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		cfgMu.RLock()
-		resp := adminConfigResp{Config: cfg, EffectivePort: currentPort()}
-		cfgMu.RUnlock()
-		json.NewEncoder(w).Encode(resp)
+		c := currentCfg()
+		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *c, EffectivePort: currentPort()})
 	})
 	mux.HandleFunc("/admin/api/save", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1360,31 +1414,25 @@ func adminHandler(user, pass string) http.HandlerFunc {
 			http.Error(w, "端口必须是 1-65535 之间的整数", http.StatusBadRequest)
 			return
 		}
-		newCfg := Config{
+		oldCfg := currentCfg()
+		newCfg := &Config{
 			Port:      req.Port,
 			ChinaOnly: req.ChinaOnly,
 			Whitelist: req.Whitelist,
 			GeoAPI:    req.GeoAPI,
 			GeoAPIURL: strings.TrimSpace(req.GeoAPIURL),
 		}
-		cfgMu.Lock()
-		oldCfg := cfg
-		cfg = newCfg
-		err := saveConfigLocked()
-		cfgMu.Unlock()
-		if err != nil {
+		if err := saveConfig(newCfg); err != nil {
 			http.Error(w, "保存失败: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		cfgPtr.Store(newCfg)
 		refreshRuntime()
 
-		// 端口变更：先在新端口监听成功，再关旧端口；失败则回滚配置
 		if newCfg.Port > 0 && newCfg.Port != currentPort() && globalSrv != nil {
 			if err := startListen(globalSrv, newCfg.Port); err != nil {
-				cfgMu.Lock()
-				cfg = oldCfg
-				_ = saveConfigLocked()
-				cfgMu.Unlock()
+				cfgPtr.Store(oldCfg)
+				_ = saveConfig(oldCfg)
 				refreshRuntime()
 				http.Error(w, "端口 "+strconv.Itoa(newCfg.Port)+" 无法监听（可能被占用或权限不足）: "+err.Error(), http.StatusBadRequest)
 				return
@@ -1393,7 +1441,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(adminConfigResp{Config: newCfg, EffectivePort: currentPort()})
+		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
 	})
 	mux.HandleFunc("/admin/api/flag/", func(w http.ResponseWriter, r *http.Request) {
 		code := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/admin/api/flag/"))
@@ -1408,7 +1456,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Cache-Control", "public, max-age=2592000")
-		w.Write(data)
+		_, _ = w.Write(data)
 	})
 	mux.HandleFunc("/admin/api/traffic", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1426,7 +1474,6 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		}
 		sort.Sort(sort.Reverse(sort.StringSlice(days)))
 		if from == "" && to == "" {
-			// 不限时间：用累计值，升级前的历史数据也能算进来
 			reqs, byts = stats.TotalRequests, stats.TotalBytes
 			cn, wl = stats.BlockedCN, stats.BlockedWhitelist
 			for ip, n := range stats.IPCounts {
@@ -1462,7 +1509,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		}
 		statsMu.Unlock()
 
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"today":             today,
 			"requests":          reqs,
 			"bytes":             byts,
@@ -1535,7 +1582,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 			end = total
 		}
 		items := append([]BlockEvent{}, matched[start:end]...)
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"total": total, "page": page, "size": size, "pages": pages,
 			"items": items, "dates": dates, "today": time.Now().Format("2006-01-02"),
 		})
@@ -1557,9 +1604,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 			http.Error(w, "IP 地址格式不正确", http.StatusBadRequest)
 			return
 		}
-		cfgMu.RLock()
-		tpl := strings.TrimSpace(cfg.GeoAPIURL)
-		cfgMu.RUnlock()
+		tpl := strings.TrimSpace(currentCfg().GeoAPIURL)
 		if tpl == "" {
 			tpl = defaultGeoAPI
 		}
@@ -1580,7 +1625,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 			out["name"] = name
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
+		_ = json.NewEncoder(w).Encode(out)
 	})
 	mux.HandleFunc("/admin/api/regeo", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1595,7 +1640,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 			}()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"started": started})
+		_ = json.NewEncoder(w).Encode(map[string]any{"started": started})
 	})
 	mux.HandleFunc("/admin/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1605,7 +1650,6 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		snap := stats
 		snap.Blocks = nil
 		snap.RecentBlocks = nil
-		// 按天数据只在流量接口里按需聚合，不塞进 5 秒一次的轮询
 		snap.Daily = nil
 		blocksTotal := len(stats.Blocks)
 		labels := map[string]string{}
@@ -1617,7 +1661,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 				labels[b.Country] = countryName(b.Country)
 			}
 		}
-		json.NewEncoder(w).Encode(struct {
+		_ = json.NewEncoder(w).Encode(struct {
 			Stats
 			CountryLabels map[string]string `json:"country_labels"`
 			Port          int               `json:"port"`
@@ -1645,7 +1689,7 @@ func adminHandler(user, pass string) http.HandlerFunc {
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Write(adminHTML)
+		_, _ = w.Write(adminHTML)
 	})
 	return basicAuth(mux.ServeHTTP, user, pass)
 }
@@ -1667,7 +1711,6 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 	proxy := buildProxy(proxyTr)
 
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 站点自有文件：不算请求、不记拦截
 		if isBuiltinAssetPath(r.URL.Path) {
 			http.NotFound(w, r)
 			return
@@ -1675,11 +1718,8 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 		ip := getClientIP(r)
 		country, _ := ipLabel(ip)
 
-		// 本机/内网视为可信（前面挂了 Nginx 时不至于把自己挡住）
-		cfgMu.RLock()
-		chinaOnly := cfg.ChinaOnly
-		cfgMu.RUnlock()
-		if chinaOnly && country != "CN" && country != "LO" && country != "PV" {
+		c := currentCfg()
+		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
 			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent())
 			http.Error(w, "仅允许中国大陆 IP 访问（可在管理页关闭此限制）", http.StatusForbidden)
 			return
@@ -1690,7 +1730,7 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 			helpPage(w)
 			return
 		}
-		if !whitelistAllowed(target.Host) {
+		if !whitelistMatch(c.Whitelist, target.Host) {
 			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent())
 			http.Error(w, "目标域名不在访问白名单内，已被拦截", http.StatusForbidden)
 			return
@@ -1703,8 +1743,6 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 		recordBytes(sw.bytes)
 	})
 
-	// 不用 ServeMux 分发：它会 cleanPath，把路径里的 // 改成 301，
-	// 对反代是致命的（会改写上游路径、打断带 // 的媒体地址）
 	adminSrv := adminHandler(adminUser, adminPass)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/admin" {
@@ -1718,17 +1756,15 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 		proxyHandler(w, r)
 	})
 
-	// 配置文件里的端口优先于启动参数，这样后台改端口重启后仍然生效
-	cfgMu.RLock()
-	if cfg.Port > 0 {
-		port = cfg.Port
+	if c := currentCfg(); c.Port > 0 {
+		port = c.Port
 	}
-	cfgMu.RUnlock()
 
 	srv := &http.Server{
 		Handler:           root,
-		ReadHeaderTimeout: 20 * time.Second,
-		IdleTimeout:       300 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    32 << 10,
 	}
 	globalSrv = srv
 	if err := startListen(srv, port); err != nil {
@@ -1753,13 +1789,15 @@ func main() {
 	adminPass := fs.String("admin-pass", "", "管理页密码")
 	configPath := fs.String("config", "/etc/emby-proxy/config.json", "配置文件路径")
 	statsFile := fs.String("stats", "/etc/emby-proxy/stats.json", "统计文件路径")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *adminPass == "" {
 		log.Fatal("必须通过 --admin-pass 指定管理页密码")
 	}
 	runServer(*port, *adminUser, *adminPass, *configPath, *statsFile)
 }
 GO_SOURCE
+
+# ⬇⬇⬇ PART 2 从这里开始：admin.html heredoc + 剩余 bash 函数 ⬇⬇⬇
 
   cat > "$dir/admin.html" <<'ADMIN_HTML'
 <!DOCTYPE html>
@@ -2357,11 +2395,9 @@ function flagBadge(text) {
   return '<span class="flag-badge">' + esc(text) + '</span>';
 }
 const LOCAL_CODES = { LO: 1, PV: 1, '??': 1 };
-// 拦截原因：短标签用于表格，完整说明用于详情
 function reasonLabel(b) {
   return b.reason === 'cn' ? '大陆限制' : '未授权';
 }
-// 用服务端代理的图片（Windows 不渲染国旗 emoji，必须用图）
 function flagHtml(code) {
   if (!code) return flagBadge('?');
   if (code === 'LO') return flagBadge('本');
@@ -2371,7 +2407,6 @@ function flagHtml(code) {
   const lc = code.toLowerCase();
   return '<img class="flag-img" src="/admin/api/flag/' + lc + '" alt="' + code + '" width="20" height="15" loading="lazy">';
 }
-// 图片取不到时退回 emoji / 文字
 document.addEventListener('error', e => {
   const img = e.target;
   if (img && img.tagName === 'IMG' && img.classList.contains('flag-img')) {
@@ -2418,14 +2453,12 @@ function updateNav() {
     if (!el) return;
     const top = el.getBoundingClientRect().top;
     if (sectionInView(el)) visibleSections.add(id); else visibleSections.delete(id);
-    if (top <= 90) active = id;      // 已经划过吸顶栏的最后一个区块
+    if (top <= 90) active = id;
   });
-  // 滚到底部时强制高亮最后一个
   if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 8) {
     active = SECTIONS[SECTIONS.length - 1];
   }
   navTabs.forEach(b => b.classList.toggle('active', b.dataset.t === active));
-  // 刚滚进视野时立即取一次，避免看到 5 秒前的旧数据
   if (!hadTraffic && visibleSections.has('traffic')) loadTraffic();
   if (!hadBlocks && visibleSections.has('blocks')) { sigBlk = ''; loadBlocks(); }
 }
@@ -2466,7 +2499,6 @@ async function loadConfig() {
 
 let sigIP = '', sigReg = '', sigBlk = '';
 
-// ============ 流量统计（带时间筛选）============
 const trState = { range: { from: '', to: '' } };
 
 async function loadTraffic() {
@@ -2515,7 +2547,6 @@ async function loadStats() {
     const r = await fetch('/admin/api/stats', { cache: 'no-store' });
     if (!r.ok) return;
     const s = await r.json();
-    // 地区中文名后到：变了就强制重绘，否则会一直显示 CN 这种代码
     const nl = s.country_labels || {};
     if (JSON.stringify(nl) !== JSON.stringify(state.labels)) {
       state.labels = nl;
@@ -2612,8 +2643,6 @@ const dayStr = d => {
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
 };
-// “今天”以服务器日期为准：两边时区不同时按浏览器算会差一天，
-// 导致明明有数据、选今天却查不到
 function rangeOf(mode) {
   const t = state.serverToday || dayStr(new Date());
   const base = new Date(t + 'T00:00:00');
@@ -2876,6 +2905,7 @@ setInterval(loadStats, 5000);
 </html>
 ADMIN_HTML
 }
+
 compute_source_hash() {
   command -v sha256sum >/dev/null 2>&1 || die "缺少 sha256sum，无法校验源码版本"
   local d h
@@ -2899,7 +2929,6 @@ write_default_config() {
 }
 JSON
 }
-# systemd 的 ExecStart 用空白拆参数，密码含空格/引号/% 时必须转义，否则服务起不来
 systemd_quote() {
   local s="$1"
   s="${s//\\/\\\\}"
@@ -2907,6 +2936,7 @@ systemd_quote() {
   s="${s//%/%%}"
   printf '"%s"' "$s"
 }
+# 加了 Environment=GOGC=200
 make_unit() {
   local user_q pass_q
   user_q="$(systemd_quote "$ADMIN_USER")"
@@ -2918,6 +2948,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=simple
+Environment=GOGC=200
 ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${user_q} -admin-pass ${pass_q} -config ${CONFIG_FILE} -stats ${STATS_FILE}
 Restart=on-failure
 RestartSec=5s
@@ -2940,7 +2971,6 @@ build_binary() {
   info "初始化模块并解析依赖..."
   (
     cd "$BUILD_TMPDIR"
-    # 允许 Go 在需要时自动下载匹配的工具链，避免依赖要求更高版本时直接失败
     export GOTOOLCHAIN=auto
     export GOFLAGS=-mod=mod
     go mod init emby-proxy >/dev/null 2>&1 || true
@@ -2956,7 +2986,6 @@ build_binary() {
 }
 local_ip() {
   local ip=""
-  # hostname -I 是 GNU coreutils 的便捷写法；部分精简系统没有，逐级回退
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || true
   if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
     ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
@@ -2965,7 +2994,6 @@ local_ip() {
   printf '%s' "$ip"
 }
 port_listen() { (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
-# 重装时若没显式给 --port，沿用已装端口（配置优先，其次 unit）
 installed_port() {
   local p=""
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -2978,7 +3006,6 @@ installed_port() {
   fi
   if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then printf '%s' "$p"; else printf '%s' "$DEFAULT_PORT"; fi
 }
-# 实际生效的端口：配置 > 服务单元 > 本次参数
 effective_port() {
   local p=""
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -3017,8 +3044,6 @@ cmd_install() {
   require_root install
   require_systemd
 
-  # 交互终端里没显式给参数时，就地询问端口 / 密码
-  # 注意用 PASS_GIVEN 判断：显式传空密码表示「自动生成」，不能再问一遍
   if [[ -t 0 ]] && [[ $BINARY_ONLY -eq 0 ]] && [[ $PORT_GIVEN -eq 0 || $PASS_GIVEN -eq 0 ]]; then
     printf '\n'
     if [[ $PORT_GIVEN -eq 0 ]]; then
@@ -3055,7 +3080,7 @@ cmd_install() {
     write_default_config
     info "已创建配置文件: $CONFIG_FILE"
   elif [[ $BINARY_ONLY -eq 1 ]]; then
-    : # 更新模式：已有配置一律不动
+    :
   fi
   local expected_unit; expected_unit="$(make_unit)"
   local need_compile=0 need_reload=0 new_hash=""
@@ -3073,7 +3098,6 @@ cmd_install() {
   if [[ "$(cat "$UNIT_FILE" 2>/dev/null || true)" != "$expected_unit" ]]; then
     need_reload=1
   fi
-  # 更新代码时不碰 systemd unit，避免把用户手工调整过的启动参数覆盖掉
   if [[ $BINARY_ONLY -eq 1 ]]; then
     need_reload=0
   fi
@@ -3155,7 +3179,6 @@ cmd_uninstall() {
     [[ "$ans" == "y" || "$ans" == "Y" ]] || { info "已取消"; return 0; }
   fi
 
-  # 从 unit 里取实际安装路径，用户可能用 --bin 装到了别处
   local installed_bin=""
   if [[ -f "$UNIT_FILE" ]]; then
     installed_bin="$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$UNIT_FILE" | head -n1)"
@@ -3186,7 +3209,6 @@ cmd_uninstall() {
     warn "已保留配置目录: $CONFIG_DIR"
     warn "若以后要彻底清掉: rm -rf $CONFIG_DIR"
   else
-    # 先统计一下，让用户知道删了什么
     if [[ -d "$CONFIG_DIR" ]]; then
       local files
       files="$(find "$CONFIG_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
@@ -3197,7 +3219,6 @@ cmd_uninstall() {
     fi
   fi
 
-  # 顺手清掉可能残留的临时文件
   rm -f "${DEFAULT_BIN}.tmp."* 2>/dev/null || true
 
   printf '\n'
@@ -3221,7 +3242,35 @@ cmd_status() { require_systemd; systemctl status "$SERVICE_NAME" --no-pager -l |
 # ============ 交互菜单 ============
 C_R=$'\033[1;31m'; C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'
 C_B=$'\033[1m'; C_D=$'\033[2m'; C_C=$'\033[1;36m'; C_0=$'\033[0m'
-if [[ ! -t 1 ]]; then C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_C=""; C_0=""; fi
+C_M=$'\033[0;35m'; C_W=$'\033[0;37m'
+if [[ ! -t 1 ]]; then C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_C=""; C_0=""; C_M=""; C_W=""; fi
+
+# 终端宽度（用于画分隔线），限制在 [52, 88]
+term_cols() {
+  local c=""
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    c="$(tput cols 2>/dev/null || true)"
+  fi
+  [[ "$c" =~ ^[0-9]+$ ]] && (( c > 0 )) || c=68
+  (( c > 88 )) && c=88
+  (( c < 52 )) && c=52
+  printf '%s' "$((c - 2))"
+}
+
+# 生成 n 个指定字符（替代手写长串，宽度随终端变化）
+hline() {
+  local n="$1" ch="${2:-─}" s=""
+  (( n > 0 )) || return 0
+  printf -v s '%*s' "$n" ''
+  printf '%s' "${s// /$ch}"
+}
+
+# 非 UTF-8 终端降级
+if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *[Uu][Tt][Ff]* ]]; then
+  BOX_H1='━'; BOX_H2='─'
+else
+  BOX_H1='='; BOX_H2='-'
+fi
 
 svc_state() {
   if [[ ! -f "$UNIT_FILE" && ! -x "$BIN_PATH" && ! -x "$DEFAULT_BIN" ]]; then
@@ -3247,7 +3296,6 @@ has_binary() {
   [[ -x "$BIN_PATH" || -x "$DEFAULT_BIN" ]]
 }
 
-# 只要还留有 unit / 程序 / 配置目录，就认为有东西可卸载
 has_install() {
   [[ -f "$UNIT_FILE" ]] && return 0
   has_binary && return 0
@@ -3269,39 +3317,50 @@ build_time() {
 }
 
 menu_rule() {
-  printf '  %s%s%s\n' "$C_D" "───────────────────────────────────────────────────────" "$C_0"
+  printf '   %s%s%s\n' "$C_D" "$(hline "$(term_cols)" "$BOX_H2")" "$C_0"
 }
 
 menu_banner() {
-  local ip ep
+  local ip ep svc bt W
   ip="$(local_ip)"; ep="$(effective_port)"
+  svc="$(svc_state_colored)"; bt="$(build_time)"
+  W="$(term_cols)"
+
   printf '\n'
+  printf '%s%s%s\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
+  printf '  %s⚡ Emby 路径反代%s  %s·%s  %s管理菜单%s\n' \
+    "$C_B" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
+  printf '%s%s%s\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
+  printf '\n'
+
+  printf '   %s服务%s   %s\n' "$C_D" "$C_0" "$svc"
+  printf '   %s端口%s   %s:%s%s\n' "$C_D" "$C_0" "$C_C" "$ep" "$C_0"
+  printf '   %s访问%s   %s\n' "$C_D" "$C_0" "$C_C" "http://${ip}:${ep}/admin/"
+  printf '   %s构建%s   %s\n' "$C_D" "$C_0" "$bt"
+  printf '\n'
+
   menu_rule
-  printf '   %sEmby 路径反代%s   %s管理菜单%s\n' "$C_B" "$C_0" "$C_D" "$C_0"
-  menu_rule
   printf '\n'
-  printf '   %s服务%s   %s    %s端口%s   %s%s\n' \
-    "$C_D" "$C_0" "$(svc_state_colored)" "$C_D" "$C_0" "${C_C}:${ep}${C_0}"
-  printf '   %s访问%s   %s\n' "$C_D" "$C_0" "http://${ip}:${ep}/admin/"
-  printf '   %s构建%s   %s\n' "$C_D" "$C_0" "$(build_time)"
+
+  printf '   %s[1]%s  安装 / 重新安装    %s设置端口与密码，完整装一遍%s\n' \
+    "$C_B$C_C" "$C_0" "$C_D" "$C_0"
+  printf '   %s[2]%s  更新代码           %s重新编译并替换程序，配置与数据不动%s\n' \
+    "$C_B$C_C" "$C_0" "$C_D" "$C_0"
+  printf '   %s[3]%s  卸载               %s停止服务，删除程序、配置、统计%s\n' \
+    "$C_B$C_C" "$C_0" "$C_D" "$C_0"
+  printf '   %s[4]%s  运行状态           %s查看服务详细状态%s\n' \
+    "$C_B$C_C" "$C_0" "$C_D" "$C_0"
+  printf '   %s[5]%s  查看日志           %s最近 60 行%s\n' \
+    "$C_B$C_C" "$C_0" "$C_D" "$C_0"
+  printf '   %s[0]%s  退出\n' "$C_B" "$C_0"
   printf '\n'
-  menu_rule
-  printf '\n'
-  printf '   %s1%s   安装 / 重新安装    %s设置端口与密码，完整装一遍%s\n' \
-    "$C_B" "$C_0" "$C_D" "$C_0"
-  printf '   %s2%s   更新代码           %s重新编译并替换程序，配置与数据不动%s\n' "$C_B" "$C_0" "$C_D" "$C_0"
-  printf '   %s3%s   卸载               %s停止服务，删除程序、配置、统计%s\n' "$C_B" "$C_0" "$C_D" "$C_0"
-  printf '   %s4%s   运行状态           %s查看服务详细状态%s\n' "$C_B" "$C_0" "$C_D" "$C_0"
-  printf '   %s5%s   查看日志           %s最近 60 行%s\n' "$C_B" "$C_0" "$C_D" "$C_0"
-  printf '   %s0%s   退出\n' "$C_B" "$C_0"
-  printf '\n'
-  menu_rule
-  printf '   %s直接回车 = 重新显示菜单%s\n' "$C_D" "$C_0"
+
+  printf '%s%s%s\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
   printf '\n'
 }
 
 press_enter() {
-  printf '\n%s按回车返回菜单…%s' "$C_D" "$C_0"
+  printf '\n   %s↵ 按回车返回菜单…%s' "$C_D" "$C_0"
   read -r _ || true
 }
 
@@ -3313,7 +3372,6 @@ log_tail() {
   journalctl -u "$SERVICE_NAME" -n 60 --no-pager 2>/dev/null || warn "读取日志失败"
 }
 
-# 回车视为同意
 ask_yes_default() {
   printf '  %s ' "$1"
   local a=""
@@ -3331,10 +3389,9 @@ ask_yes() {
   [[ "$a" == "y" || "$a" == "Y" ]]
 }
 
-# 交互询问的返回值存在 PROMPT_RESULT，避免把提示文本一起捕获
 PROMPT_RESULT=""
 prompt_port() {
-  local def="$1" port=""
+  local def="$1" port="" 
   while true; do
     printf '   %s监听端口%s [%s]: ' "$C_D" "$C_0" "$def"
     if ! read -r port; then
@@ -3350,7 +3407,6 @@ prompt_port() {
       warn "端口需要是 1-65535 之间的数字"
       continue
     fi
-    # 被别的程序占用时提醒（自己装在上面跑属于正常）
     if port_listen "$port" && [[ "$port" != "$(effective_port)" ]]; then
       if ! ask_yes "端口 $port 已被占用，仍要使用？[y/N]"; then
         continue
@@ -3375,7 +3431,6 @@ prompt_pass() {
   return 0
 }
 
-# 安装前询问端口与密码
 menu_install_flow() {
   printf '\n'
   printf '   %s安装 / 重新安装%s\n' "$C_B" "$C_0"
@@ -3413,7 +3468,6 @@ menu_install_flow() {
   fi
   printf '\n'
 
-  # 密码留空也要传：告诉 install「已经问过了，按自动生成处理」
   local args=( --port "$port" --admin-pass "$pass" )
   if ( cmd_install "${args[@]}" ); then
     return 0
@@ -3433,7 +3487,7 @@ cmd_menu() {
   while true; do
     if [[ -t 1 ]]; then clear 2>/dev/null || true; fi
     menu_banner
-    printf '  请输入序号: '
+    printf '   %s❯%s 选择 %s[0-5]%s: ' "$C_G" "$C_0" "$C_D" "$C_0"
     local choice=""
     read -r choice || { printf '\n'; return 0; }
     choice="${choice//[[:space:]]/}"
