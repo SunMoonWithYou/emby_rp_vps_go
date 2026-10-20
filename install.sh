@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
+# =============================================================================
+# Emby 路径反代 — 一键安装 / 管理脚本
+#
+# 功能：编译并安装 Go 实现的路径反代服务，提供 systemd 管理与管理后台。
+# 用法：sudo ./emby-proxy.sh [menu|install|update|uninstall|status|start|stop|restart]
+# =============================================================================
 set -euo pipefail
+
+# ---------- 默认路径与版本 ----------
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
 DEFAULT_BIN="/usr/local/bin/emby-proxy"
@@ -11,8 +19,10 @@ BUILD_HASH_FILE="${CONFIG_DIR}/build.sha256"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GO_MIN_MAJOR=1
 GO_MIN_MINOR=20
-GO_FALLBACK_VERSION="1.23.4"
-IPLOC_VERSION="latest"
+GO_FALLBACK_VERSION="1.23.4"   # 包管理器失败时下载的官方 Go 版本
+IPLOC_VERSION="latest"         # github.com/phuslu/iploc 依赖版本
+
+# ---------- 运行时状态 ----------
 BUILD_TMPDIR=""
 GENERATED_PASS=0
 PORT=$DEFAULT_PORT
@@ -24,34 +34,85 @@ FORCE=0
 BINARY_ONLY=0
 PORT_GIVEN=0
 PASS_GIVEN=0
+
+# ---------- 日志辅助 ----------
 info() { printf '\033[1;32m[OK] %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
 err()  { printf '\033[1;31m[ERR] %s\033[0m\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
-cleanup() { if [[ -n "$BUILD_TMPDIR" && -d "$BUILD_TMPDIR" ]]; then rm -rf "$BUILD_TMPDIR"; fi; }
+
+# 退出时清理临时编译目录
+cleanup() {
+  if [[ -n "$BUILD_TMPDIR" && -d "$BUILD_TMPDIR" ]]; then
+    rm -rf "$BUILD_TMPDIR"
+  fi
+}
 trap cleanup EXIT
-require_root() { [[ $EUID -eq 0 ]] || die "请使用 root 权限: sudo $0 $*"; }
-require_systemd() { command -v systemctl >/dev/null 2>&1 || die "未检测到 systemctl"; [[ -d /run/systemd/system ]] || die "systemd 未运行"; }
+
+require_root() {
+  [[ $EUID -eq 0 ]] || die "请使用 root 权限: sudo $0 $*"
+}
+require_systemd() {
+  command -v systemctl >/dev/null 2>&1 || die "未检测到 systemctl"
+  [[ -d /run/systemd/system ]] || die "systemd 未运行"
+}
+
 usage() {
   cat <<EOF
 Emby 路径反代 一键安装
   sudo $0 [menu|install|update|uninstall|status|start|stop|restart]
 EOF
 }
+
+# 解析 install / update 的命令行参数
 parse_install_args() {
-  PORT="$(installed_port)"; BIN_PATH="$(installed_bin_path)"
+  PORT="$(installed_port)"
+  BIN_PATH="$(installed_bin_path)"
   [[ -n "$BIN_PATH" ]] || BIN_PATH=$DEFAULT_BIN
-  ADMIN_USER="admin"; ADMIN_PASS=""; PREBUILT=""; FORCE=0; BINARY_ONLY=0
-  PORT_GIVEN=0; PASS_GIVEN=0
-  need_value() { if [[ $# -lt 2 ]]; then die "参数 $1 后面需要一个值"; fi; }
+  ADMIN_USER="admin"
+  ADMIN_PASS=""
+  PREBUILT=""
+  FORCE=0
+  BINARY_ONLY=0
+  PORT_GIVEN=0
+  PASS_GIVEN=0
+
+  need_value() {
+    if [[ $# -lt 2 ]]; then
+      die "参数 $1 后面需要一个值"
+    fi
+  }
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --code-only) BINARY_ONLY=1; shift ;;
-      --port) need_value "$@"; PORT="$2"; PORT_GIVEN=1; shift 2 ;;
-      --bin) need_value "$@"; BIN_PATH="$2"; shift 2 ;;
-      --admin-user) need_value "$@"; ADMIN_USER="$2"; shift 2 ;;
-      --admin-pass) need_value "$@"; ADMIN_PASS="$2"; PASS_GIVEN=1; shift 2 ;;
-      --prebuilt) need_value "$@"; PREBUILT="$2"; shift 2 ;;
+      --port)
+        need_value "$@"
+        PORT="$2"
+        PORT_GIVEN=1
+        shift 2
+        ;;
+      --bin)
+        need_value "$@"
+        BIN_PATH="$2"
+        shift 2
+        ;;
+      --admin-user)
+        need_value "$@"
+        ADMIN_USER="$2"
+        shift 2
+        ;;
+      --admin-pass)
+        need_value "$@"
+        ADMIN_PASS="$2"
+        PASS_GIVEN=1
+        shift 2
+        ;;
+      --prebuilt)
+        need_value "$@"
+        PREBUILT="$2"
+        shift 2
+        ;;
       --force) FORCE=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "未知参数: $1" ;;
@@ -120,6 +181,12 @@ ensure_go() {
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
+// Emby 路径反代服务
+//
+// 将请求路径中的目标地址解析后做反向代理，例如：
+//   http://本机:8520/https://example.com/emby/...
+// 管理页：/admin/（Basic Auth）
+// 支持：大陆 IP 限制、目标域名白名单、访问统计、拦截日志、国旗与 Geo 查询
 package main
 
 import (
@@ -397,7 +464,7 @@ func recordRequestStart(ip, country string) {
 	rolloverLocked()
 	stats.TotalRequests++
 	stats.TodayRequests++
-	stats.LastProxyAt = time.Now().Format("2006-01-02 15:04:05")
+	stats.LastProxyAt = formatBlockTime(time.Now())
 	if country == "" { country = "??" }
 	stats.CountryCounts[country]++
 	stats.IPCounts[ip]++
@@ -417,21 +484,72 @@ func recordBytes(bytes int64) {
 
 const maxBlocks = 5000
 
+func parseBlockTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.Local); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+func formatBlockTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
+}
 func pruneBlocksLocked() {
-	cutoff := time.Now().AddDate(-1, 0, 0).Format("2006-01-02 15:04:05")
-	for len(stats.Blocks) > 0 && stats.Blocks[len(stats.Blocks)-1].Time < cutoff { stats.Blocks = stats.Blocks[:len(stats.Blocks)-1] }
+	cutoff := time.Now().AddDate(-1, 0, 0)
+	for len(stats.Blocks) > 0 {
+		t := parseBlockTime(stats.Blocks[len(stats.Blocks)-1].Time)
+		if !t.IsZero() && t.Before(cutoff) {
+			stats.Blocks = stats.Blocks[:len(stats.Blocks)-1]
+			continue
+		}
+		break
+	}
+}
+func isSelfOrLocalIP(ip, country string) bool {
+	if country == "LO" || country == "PV" {
+		return true
+	}
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false
+	}
+	if self := selfPublicIP.Load(); self != nil {
+		if s, ok := self.(string); ok && s != "" && s == ip {
+			return true
+		}
+	}
+	return false
 }
 func recordBlocked(ip, country, path, reason, ua string) {
-	if country == "LO" || country == "PV" { return }
-	statsMu.Lock(); defer statsMu.Unlock()
+	if isSelfOrLocalIP(ip, country) {
+		return
+	}
+	statsMu.Lock()
+	defer statsMu.Unlock()
 	rolloverLocked()
 	d := dayLocked()
 	reasonText := "目标域名不在访问白名单内"
-	if reason == "cn" { stats.BlockedCN++; d.BlockedCN++; reasonText = "仅允许中国大陆 IP 访问" } else { stats.BlockedWhitelist++; d.BlockedWL++ }
-	if country == "" { country = "??" }
-	ev := BlockEvent{Time: time.Now().Format("2006-01-02 15:04:05"), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
+	if reason == "cn" {
+		stats.BlockedCN++
+		d.BlockedCN++
+		reasonText = "仅允许中国大陆 IP 访问"
+	} else {
+		stats.BlockedWhitelist++
+		d.BlockedWL++
+	}
+	if country == "" {
+		country = "??"
+	}
+	ev := BlockEvent{Time: formatBlockTime(time.Now()), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
 	stats.Blocks = append([]BlockEvent{ev}, stats.Blocks...)
-	if len(stats.Blocks) > maxBlocks { stats.Blocks = stats.Blocks[:maxBlocks] }
+	if len(stats.Blocks) > maxBlocks {
+		stats.Blocks = stats.Blocks[:maxBlocks]
+	}
 }
 func saveStatsLocked() {
 	if statsPath == "" { return }
@@ -464,17 +582,55 @@ func startStatsSaver() {
 }
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil { host = r.RemoteAddr }
+	if err != nil {
+		host = r.RemoteAddr
+	}
 	ip := net.ParseIP(host)
 	trusted := ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 	if trusted {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i > 0 { return strings.TrimSpace(xff[:i]) }
+			if i := strings.IndexByte(xff, ','); i > 0 {
+				return strings.TrimSpace(xff[:i])
+			}
 			return strings.TrimSpace(xff)
 		}
-		if xri := r.Header.Get("X-Real-IP"); xri != "" { return strings.TrimSpace(xri) }
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
 	}
 	return host
+}
+
+// selfPublicIP caches this machine's outbound public IP (atomic.Value holds string).
+var selfPublicIP atomic.Value
+
+func detectSelfPublicIP() {
+	go func() {
+		client := &http.Client{Timeout: 4 * time.Second}
+		urls := []string{
+			"https://api.ipify.org",
+			"https://ifconfig.me/ip",
+			"https://icanhazip.com",
+		}
+		for _, u := range urls {
+			resp, err := client.Get(u)
+			if err != nil {
+				continue
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				continue
+			}
+			ipStr := strings.TrimSpace(string(body))
+			if net.ParseIP(ipStr) != nil {
+				selfPublicIP.Store(ipStr)
+				log.Printf("本机公网 IP: %s（拦截记录中将忽略）", ipStr)
+				return
+			}
+		}
+		log.Printf("未能探测本机公网 IP，本机访问拦截仍按 LO/PV 过滤")
+	}()
 }
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
@@ -486,14 +642,49 @@ func countryOf(ipStr string) string {
 
 var countryNames = map[string]string{
 	"CN": "中国", "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门",
-	"SG": "新加坡", "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大",
-	"GB": "英国", "DE": "德国", "FR": "法国", "IT": "意大利", "ES": "西班牙",
-	"NL": "荷兰", "BE": "比利时", "CH": "瑞士", "AT": "奥地利", "SE": "瑞典",
-	"NO": "挪威", "DK": "丹麦", "FI": "芬兰", "PL": "波兰", "CZ": "捷克",
-	"RU": "俄罗斯", "UA": "乌克兰", "TR": "土耳其", "IN": "印度", "ID": "印度尼西亚",
-	"TH": "泰国", "VN": "越南", "MY": "马来西亚", "PH": "菲律宾", "AU": "澳大利亚",
-	"NZ": "新西兰", "BR": "巴西", "AR": "阿根廷", "MX": "墨西哥", "ZA": "南非",
-	"EG": "埃及", "AE": "阿联酋", "SA": "沙特阿拉伯", "IL": "以色列", "IR": "伊朗",
+	"SG": "新加坡", "JP": "日本", "KR": "韩国", "KP": "朝鲜", "MN": "蒙古",
+	"US": "美国", "CA": "加拿大", "MX": "墨西哥", "BR": "巴西", "AR": "阿根廷",
+	"CL": "智利", "CO": "哥伦比亚", "PE": "秘鲁", "VE": "委内瑞拉", "UY": "乌拉圭",
+	"PY": "巴拉圭", "BO": "玻利维亚", "EC": "厄瓜多尔", "CR": "哥斯达黎加", "PA": "巴拿马",
+	"CU": "古巴", "DO": "多米尼加", "GT": "危地马拉", "HN": "洪都拉斯", "NI": "尼加拉瓜",
+	"SV": "萨尔瓦多", "JM": "牙买加", "TT": "特立尼达和多巴哥", "BS": "巴哈马", "BB": "巴巴多斯",
+	"GB": "英国", "IE": "爱尔兰", "FR": "法国", "DE": "德国", "IT": "意大利",
+	"ES": "西班牙", "PT": "葡萄牙", "NL": "荷兰", "BE": "比利时", "LU": "卢森堡",
+	"CH": "瑞士", "AT": "奥地利", "LI": "列支敦士登", "MC": "摩纳哥", "AD": "安道尔",
+	"SM": "圣马力诺", "VA": "梵蒂冈", "MT": "马耳他", "CY": "塞浦路斯", "GR": "希腊",
+	"SE": "瑞典", "NO": "挪威", "DK": "丹麦", "FI": "芬兰", "IS": "冰岛",
+	"PL": "波兰", "CZ": "捷克", "SK": "斯洛伐克", "HU": "匈牙利", "RO": "罗马尼亚",
+	"BG": "保加利亚", "HR": "克罗地亚", "SI": "斯洛文尼亚", "RS": "塞尔维亚", "BA": "波黑",
+	"ME": "黑山", "MK": "北马其顿", "AL": "阿尔巴尼亚", "XK": "科索沃", "MD": "摩尔多瓦",
+	"UA": "乌克兰", "BY": "白俄罗斯", "RU": "俄罗斯", "LT": "立陶宛", "LV": "拉脱维亚",
+	"EE": "爱沙尼亚", "GE": "格鲁吉亚", "AM": "亚美尼亚", "AZ": "阿塞拜疆", "KZ": "哈萨克斯坦",
+	"UZ": "乌兹别克斯坦", "TM": "土库曼斯坦", "KG": "吉尔吉斯斯坦", "TJ": "塔吉克斯坦",
+	"TR": "土耳其", "IL": "以色列", "PS": "巴勒斯坦", "JO": "约旦", "LB": "黎巴嫩",
+	"SY": "叙利亚", "IQ": "伊拉克", "IR": "伊朗", "SA": "沙特阿拉伯", "AE": "阿联酋",
+	"QA": "卡塔尔", "KW": "科威特", "BH": "巴林", "OM": "阿曼", "YE": "也门",
+	"EG": "埃及", "LY": "利比亚", "TN": "突尼斯", "DZ": "阿尔及利亚", "MA": "摩洛哥",
+	"SD": "苏丹", "SS": "南苏丹", "ET": "埃塞俄比亚", "SO": "索马里", "KE": "肯尼亚",
+	"TZ": "坦桑尼亚", "UG": "乌干达", "RW": "卢旺达", "BI": "布隆迪", "DJ": "吉布提",
+	"ER": "厄立特里亚", "ZA": "南非", "NA": "纳米比亚", "BW": "博茨瓦纳", "ZW": "津巴布韦",
+	"ZM": "赞比亚", "MW": "马拉维", "MZ": "莫桑比克", "AO": "安哥拉", "CD": "刚果（金）",
+	"CG": "刚果（布）", "GA": "加蓬", "CM": "喀麦隆", "NG": "尼日利亚", "GH": "加纳",
+	"CI": "科特迪瓦", "SN": "塞内加尔", "ML": "马里", "BF": "布基纳法索", "NE": "尼日尔",
+	"TD": "乍得", "CF": "中非", "GM": "冈比亚", "GN": "几内亚", "SL": "塞拉利昂",
+	"LR": "利比里亚", "TG": "多哥", "BJ": "贝宁", "MR": "毛里塔尼亚", "MU": "毛里求斯",
+	"SC": "塞舌尔", "MG": "马达加斯加", "RE": "留尼汪", "YT": "马约特",
+	"IN": "印度", "PK": "巴基斯坦", "BD": "孟加拉国", "LK": "斯里兰卡", "NP": "尼泊尔",
+	"BT": "不丹", "MV": "马尔代夫", "AF": "阿富汗", "MM": "缅甸", "TH": "泰国",
+	"LA": "老挝", "KH": "柬埔寨", "VN": "越南", "MY": "马来西亚", "ID": "印度尼西亚",
+	"PH": "菲律宾", "BN": "文莱", "TL": "东帝汶", "AU": "澳大利亚", "NZ": "新西兰",
+	"PG": "巴布亚新几内亚", "FJ": "斐济", "NC": "新喀里多尼亚", "PF": "法属波利尼西亚",
+	"GU": "关岛", "MP": "北马里亚纳", "WS": "萨摩亚", "TO": "汤加", "VU": "瓦努阿图",
+	"SB": "所罗门群岛", "FM": "密克罗尼西亚", "PW": "帕劳", "MH": "马绍尔群岛", "KI": "基里巴斯",
+	"PR": "波多黎各", "VI": "美属维尔京群岛", "VG": "英属维尔京群岛", "KY": "开曼群岛",
+	"BM": "百慕大", "GL": "格陵兰", "FO": "法罗群岛", "GI": "直布罗陀", "IM": "马恩岛",
+	"JE": "泽西", "GG": "根西", "AX": "奥兰群岛", "SJ": "斯瓦尔巴", "CW": "库拉索",
+	"AW": "阿鲁巴", "SX": "荷属圣马丁", "MF": "法属圣马丁", "GP": "瓜德罗普", "MQ": "马提尼克",
+	"GF": "法属圭亚那", "SR": "苏里南", "GY": "圭亚那", "BZ": "伯利兹", "HT": "海地",
+	"EU": "欧盟", "AP": "亚太地区", "A1": "匿名代理", "A2": "卫星运营商",
 	"PV": "内网", "LO": "本机", "??": "未知",
 }
 
@@ -628,62 +819,174 @@ func geoLookupAsync(ipStr string) {
 		geoFetchAndCache(ipStr)
 	}()
 }
+func isSelfPublicIP(ipStr string) bool {
+	if self := selfPublicIP.Load(); self != nil {
+		if s, ok := self.(string); ok && s != "" && s == strings.TrimSpace(ipStr) {
+			return true
+		}
+	}
+	return false
+}
 func ipLabel(ipStr string) (code, name string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
-	if ip == nil { return "??", "未知" }
-	if ip.IsLoopback() { return "LO", "本机" }
-	if ip.IsPrivate() || ip.IsLinkLocalUnicast() { return "PV", "内网" }
-	if c := countryOf(ipStr); c != "??" { return c, countryName(c) }
+	if ip == nil {
+		return "??", "未知"
+	}
+	if ip.IsLoopback() || isSelfPublicIP(ipStr) {
+		return "LO", "本机"
+	}
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return "PV", "内网"
+	}
+	if c := countryOf(ipStr); c != "??" {
+		return c, countryName(c)
+	}
 	now := time.Now().Unix()
-	geoMu.RLock(); e, ok := geoMap[ipStr]; geoMu.RUnlock()
+	geoMu.RLock()
+	e, ok := geoMap[ipStr]
+	geoMu.RUnlock()
 	if ok {
-		if e.Code != "??" && now-e.At < 30*86400 { return e.Code, e.Name }
-		if e.Code == "??" && now-e.At < 3600 { return "??", "未知" }
+		if e.Code != "??" && now-e.At < 30*86400 {
+			return e.Code, e.Name
+		}
+		if e.Code == "??" && now-e.At < 3600 {
+			return "??", "未知"
+		}
 	}
 	geoLookupAsync(ipStr)
 	return "??", "未知"
 }
 func ipLabelSync(ipStr string) (code, name string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
-	if ip == nil { return "??", "未知" }
-	if ip.IsLoopback() { return "LO", "本机" }
-	if ip.IsPrivate() || ip.IsLinkLocalUnicast() { return "PV", "内网" }
-	if c := countryOf(ipStr); c != "??" { return c, countryName(c) }
-	if gc, gn, ok := geoLookup(ipStr); ok { return gc, gn }
+	if ip == nil {
+		return "??", "未知"
+	}
+	if ip.IsLoopback() || isSelfPublicIP(ipStr) {
+		return "LO", "本机"
+	}
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return "PV", "内网"
+	}
+	if c := countryOf(ipStr); c != "??" {
+		return c, countryName(c)
+	}
+	if gc, gn, ok := geoLookup(ipStr); ok {
+		return gc, gn
+	}
 	return "??", "未知"
+}
+
+type flagAsset struct {
+	Data []byte
+	MIME string // image/svg+xml or image/png
 }
 
 var flagCache = struct {
 	sync.RWMutex
-	m map[string][]byte
-}{m: map[string][]byte{}}
+	m map[string]flagAsset
+}{m: map[string]flagAsset{}}
 
 var flagDir string
 
-func flagPng(code string) ([]byte, error) {
-	flagCache.RLock(); b, ok := flagCache.m[code]; flagCache.RUnlock()
-	if ok { return b, nil }
-	if flagDir != "" {
-		if d, err := os.ReadFile(filepath.Join(flagDir, code+".png")); err == nil && len(d) > 100 {
-			flagCache.Lock(); flagCache.m[code] = d; flagCache.Unlock()
-			return d, nil
-		}
+func flagMIME(data []byte) string {
+	s := strings.TrimSpace(string(data))
+	if strings.HasPrefix(s, "<svg") || strings.HasPrefix(s, "<?xml") {
+		return "image/svg+xml"
 	}
-	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Get("https://flagcdn.com/w40/" + code + ".png")
-	if err != nil { return nil, err }
+	return "image/png"
+}
+
+func fetchFlagURL(client *http.Client, url string) ([]byte, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 { return nil, fmt.Errorf("flagcdn 返回 %d", resp.StatusCode) }
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if err != nil || len(data) < 100 { return nil, fmt.Errorf("图片无效") }
-	flagCache.Lock()
-	if len(flagCache.m) > 400 { flagCache.m = map[string][]byte{} }
-	flagCache.m[code] = data
-	flagCache.Unlock()
-	if flagDir != "" {
-		if os.MkdirAll(flagDir, 0755) == nil { _ = os.WriteFile(filepath.Join(flagDir, code+".png"), data, 0644) }
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
+	if err != nil || len(data) < 40 {
+		return nil, fmt.Errorf("图片无效")
 	}
 	return data, nil
+}
+
+// flagPng loads a country flag. Prefers open-source flag-icons (GitHub / jsDelivr),
+// falls back to flagcdn. Returns SVG or PNG bytes.
+func flagPng(code string) ([]byte, error) {
+	code = strings.ToLower(strings.TrimSpace(code))
+	flagCache.RLock()
+	cached, ok := flagCache.m[code]
+	flagCache.RUnlock()
+	if ok {
+		return cached.Data, nil
+	}
+	if flagDir != "" {
+		for _, ext := range []string{".svg", ".png"} {
+			if d, err := os.ReadFile(filepath.Join(flagDir, code+ext)); err == nil && len(d) > 40 {
+				asset := flagAsset{Data: d, MIME: flagMIME(d)}
+				flagCache.Lock()
+				flagCache.m[code] = asset
+				flagCache.Unlock()
+				return d, nil
+			}
+		}
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	// lipis/flag-icons (MIT) via jsDelivr / GitHub — reliable, open source
+	urls := []string{
+		"https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.2.3/flags/4x3/" + code + ".svg",
+		"https://cdn.jsdelivr.net/npm/flag-icons@7.2.3/flags/4x3/" + code + ".svg",
+		"https://raw.githubusercontent.com/lipis/flag-icons/main/flags/4x3/" + code + ".svg",
+		"https://flagcdn.com/w40/" + code + ".png",
+		"https://flagcdn.com/w80/" + code + ".png",
+	}
+	var data []byte
+	var lastErr error
+	for _, u := range urls {
+		d, err := fetchFlagURL(client, u)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		data = d
+		break
+	}
+	if data == nil {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("国旗不可用")
+	}
+	asset := flagAsset{Data: data, MIME: flagMIME(data)}
+	flagCache.Lock()
+	if len(flagCache.m) > 400 {
+		flagCache.m = map[string]flagAsset{}
+	}
+	flagCache.m[code] = asset
+	flagCache.Unlock()
+	if flagDir != "" {
+		ext := ".png"
+		if asset.MIME == "image/svg+xml" {
+			ext = ".svg"
+		}
+		if os.MkdirAll(flagDir, 0755) == nil {
+			_ = os.WriteFile(filepath.Join(flagDir, code+ext), data, 0644)
+		}
+	}
+	return data, nil
+}
+
+func flagContentType(code string) string {
+	code = strings.ToLower(strings.TrimSpace(code))
+	flagCache.RLock()
+	a, ok := flagCache.m[code]
+	flagCache.RUnlock()
+	if ok && a.MIME != "" {
+		return a.MIME
+	}
+	return "image/png"
 }
 
 var (
@@ -885,10 +1188,16 @@ func adminHandler(user, pass string) http.HandlerFunc {
 	})
 	mux.HandleFunc("/admin/api/flag/", func(w http.ResponseWriter, r *http.Request) {
 		code := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/admin/api/flag/"))
-		if len(code) != 2 || code[0] < 'a' || code[0] > 'z' || code[1] < 'a' || code[1] > 'z' { http.NotFound(w, r); return }
+		if len(code) != 2 || code[0] < 'a' || code[0] > 'z' || code[1] < 'a' || code[1] > 'z' {
+			http.NotFound(w, r)
+			return
+		}
 		data, err := flagPng(code)
-		if err != nil { http.NotFound(w, r); return }
-		w.Header().Set("Content-Type", "image/png")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", flagContentType(code))
 		w.Header().Set("Cache-Control", "public, max-age=2592000")
 		_, _ = w.Write(data)
 	})
@@ -941,22 +1250,47 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		dates := []string{}
 		seen := map[string]bool{}
 		for _, b := range stats.Blocks {
+			// 本机 / 内网 / 本机公网 IP 不展示在拦截列表
+			if isSelfOrLocalIP(b.IP, b.Country) {
+				continue
+			}
 			d := b.Time
-			if len(d) >= 10 { d = d[:10] }
-			if !seen[d] { seen[d] = true; if len(dates) < 60 { dates = append(dates, d) } }
-			if from != "" && d < from { continue }
-			if to != "" && d > to { continue }
+			if t := parseBlockTime(b.Time); !t.IsZero() {
+				d = t.In(time.Local).Format("2006-01-02")
+			} else if len(d) >= 10 {
+				d = d[:10]
+			}
+			if !seen[d] {
+				seen[d] = true
+				if len(dates) < 60 {
+					dates = append(dates, d)
+				}
+			}
+			if from != "" && d < from {
+				continue
+			}
+			if to != "" && d > to {
+				continue
+			}
 			matched = append(matched, b)
 		}
 		statsMu.Unlock()
 		total := len(matched)
 		pages := (total + size - 1) / size
-		if pages < 1 { pages = 1 }
-		if page > pages { page = pages }
+		if pages < 1 {
+			pages = 1
+		}
+		if page > pages {
+			page = pages
+		}
 		start := (page - 1) * size
 		end := start + size
-		if start > total { start = total }
-		if end > total { end = total }
+		if start > total {
+			start = total
+		}
+		if end > total {
+			end = total
+		}
 		items := append([]BlockEvent{}, matched[start:end]...)
 		_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "page": page, "size": size, "pages": pages, "items": items, "dates": dates, "today": time.Now().Format("2006-01-02")})
 	})
@@ -1042,6 +1376,7 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 	flagDir = filepath.Join(filepath.Dir(configPath), "flags")
 	loadStats(statsFile)
 	startStatsSaver()
+	detectSelfPublicIP()
 	defer func() { statsMu.Lock(); saveStatsLocked(); statsMu.Unlock(); geoCacheSave() }()
 	proxy := buildProxy(proxyTr)
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1112,9 +1447,10 @@ GO_SOURCE
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--mono:Consolas,monospace;--r:12px}
 body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;height:100vh;overflow:hidden}
 .sb{width:230px;background:var(--card);border-right:1px solid var(--bd);display:flex;flex-direction:column}
-.sb-h{padding:22px 20px 14px;display:flex;align-items:center;gap:10px}
-.sb-logo{width:32px;height:32px;background:linear-gradient(135deg,var(--p),#8b5cf6);border-radius:8px;display:grid;place-items:center;color:#fff;font-weight:700}
-.sb-t{font-size:16px;font-weight:700}
+.sb-h{padding:22px 20px 16px;display:flex;align-items:center}
+.sb-brand{min-width:0;display:flex;flex-direction:column;gap:3px}
+.sb-t{font-size:16px;font-weight:700;letter-spacing:-.3px;line-height:1.2;color:var(--t)}
+.sb-sub{font-size:12px;color:var(--t3);font-weight:500;letter-spacing:.2px}
 .nav{list-style:none;padding:0 10px;flex:1;overflow-y:auto}
 .nav-i{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:8px;color:var(--t2);cursor:pointer;margin-bottom:4px;border:0;background:transparent;font:inherit;font-size:14px;width:100%;text-align:left}
 .nav-i:hover{background:#f1f5f9}
@@ -1138,11 +1474,11 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
 .g2 .card{margin-bottom:0}
 .sg{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:22px}
-.stc{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:18px;display:flex;align-items:flex-start;gap:14px}
-.si{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;flex-shrink:0}
-.si.b{background:#eff6ff;color:#3b82f6}.si.g{background:#ecfdf5;color:#10b981}.si.r{background:#fef2f2;color:#ef4444}.si.o{background:#fffbeb;color:#f59e0b}
+.stc{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:18px 20px;position:relative;overflow:hidden}
+.stc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.stc.b::before{background:#3b82f6}.stc.g::before{background:#10b981}.stc.r::before{background:#ef4444}.stc.o::before{background:#f59e0b}
 .sl{font-size:13px;color:var(--t3);font-weight:500}
-.sv{font-size:24px;font-weight:700;margin:4px 0;font-variant-numeric:tabular-nums}
+.sv{font-size:26px;font-weight:700;margin:6px 0 4px;font-variant-numeric:tabular-nums;letter-spacing:-.5px;line-height:1.1}
 .ss{font-size:12px;color:var(--t2)}
 .ss b{font-weight:600;color:var(--t)}
 .dr{display:flex;align-items:center;gap:12px;padding:8px 0}
@@ -1154,8 +1490,8 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
 .dv{width:80px;text-align:right;font-size:13px;font-weight:500;font-variant-numeric:tabular-nums}
 .dv span{color:var(--t3);font-size:12px;margin-left:6px}
-.flg{width:20px;height:15px;object-fit:cover;border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,.1)}
-.fb{display:inline-grid;place-items:center;width:20px;height:15px;background:#f1f5f9;border-radius:3px;font-size:10px;font-weight:700;color:var(--t3)}
+.flg{width:22px;height:16px;object-fit:cover;border-radius:3px;box-shadow:0 0 0 1px rgba(15,23,42,.12);background:#e2e8f0;flex-shrink:0}
+.fb{display:inline-grid;place-items:center;width:22px;height:16px;background:#f1f5f9;border-radius:3px;font-size:9px;font-weight:700;color:var(--t3);flex-shrink:0;letter-spacing:-.3px}
 .tw{overflow-x:auto;margin:0 -22px -22px;padding:0 22px 22px}
 table{width:100%;border-collapse:collapse;min-width:700px;text-align:left}
 th{padding:12px 16px;border-bottom:1px solid var(--bd);font-size:12px;font-weight:600;color:var(--t3);background:#fafbfc}
@@ -1243,7 +1579,7 @@ tbody tr:last-child td{border-bottom:0}
 </head>
 <body>
 <aside class="sb" id="sb">
-<div class="sb-h"><div class="sb-logo">E</div><div class="sb-t">Emby Proxy</div></div>
+<div class="sb-h"><div class="sb-brand"><div class="sb-t">Emby Proxy</div><div class="sb-sub">路径反代 · 管理台</div></div></div>
 <ul class="nav">
 <li><button class="nav-i on" data-t="overview">概览</button></li>
 <li><button class="nav-i" data-t="traffic">流量</button></li>
@@ -1260,10 +1596,10 @@ tbody tr:last-child td{border-bottom:0}
 <div class="sc">
 <section id="overview" class="pg on">
 <div class="sg">
-<div class="stc"><div class="si b">⚡</div><div style="flex:1;min-width:0"><div class="sl">今日请求</div><div class="sv" id="todayReq">-</div><div class="ss">流量 <b id="todayBytes">0 B</b></div></div></div>
-<div class="stc"><div class="si g">↻</div><div style="flex:1;min-width:0"><div class="sl">累计请求</div><div class="sv" id="totalReq">-</div><div class="ss">流量 <b id="totalBytes">0 B</b></div></div></div>
-<div class="stc"><div class="si r">⊘</div><div style="flex:1;min-width:0"><div class="sl">拦截</div><div class="sv" id="totalBlocked" style="color:var(--d)">-</div><div class="ss">地区 <b id="blockedCN">0</b> · 白名单 <b id="blockedWL">0</b></div></div></div>
-<div class="stc"><div class="si o">◕</div><div style="flex:1;min-width:0"><div class="sl">独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss"><b id="uniqueCountries">0</b> 个地区</div></div></div>
+<div class="stc b"><div class="sl">今日请求</div><div class="sv" id="todayReq">-</div><div class="ss">流量 <b id="todayBytes">0 B</b></div></div>
+<div class="stc g"><div class="sl">累计请求</div><div class="sv" id="totalReq">-</div><div class="ss">流量 <b id="totalBytes">0 B</b></div></div>
+<div class="stc r"><div class="sl">拦截</div><div class="sv" id="totalBlocked" style="color:var(--d)">-</div><div class="ss">地区 <b id="blockedCN">0</b> · 白名单 <b id="blockedWL">0</b></div></div>
+<div class="stc o"><div class="sl">独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss"><b id="uniqueCountries">0</b> 个地区</div></div>
 </div>
 <div class="og">
 <div class="card sp2"><div class="ch"><div><h2 class="ct">近 7 天趋势</h2><div class="cd">每日请求数与流量消耗</div></div><button class="btn g s" data-goto="traffic">查看全部 →</button></div><div style="position:relative;height:240px"><canvas id="miniTrendChart"></canvas></div></div>
@@ -1285,7 +1621,7 @@ tbody tr:last-child td{border-bottom:0}
 </section>
 <section id="blocks" class="pg">
 <div class="card" style="padding-bottom:0">
-<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">保留一年，最新在上</div></div><div class="flt" id="rangeBar"><button class="filter on" data-r="all">全部</button><button class="filter" data-r="today">今天</button><button class="filter" data-r="7d">近 7 天</button><button class="filter" data-r="30d">近 30 天</button><span class="chip" id="cntAll">0 条</span></div></div>
+<div class="ch"><div><h2 class="ct">拦截</h2><div class="cd">保留一年，最新在上</div></div><div class="flt" id="rangeBar"><button class="filter on" data-r="all">全部</button><button class="filter" data-r="today">今天</button><button class="filter" data-r="7d">近 7 天</button><button class="filter" data-r="30d">近 30 天</button><span class="chip" id="cntAll">0 条</span></div></div>
 <div class="tw"><table><thead><tr><th>时间</th><th>IP</th><th>地区</th><th>路径</th><th>原因</th></tr></thead><tbody id="blocksBody"><tr><td colspan="5" class="emp">暂无记录</td></tr></tbody></table></div>
 <div class="pg2" style="padding-bottom:20px"><button class="btn g" id="prevPage">上一页</button><span class="pi" id="pageInfo">1 / 1</span><button class="btn g" id="nextPage">下一页</button></div>
 </div>
@@ -1324,6 +1660,12 @@ tbody tr:last-child td{border-bottom:0}
 const state={port:0,labels:{},serverToday:'',range:{from:'',to:''},page:1,pages:1,total:0};
 function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
 function fmtUptime(s){if(s<60)return s+' 秒';if(s<3600)return Math.floor(s/60)+' 分钟';if(s<86400)return Math.floor(s/3600)+' 小时';return Math.floor(s/86400)+' 天'}
+const TZ_CN='Asia/Shanghai';
+function parseServerTime(s){if(!s)return null;let d=new Date(s);if(!isNaN(d.getTime()))return d;if(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)){d=new Date(s.replace(' ','T')+'+08:00');if(!isNaN(d.getTime()))return d;d=new Date(s.replace(' ','T'));if(!isNaN(d.getTime()))return d}return null}
+function partsInCN(d){try{const f=new Intl.DateTimeFormat('en-CA',{timeZone:TZ_CN,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});const o={};f.formatToParts(d).forEach(p=>{if(p.type!=='literal')o[p.type]=p.value});return o}catch(e){const p=n=>String(n).padStart(2,'0');return{year:String(d.getFullYear()),month:p(d.getMonth()+1),day:p(d.getDate()),hour:p(d.getHours()),minute:p(d.getMinutes()),second:p(d.getSeconds())}}}
+function fmtTime(s){const d=parseServerTime(s);if(!d)return s||'';const o=partsInCN(d);return o.year+'-'+o.month+'-'+o.day+' '+o.hour+':'+o.minute+':'+o.second}
+function fmtTimeShort(s){const d=parseServerTime(s);if(!d)return (s||'').slice(11,16)||s||'';const o=partsInCN(d);return o.hour+':'+o.minute}
+function nowClockCN(){const o=partsInCN(new Date());return o.hour+':'+o.minute+':'+o.second}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function toast(m,k){const t=document.getElementById('toast');t.textContent=m;t.className='tst on'+(k==='ok'?' ok':k==='err'?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='tst',3500)}
 const LOCAL={'LO':'本机','PV':'内网','??':'未知','':'未知'};
@@ -1334,7 +1676,7 @@ function reasonLabel(b){return b.reason==='cn'?'大陆限制':'未授权'}
 function flagHtml(c){if(!c||c==='??'||LOCAL_CODES[c])return flagBadge(c==='LO'?'本':c==='PV'?'内':'?');if(!/^[A-Z]{2}$/.test(c))return flagBadge(String(c).slice(0,2));return '<img class="flg" src="/admin/api/flag/'+c.toLowerCase()+'" alt="'+c+'" loading="lazy">'}
 document.addEventListener('error',e=>{const i=e.target;if(i&&i.tagName==='IMG'&&i.classList.contains('flg')){const s=document.createElement('span');s.className='fb';s.textContent=i.alt||'?';i.replaceWith(s)}},true);
 function shortPath(p){if(!p)return '';const q=p.indexOf('?');if(q>0&&p.length>q+1)return p.slice(0,q)+' ?…';return p.length>96?p.slice(0,96)+'…':p}
-const pageTitles={overview:'概览',traffic:'流量',blocks:'拦截记录',settings:'设置'};
+const pageTitles={overview:'概览',traffic:'流量',blocks:'拦截',settings:'设置'};
 function switchTab(id){document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));document.getElementById('pt').textContent=pageTitles[id]||'';if(window.innerWidth<=768)document.getElementById('sb').classList.remove('on');if(id==='overview')loadOverview();if(id==='traffic')loadTraffic();if(id==='blocks'){sigBlk='';loadBlocks()}}
 document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
 document.getElementById('mmb').addEventListener('click',()=>document.getElementById('sb').classList.toggle('on'));
@@ -1345,14 +1687,14 @@ let miniTrendChart=null,ovLoading=false;
 async function loadOverview(){if(ovLoading)return;ovLoading=true;try{const[t,b,c]=await Promise.all([fetch('/admin/api/traffic',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null),fetch('/admin/api/blocks?page=1&size=5',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null),fetch('/admin/api/config',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null)]);if(t){renderMiniTrend(t.trend||[]);renderOvRegion(t.country_counts||{})}if(b)renderOvBlocks(b.items||[]);renderOvSystem(c)}catch(e){}finally{ovLoading=false}}
 function renderMiniTrend(trend){const cv=document.getElementById('miniTrendChart');if(!cv||typeof Chart==='undefined')return;const data=(trend||[]).slice(-7);if(!data.length){if(miniTrendChart){miniTrendChart.destroy();miniTrendChart=null}return}const labels=data.map(d=>(d.date||'').slice(5)),bytes=data.map(d=>d.bytes||0),reqs=data.map(d=>d.requests||0);if(miniTrendChart){miniTrendChart.data.labels=labels;miniTrendChart.data.datasets[0].data=bytes;miniTrendChart.data.datasets[1].data=reqs;miniTrendChart.update('none');return}miniTrendChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'流量',data:bytes,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,yAxisID:'y',tension:0.35,pointRadius:2},{label:'请求',data:reqs,borderColor:'#10b981',backgroundColor:'transparent',borderWidth:1.5,borderDash:[4,4],yAxisID:'y1',tension:0.35,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'top',align:'end',labels:{usePointStyle:true,boxWidth:8,font:{size:11}}},tooltip:{backgroundColor:'rgba(15,23,42,0.9)',padding:10,cornerRadius:8,callbacks:{label:c=>c.dataset.label+': '+(c.dataset.yAxisID==='y'?fmtBytes(c.parsed.y):c.parsed.y.toLocaleString())}}},scales:{x:{grid:{display:false},ticks:{font:{size:10},color:'#94a3b8'}},y:{display:false,beginAtZero:true},y1:{display:false,beginAtZero:true}}}})}
 function renderOvRegion(cc){const box=document.getElementById('ovRegion');if(!box)return;const entries=Object.entries(cc||{});if(!entries.length){box.innerHTML='<div class="emp"><b>暂无数据</b>有请求后自动统计</div>';return}const rows=entries.sort((a,b)=>b[1]-a[1]).slice(0,5),total=entries.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;box.innerHTML=rows.map(([code,n])=>{const nm=regionName(code);return '<div class="dr"><span class="dn" title="'+esc(nm)+'">'+flagHtml(code)+'<span class="tx">'+esc(nm)+'</span></span><div class="bar t"><i style="width:'+(n/max*100).toFixed(1)+'%"></i></div><span class="dv">'+n.toLocaleString()+'<span>'+(n/total*100).toFixed(0)+'%</span></span></div>'}).join('')}
-function renderOvBlocks(items){const box=document.getElementById('ovBlocks');if(!box)return;if(!items||!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b>被拦截的请求会出现在这里</div>';return}box.innerHTML=items.map((b,i)=>'<div class="obr" data-ovb="'+i+'"><span class="obip">'+esc(b.ip)+'</span><span class="obp" title="'+esc(b.path)+'">'+esc(shortPath(b.path))+'</span><span class="pill '+(b.reason==='cn'?'pc':'pw')+'">'+esc(reasonLabel(b))+'</span><span class="obt">'+esc((b.time||'').slice(11,16))+'</span></div>').join('');box.querySelectorAll('[data-ovb]').forEach(el=>el.addEventListener('click',()=>{const b=items[+el.dataset.ovb];if(b)showDetail(b)}))}
-function renderOvSystem(cfg){const box=document.getElementById('ovSystem');if(!box)return;const s=state.lastStats||{},items=[];if(cfg){items.push({label:'监听端口',value:':'+(cfg.effective_port||'—'),cls:'m'});items.push({label:'大陆限制',value:cfg.china_only?'已开启':'已关闭',cls:cfg.china_only?'ok':''});items.push({label:'在线查询',value:cfg.geo_api?'已开启':'已关闭',cls:cfg.geo_api?'ok':''});const wl=(cfg.whitelist||[]).filter(Boolean).length;items.push({label:'白名单',value:wl?wl+' 个域名':'不限目标',cls:wl?'':'warn'})}items.push({label:'运行时长',value:typeof s.uptime_sec==='number'?fmtUptime(s.uptime_sec):'—'});items.push({label:'最近转发',value:s.last_proxy_at?s.last_proxy_at.slice(5,16):'尚无请求',cls:s.last_proxy_at?'m':'warn'});const bc=(s.blocked_cn||0)+(s.blocked_whitelist||0);items.push({label:'累计拦截',value:bc.toLocaleString()+' 次'});items.push({label:'独立 IP',value:Object.keys(s.ip_counts||{}).length.toLocaleString()+' 个'});box.innerHTML=items.map(it=>'<div class="sysi"><span class="sysl">'+esc(it.label)+'</span><span class="sysv '+(it.cls||'')+'">'+esc(it.value)+'</span></div>').join('')}
+function renderOvBlocks(items){const box=document.getElementById('ovBlocks');if(!box)return;if(!items||!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b>被拦截的请求会出现在这里</div>';return}box.innerHTML=items.map((b,i)=>'<div class="obr" data-ovb="'+i+'"><span class="obip">'+esc(b.ip)+'</span><span class="obp" title="'+esc(b.path)+'">'+esc(shortPath(b.path))+'</span><span class="pill '+(b.reason==='cn'?'pc':'pw')+'">'+esc(reasonLabel(b))+'</span><span class="obt">'+esc(fmtTimeShort(b.time))+'</span></div>').join('');box.querySelectorAll('[data-ovb]').forEach(el=>el.addEventListener('click',()=>{const b=items[+el.dataset.ovb];if(b)showDetail(b)}))}
+function renderOvSystem(cfg){const box=document.getElementById('ovSystem');if(!box)return;const s=state.lastStats||{},items=[];if(cfg){items.push({label:'监听端口',value:':'+(cfg.effective_port||'—'),cls:'m'});items.push({label:'大陆限制',value:cfg.china_only?'已开启':'已关闭',cls:cfg.china_only?'ok':''});items.push({label:'在线查询',value:cfg.geo_api?'已开启':'已关闭',cls:cfg.geo_api?'ok':''});const wl=(cfg.whitelist||[]).filter(Boolean).length;items.push({label:'白名单',value:wl?wl+' 个域名':'不限目标',cls:wl?'':'warn'})}items.push({label:'运行时长',value:typeof s.uptime_sec==='number'?fmtUptime(s.uptime_sec):'—'});items.push({label:'最近转发',value:s.last_proxy_at?fmtTime(s.last_proxy_at).slice(5,16):'尚无请求',cls:s.last_proxy_at?'m':'warn'});const bc=(s.blocked_cn||0)+(s.blocked_whitelist||0);items.push({label:'累计拦截',value:bc.toLocaleString()+' 次'});items.push({label:'独立 IP',value:Object.keys(s.ip_counts||{}).length.toLocaleString()+' 个'});box.innerHTML=items.map(it=>'<div class="sysi"><span class="sysl">'+esc(it.label)+'</span><span class="sysv '+(it.cls||'')+'">'+esc(it.value)+'</span></div>').join('')}
 let trendChart=null;
 function fmtChartBytes(b){if(!b)return '0';if(b<1048576)return (b/1024).toFixed(0)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
 function renderTrend(td){const ctx=document.getElementById('trendChart');if(!ctx)return;if(!td||!td.length){if(trendChart){trendChart.destroy();trendChart=null}return}const labels=td.map(d=>d.date),dr=td.map(d=>d.requests),db=td.map(d=>d.bytes);if(trendChart){trendChart.data.labels=labels;trendChart.data.datasets[0].data=db;trendChart.data.datasets[1].data=dr;trendChart.update();return}trendChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{label:'流量',data:db,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,yAxisID:'y',tension:0.3,pointRadius:3},{label:'请求数',data:dr,borderColor:'#10b981',backgroundColor:'transparent',borderWidth:2,borderDash:[5,5],yAxisID:'y1',tension:0.3,pointRadius:2}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'top',align:'end',labels:{usePointStyle:true,boxWidth:8,font:{size:12}}},tooltip:{backgroundColor:'rgba(15,23,42,0.9)',padding:12,cornerRadius:8,callbacks:{label:c=>c.dataset.label+': '+(c.dataset.yAxisID==='y'?fmtBytes(c.parsed.y):c.parsed.y.toLocaleString())}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:12,font:{size:11},color:'#94a3b8'}},y:{type:'linear',position:'left',title:{display:true,text:'流量',color:'#3b82f6',font:{size:11,weight:'bold'}},ticks:{color:'#94a3b8',font:{size:11},callback:v=>fmtChartBytes(v)},grid:{color:'#f1f5f9'}},y1:{type:'linear',position:'right',title:{display:true,text:'请求数',color:'#10b981',font:{size:11,weight:'bold'}},ticks:{color:'#94a3b8',font:{size:11}},grid:{drawOnChartArea:false}}}}})}
 async function loadTraffic(){const r0=trState.range||{from:'',to:''};const qs=new URLSearchParams();if(r0.from)qs.set('from',r0.from);if(r0.to)qs.set('to',r0.to);try{const r=await fetch('/admin/api/traffic'+(qs.toString()?'?'+qs.toString():''),{cache:'no-store'});if(!r.ok)return;const d=await r.json();if(d.today)state.serverToday=d.today;const sum=document.getElementById('trSummary');if(sum){const blocked=(d.blocked_cn||0)+(d.blocked_whitelist||0);sum.innerHTML='请求总计 <b>'+(d.requests||0).toLocaleString()+'</b> · 流量总计 <b>'+fmtBytes(d.bytes||0)+'</b> · 拦截总计 <b>'+blocked.toLocaleString()+'</b>'}renderIP(d.ip_counts||{});renderRegion(d.country_counts||{});if(d.trend)renderTrend(d.trend)}catch(e){}}
 document.getElementById('trRangeBar').addEventListener('click',e=>{const btn=e.target.closest('.filter[data-r]');if(!btn)return;document.querySelectorAll('#trRangeBar .filter').forEach(b=>b.classList.toggle('on',b===btn));trState.range=rangeOf(btn.dataset.r);sigIP='';sigReg='';loadTraffic()});
-async function loadStats(){try{const r=await fetch('/admin/api/stats',{cache:'no-store'});if(!r.ok)return;const s=await r.json();state.lastStats=s;const nl=s.country_labels||{};if(JSON.stringify(nl)!==JSON.stringify(state.labels)){state.labels=nl;sigReg='';sigBlk='';sigIP='';if(blockItems.length)drawBlocks();if(document.getElementById('traffic').classList.contains('on'))loadTraffic()}if(s.port&&!state.port)applyPort(s.port);document.getElementById('todayReq').textContent=(s.today_requests||0).toLocaleString();document.getElementById('todayBytes').textContent=fmtBytes(s.today_bytes||0);document.getElementById('totalReq').textContent=(s.total_requests||0).toLocaleString();document.getElementById('totalBytes').textContent=fmtBytes(s.total_bytes||0);const bc=s.blocked_cn||0,bw=s.blocked_whitelist||0;document.getElementById('totalBlocked').textContent=(bc+bw).toLocaleString();document.getElementById('blockedCN').textContent=bc.toLocaleString();document.getElementById('blockedWL').textContent=bw.toLocaleString();document.getElementById('uniqueIPs').textContent=Object.keys(s.ip_counts||{}).length.toLocaleString();document.getElementById('uniqueCountries').textContent=Object.keys(s.country_counts||{}).length;document.getElementById('clock').textContent=new Date().toLocaleTimeString('zh-CN',{hour12:false});if(typeof s.uptime_sec==='number')document.getElementById('uptimeChip').textContent='已运行 '+fmtUptime(s.uptime_sec);const gs=document.getElementById('geoStatus');if(s.regeo_running)gs.textContent='识别中 '+(s.regeo_done||0)+'/'+(s.regeo_total||0);else if(s.geo_ok||s.geo_fail)gs.textContent='成功 '+(s.geo_ok||0)+' · 失败 '+(s.geo_fail||0);else gs.textContent='';if(document.getElementById('traffic').classList.contains('on'))loadTraffic();if(document.getElementById('blocks').classList.contains('on'))loadBlocks();if(document.getElementById('overview').classList.contains('on')){const now=Date.now();if(!loadStats._ovAt||now-loadStats._ovAt>30000){loadStats._ovAt=now;loadOverview()}}}catch(e){}}
+async function loadStats(){try{const r=await fetch('/admin/api/stats',{cache:'no-store'});if(!r.ok)return;const s=await r.json();state.lastStats=s;const nl=s.country_labels||{};if(JSON.stringify(nl)!==JSON.stringify(state.labels)){state.labels=nl;sigReg='';sigBlk='';sigIP='';if(blockItems.length)drawBlocks();if(document.getElementById('traffic').classList.contains('on'))loadTraffic()}if(s.port&&!state.port)applyPort(s.port);document.getElementById('todayReq').textContent=(s.today_requests||0).toLocaleString();document.getElementById('todayBytes').textContent=fmtBytes(s.today_bytes||0);document.getElementById('totalReq').textContent=(s.total_requests||0).toLocaleString();document.getElementById('totalBytes').textContent=fmtBytes(s.total_bytes||0);const bc=s.blocked_cn||0,bw=s.blocked_whitelist||0;document.getElementById('totalBlocked').textContent=(bc+bw).toLocaleString();document.getElementById('blockedCN').textContent=bc.toLocaleString();document.getElementById('blockedWL').textContent=bw.toLocaleString();document.getElementById('uniqueIPs').textContent=Object.keys(s.ip_counts||{}).length.toLocaleString();document.getElementById('uniqueCountries').textContent=Object.keys(s.country_counts||{}).length;document.getElementById('clock').textContent=nowClockCN();if(typeof s.uptime_sec==='number')document.getElementById('uptimeChip').textContent='已运行 '+fmtUptime(s.uptime_sec);const gs=document.getElementById('geoStatus');if(s.regeo_running)gs.textContent='识别中 '+(s.regeo_done||0)+'/'+(s.regeo_total||0);else if(s.geo_ok||s.geo_fail)gs.textContent='成功 '+(s.geo_ok||0)+' · 失败 '+(s.geo_fail||0);else gs.textContent='';if(document.getElementById('traffic').classList.contains('on'))loadTraffic();if(document.getElementById('blocks').classList.contains('on'))loadBlocks();if(document.getElementById('overview').classList.contains('on')){const now=Date.now();if(!loadStats._ovAt||now-loadStats._ovAt>30000){loadStats._ovAt=now;loadOverview()}}}catch(e){}}
 function renderIP(map){const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);const sig=JSON.stringify(rows);if(sig===sigIP)return;sigIP=sig;const box=document.getElementById('ipDist');if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b>有请求后自动统计</div>';return}const max=rows[0][1]||1;box.innerHTML=rows.map(([ip,n])=>'<div class="dr"><span class="dn m" title="'+esc(ip)+'"><span class="tx">'+esc(ip)+'</span></span><div class="bar i"><i style="width:'+(n/max*100).toFixed(1)+'%"></i></div><span class="dv">'+n.toLocaleString()+'</span></div>').join('')}
 function renderRegion(map){const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);const sig=JSON.stringify(rows);if(sig===sigReg)return;sigReg=sig;const box=document.getElementById('regionDist');if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b>有请求后自动统计</div>';return}const total=rows.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;box.innerHTML=rows.map(([code,n])=>{const nm=regionName(code);return '<div class="dr"><span class="dn" title="'+esc(nm)+'">'+flagHtml(code)+'<span class="tx">'+esc(nm)+'</span></span><div class="bar t"><i style="width:'+(n/max*100).toFixed(1)+'%"></i></div><span class="dv">'+n.toLocaleString()+'<span>'+(n/total*100).toFixed(0)+'%</span></span></div>'}).join('')}
 function maskHost(h){h=String(h||'').trim();if(!h)return '';const port=h.includes(':')?':'+h.split(':').pop():'',host=h.split(':')[0];if(/^\d{1,3}(\.\d{1,3}){3}$/.test(host)){const p=host.split('.');return p[0]+'.'+p[1]+'.*.*'+port}const parts=host.split('.');if(parts.length<=1)return '***'+port;return '***.'+parts[parts.length-1]+port}
@@ -1361,8 +1703,8 @@ const dayStr=d=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'
 function rangeOf(mode){const t=state.serverToday||dayStr(new Date()),base=new Date(t+'T00:00:00');if(mode==='today')return{from:t,to:t};if(mode==='7d'){const f=new Date(base);f.setDate(f.getDate()-6);return{from:dayStr(f),to:t}}if(mode==='30d'){const f=new Date(base);f.setDate(f.getDate()-29);return{from:dayStr(f),to:t}}return{from:'',to:''}}
 async function loadBlocks(){const r0=state.range||{from:'',to:''};const qs=new URLSearchParams();if(r0.from)qs.set('from',r0.from);if(r0.to)qs.set('to',r0.to);qs.set('page',String(state.page||1));qs.set('size','20');try{const r=await fetch('/admin/api/blocks?'+qs.toString(),{cache:'no-store'});if(!r.ok)return;const data=await r.json();if(data.today)state.serverToday=data.today;const total=data.total||0;state.page=data.page||1;state.pages=data.pages||1;state.total=total;document.getElementById('cntAll').textContent=total.toLocaleString()+' 条';updatePager();const sig=JSON.stringify(data.items||[]);if(sig===sigBlk)return;sigBlk=sig;blockItems=data.items||[];drawBlocks()}catch(e){}}
 function updatePager(){document.getElementById('pageInfo').textContent=state.page+' / '+state.pages+' 页';document.getElementById('prevPage').disabled=state.page<=1;document.getElementById('nextPage').disabled=state.page>=state.pages}
-function drawBlocks(){const body=document.getElementById('blocksBody');if(!blockItems.length){body.innerHTML='<tr><td colspan="5" class="emp"><b>暂无记录</b>被拦截的请求会出现在这里</td></tr>';return}body.innerHTML=blockItems.map((b,i)=>'<tr data-i="'+i+'" style="cursor:pointer"><td class="ct2" data-label="时间">'+esc(b.time)+'</td><td class="ci" data-label="IP">'+esc(b.ip)+'</td><td data-label="地区"><span class="rg">'+flagHtml(b.country)+'<span>'+esc(regionName(b.country))+'</span></span></td><td class="cp" data-label="路径" title="'+esc(b.path)+'">'+esc(shortPath(b.path))+'</td><td data-label="原因"><span class="pill '+(b.reason==='cn'?'pc':'pw')+'" title="'+esc(b.reason_text||reasonLabel(b))+'">'+esc(reasonLabel(b))+'</span></td></tr>').join('')}
-function showDetail(b){document.getElementById('modalTitle').textContent='记录详情';document.getElementById('modalBody').innerHTML=[['时间',esc(b.time),false],['IP',esc(b.ip),true],['地区',esc(regionName(b.country)),false],['原因','<span class="pill '+(b.reason==='cn'?'pc':'pw')+'">'+esc(b.reason_text||reasonLabel(b))+'</span>',false],['路径',esc(b.path),true],['UA',esc(b.ua||'（未记录）'),true]].map(([k,v,m])=>'<div class="kv"><div class="kk">'+k+'</div><div class="kvv'+(m?' m':'')+'">'+v+'</div></div>').join('');document.getElementById('modal').classList.add('on')}
+function drawBlocks(){const body=document.getElementById('blocksBody');if(!blockItems.length){body.innerHTML='<tr><td colspan="5" class="emp"><b>暂无记录</b>被拦截的请求会出现在这里</td></tr>';return}body.innerHTML=blockItems.map((b,i)=>'<tr data-i="'+i+'" style="cursor:pointer"><td class="ct2" data-label="时间">'+esc(fmtTime(b.time))+'</td><td class="ci" data-label="IP">'+esc(b.ip)+'</td><td data-label="地区"><span class="rg">'+flagHtml(b.country)+'<span>'+esc(regionName(b.country))+'</span></span></td><td class="cp" data-label="路径" title="'+esc(b.path)+'">'+esc(shortPath(b.path))+'</td><td data-label="原因"><span class="pill '+(b.reason==='cn'?'pc':'pw')+'" title="'+esc(b.reason_text||reasonLabel(b))+'">'+esc(reasonLabel(b))+'</span></td></tr>').join('')}
+function showDetail(b){document.getElementById('modalTitle').textContent='记录详情';document.getElementById('modalBody').innerHTML=[['时间',esc(fmtTime(b.time)),false],['IP',esc(b.ip),true],['地区',esc(regionName(b.country)),false],['原因','<span class="pill '+(b.reason==='cn'?'pc':'pw')+'">'+esc(b.reason_text||reasonLabel(b))+'</span>',false],['路径',esc(b.path),true],['UA',esc(b.ua||'（未记录）'),true]].map(([k,v,m])=>'<div class="kv"><div class="kk">'+k+'</div><div class="kvv'+(m?' m':'')+'">'+v+'</div></div>').join('');document.getElementById('modal').classList.add('on')}
 document.getElementById('blocksBody').addEventListener('click',e=>{const tr=e.target.closest('tr[data-i]');if(!tr)return;const b=blockItems[+tr.dataset.i];if(b)showDetail(b)});
 document.getElementById('modalClose').addEventListener('click',()=>document.getElementById('modal').classList.remove('on'));
 document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')e.currentTarget.classList.remove('on')});
