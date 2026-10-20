@@ -33,6 +33,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_g
 bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/nginx_manage/main/install.sh)
 ```
 
+配置文件所在目录：/etc/nginx/sites-available
+```bash
+    # 核心配置：匹配根目录下的所有请求
+    location / {
+        proxy_pass http://127.0.0.1:8520; # 替换为你本地服务的实际端口
+        
+        # 携带原始请求的各种头部信息，防止本地服务获取不到真实的客户端 IP 或主机名
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
 安装过程会询问：
 
 ```
