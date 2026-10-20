@@ -206,6 +206,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -1047,8 +1048,31 @@ func (w *statWriter) ReadFrom(r io.Reader) (int64, error) {
 }
 func (w *statWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-func basicAuth(next http.HandlerFunc, user, pass string) http.HandlerFunc {
+// adminCred holds runtime admin username/password (can be rotated without restart).
+type adminCred struct {
+	User string
+	Pass string
+}
+
+var (
+	adminCredPtr   atomic.Pointer[adminCred]
+	adminPassPath  string // e.g. /etc/emby-proxy/admin.pass
+)
+
+func setAdminCred(user, pass string) {
+	adminCredPtr.Store(&adminCred{User: user, Pass: pass})
+}
+func getAdminCred() (string, string) {
+	c := adminCredPtr.Load()
+	if c == nil {
+		return "", ""
+	}
+	return c.User, c.Pass
+}
+
+func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		user, pass := getAdminCred()
 		u, p, ok := r.BasicAuth()
 		if !ok || subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 || subtle.ConstantTimeCompare([]byte(p), []byte(pass)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="emby-proxy admin"`)
@@ -1057,6 +1081,136 @@ func basicAuth(next http.HandlerFunc, user, pass string) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func saveAdminPassFile(pass string) error {
+	if adminPassPath == "" {
+		return fmt.Errorf("密码文件路径未初始化")
+	}
+	tmp := adminPassPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(pass), 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, adminPassPath)
+}
+
+// best-effort: update -admin-pass in systemd unit so next restart keeps new password
+func updateSystemdUnitPass(newPass string) {
+	unit := "/etc/systemd/system/emby-proxy.service"
+	b, err := os.ReadFile(unit)
+	if err != nil {
+		return
+	}
+	s := string(b)
+	// replace -admin-pass "..." or -admin-pass xxx
+	re := regexp.MustCompile(`-admin-pass(\s+)("[^"]*"|'[^']*'|\S+)`)
+	quoted := strconv.Quote(newPass) // Go-style quotes, close enough for unit
+	// systemd uses shell-like quoting; use double quotes with escaped chars
+	esc := strings.ReplaceAll(newPass, `\`, `\\`)
+	esc = strings.ReplaceAll(esc, `"`, `\"`)
+	esc = strings.ReplaceAll(esc, `%`, `%%`)
+	replacement := `-admin-pass$1"` + esc + `"`
+	ns := re.ReplaceAllString(s, replacement)
+	if ns == s {
+		_ = quoted
+		return
+	}
+	_ = os.WriteFile(unit, []byte(ns), 0644)
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+}
+
+// ---------- 防火墙：放行 / 关闭服务端口 ----------
+func cmdExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+func firewallBackend() string {
+	if cmdExists("firewall-cmd") {
+		if out, err := exec.Command("firewall-cmd", "--state").CombinedOutput(); err == nil && strings.Contains(strings.ToLower(string(out)), "running") {
+			return "firewalld"
+		}
+	}
+	if cmdExists("ufw") {
+		if out, err := exec.Command("ufw", "status").CombinedOutput(); err == nil {
+			low := strings.ToLower(string(out))
+			if strings.Contains(low, "active") || strings.Contains(low, "启用") {
+				return "ufw"
+			}
+		}
+	}
+	if cmdExists("iptables") {
+		return "iptables"
+	}
+	return ""
+}
+
+func firewallPortOpen(port int) (open bool, backend string, detail string) {
+	backend = firewallBackend()
+	if backend == "" {
+		return false, "", "未检测到可用防火墙（firewalld / ufw / iptables）"
+	}
+	ps := strconv.Itoa(port)
+	switch backend {
+	case "firewalld":
+		out, err := exec.Command("firewall-cmd", "--query-port", ps+"/tcp").CombinedOutput()
+		open = err == nil && strings.TrimSpace(string(out)) == "yes"
+		detail = strings.TrimSpace(string(out))
+	case "ufw":
+		out, _ := exec.Command("ufw", "status").CombinedOutput()
+		s := string(out)
+		open = strings.Contains(s, ps+"/tcp") || strings.Contains(s, ps+" ")
+		detail = "ufw"
+	case "iptables":
+		out, err := exec.Command("iptables", "-C", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT").CombinedOutput()
+		open = err == nil
+		if !open {
+			detail = strings.TrimSpace(string(out))
+		}
+	}
+	return open, backend, detail
+}
+
+func firewallSetPort(port int, allow bool) error {
+	backend := firewallBackend()
+	if backend == "" {
+		return fmt.Errorf("未检测到可用防火墙")
+	}
+	ps := strconv.Itoa(port)
+	var cmd *exec.Cmd
+	switch backend {
+	case "firewalld":
+		if allow {
+			_ = exec.Command("firewall-cmd", "--permanent", "--add-port="+ps+"/tcp").Run()
+			cmd = exec.Command("firewall-cmd", "--reload")
+		} else {
+			_ = exec.Command("firewall-cmd", "--permanent", "--remove-port="+ps+"/tcp").Run()
+			cmd = exec.Command("firewall-cmd", "--reload")
+		}
+	case "ufw":
+		if allow {
+			cmd = exec.Command("ufw", "allow", ps+"/tcp")
+		} else {
+			cmd = exec.Command("ufw", "delete", "allow", ps+"/tcp")
+		}
+	case "iptables":
+		if allow {
+			// avoid duplicate
+			if err := exec.Command("iptables", "-C", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT").Run(); err == nil {
+				return nil
+			}
+			cmd = exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT")
+		} else {
+			cmd = exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT")
+		}
+	default:
+		return fmt.Errorf("不支持的防火墙: %s", backend)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s", err.Error(), strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 type switchTransport struct{ v atomic.Value }
@@ -1159,7 +1313,7 @@ type saveReq struct {
 	GeoAPI    bool     `json:"geo_api"`
 	GeoAPIURL string   `json:"geo_api_url"`
 }
-func adminHandler(user, pass string) http.HandlerFunc {
+func adminHandler() http.HandlerFunc {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1327,6 +1481,79 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
 	})
+	// 修改管理密码（需验证旧密码）
+	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			OldPass string `json:"old_pass"`
+			NewPass string `json:"new_pass"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求数据格式错误", http.StatusBadRequest)
+			return
+		}
+		req.OldPass = strings.TrimSpace(req.OldPass)
+		req.NewPass = strings.TrimSpace(req.NewPass)
+		if req.NewPass == "" {
+			http.Error(w, "新密码不能为空", http.StatusBadRequest)
+			return
+		}
+		if len(req.NewPass) < 6 {
+			http.Error(w, "新密码至少 6 位", http.StatusBadRequest)
+			return
+		}
+		user, pass := getAdminCred()
+		if subtle.ConstantTimeCompare([]byte(req.OldPass), []byte(pass)) != 1 {
+			http.Error(w, "旧密码不正确", http.StatusForbidden)
+			return
+		}
+		if err := saveAdminPassFile(req.NewPass); err != nil {
+			http.Error(w, "写入密码文件失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		setAdminCred(user, req.NewPass)
+		updateSystemdUnitPass(req.NewPass)
+		log.Printf("管理密码已通过管理页修改")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+	// 防火墙状态 / 放行或关闭服务端口
+	mux.HandleFunc("/admin/api/firewall", func(w http.ResponseWriter, r *http.Request) {
+		port := currentPort()
+		if r.Method == http.MethodGet {
+			open, backend, detail := firewallPortOpen(port)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"port":    port,
+				"open":    open,
+				"backend": backend,
+				"detail":  detail,
+				"available": backend != "",
+			})
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Allow *bool `json:"allow"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Allow == nil {
+			http.Error(w, "请提供 allow: true/false", http.StatusBadRequest)
+			return
+		}
+		if err := firewallSetPort(port, *req.Allow); err != nil {
+			http.Error(w, "防火墙操作失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		open, backend, _ := firewallPortOpen(port)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "port": port, "open": open, "backend": backend})
+	})
 	mux.HandleFunc("/admin/api/clear-stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
 		statsMu.Lock()
@@ -1367,11 +1594,13 @@ func adminHandler(user, pass string) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-cache")
 		_, _ = w.Write(adminHTML)
 	})
-	return basicAuth(mux.ServeHTTP, user, pass)
+	return basicAuth(mux.ServeHTTP)
 }
 
 func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 	loadConfig(configPath)
+	adminPassPath = filepath.Join(filepath.Dir(configPath), "admin.pass")
+	setAdminCred(adminUser, adminPass)
 	geoCacheLoad(filepath.Join(filepath.Dir(configPath), "geo_cache.json"))
 	flagDir = filepath.Join(filepath.Dir(configPath), "flags")
 	loadStats(statsFile)
@@ -1402,7 +1631,7 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 		proxy.ServeHTTP(sw, r.WithContext(ctx))
 		recordBytes(sw.bytes)
 	})
-	adminSrv := adminHandler(adminUser, adminPass)
+	adminSrv := adminHandler()
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/admin" { http.Redirect(w, r, "/admin/", http.StatusFound); return }
 		if strings.HasPrefix(r.URL.Path, "/admin/") { adminSrv.ServeHTTP(w, r); return }
@@ -1571,13 +1800,35 @@ tbody tr:last-child td{border-bottom:0}
 .obip{font-family:var(--mono);font-weight:500;flex-shrink:0;font-size:12.5px}
 .obp{flex:1;font-family:var(--mono);font-size:12px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .obt{font-size:11px;color:var(--t3);font-family:var(--mono);flex-shrink:0}
-.mmb{display:none;background:transparent;border:0;padding:8px;cursor:pointer;color:var(--t)}
+.mmb{display:none;align-items:center;justify-content:center;width:40px;height:40px;margin-right:4px;background:#f1f5f9;border:1px solid var(--bd);border-radius:10px;padding:0;cursor:pointer;color:var(--t);font-size:20px;line-height:1;flex-shrink:0;-webkit-tap-highlight-color:transparent}
+.mmb:active{background:#e2e8f0}
+.sb-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:90;border:0;padding:0;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.sb-mask.on{display:block}
 @media(max-width:900px){.sg{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}.g2 .card{margin-bottom:22px}.og{grid-template-columns:1fr}.sysg{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:768px){body{flex-direction:column}.sb{position:fixed;left:0;top:0;bottom:0;transform:translateX(-100%)}.sb.on{transform:translateX(0)}.mmb{display:block}.tb{padding:0 16px}.sc{padding:16px}.card{padding:16px;margin-bottom:16px}.tw{margin:0 -16px -16px;padding:0 16px 16px}table tr{display:block;padding:12px;border-bottom:1px solid var(--bd)}thead{display:none}td{display:flex;padding:4px 0;border:0;gap:12px}td::before{content:attr(data-label);width:60px;color:var(--t3);font-size:12px;flex-shrink:0}}
+@media(max-width:768px){
+body{flex-direction:column}
+.sb{position:fixed;left:0;top:0;bottom:0;width:min(280px,82vw);max-width:280px;transform:translate3d(-105%,0,0);transition:transform .25s ease;z-index:100;box-shadow:none;border-right:1px solid var(--bd);background:var(--card)}
+.sb.on{transform:translate3d(0,0,0);box-shadow:8px 0 32px rgba(15,23,42,.18)}
+.mmb{display:inline-flex}
+.mc{width:100%;min-width:0;flex:1}
+.tb{padding:0 12px 0 8px;height:56px}
+.tb-t{font-size:16px}
+.sc{padding:14px 12px}
+.card{padding:16px;margin-bottom:14px}
+.sg{gap:12px;margin-bottom:14px}
+.stc{padding:14px 16px}
+.sv{font-size:22px}
+.tw{margin:0 -16px -16px;padding:0 16px 16px}
+table tr{display:block;padding:12px;border-bottom:1px solid var(--bd)}
+thead{display:none}
+td{display:flex;padding:4px 0;border:0;gap:12px}
+td::before{content:attr(data-label);width:60px;color:var(--t3);font-size:12px;flex-shrink:0}
+}
 @media(max-width:480px){.sg{grid-template-columns:1fr}.sysg{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
+<button type="button" class="sb-mask" id="sbMask" aria-label="关闭菜单"></button>
 <aside class="sb" id="sb">
 <div class="sb-h"><div class="sb-brand"><div class="sb-t">Emby Proxy</div><div class="sb-sub">路径反代 · 管理台</div></div></div>
 <ul class="nav">
@@ -1646,6 +1897,23 @@ tbody tr:last-child td{border-bottom:0}
 </div>
 </div>
 </div>
+<div class="card" style="margin-top:22px">
+<div class="ch"><div><h2 class="ct">安全设置</h2><div class="cd">管理密码与防火墙端口放行</div></div></div>
+<div class="fi"><label class="fl">修改管理密码</label>
+<div style="display:grid;gap:10px;max-width:360px">
+<input id="oldPass" class="inp m" type="password" placeholder="当前密码" autocomplete="current-password">
+<input id="newPass" class="inp m" type="password" placeholder="新密码（至少 6 位）" autocomplete="new-password">
+<input id="newPass2" class="inp m" type="password" placeholder="确认新密码" autocomplete="new-password">
+</div>
+<div class="acts"><button class="btn b" id="changePassBtn">保存新密码</button></div>
+<div class="hint">修改后立即生效，并写入 <code>/etc/emby-proxy/admin.pass</code>；浏览器可能仍缓存旧登录，可清站点数据后重登。</div>
+</div>
+<div class="row" style="margin-top:8px;border-top:1px solid var(--bd);padding-top:16px">
+<div><div class="rl">防火墙放行服务端口</div><div class="rd" id="fwDesc">检测中…</div></div>
+<label class="sw"><input type="checkbox" id="fwAllow"><span class="tr2"></span></label>
+</div>
+<div class="hint" id="fwHint">支持 firewalld / ufw / iptables；需 root 运行服务才可改防火墙。</div>
+</div>
 <div class="card" style="border-color:#fecaca;margin-top:22px">
 <div class="ch"><div><h2 class="ct" style="color:var(--d)">危险操作</h2><div class="cd">以下操作不可恢复，请谨慎执行</div></div></div>
 <div class="row" style="padding-top:0"><div><div class="rl">还原初始化设置</div><div class="rd">白名单、大陆限制、在线查询开关恢复默认；不清空统计与密码</div></div><button class="btn g" id="resetConfigBtn" style="color:var(--d);border-color:#fecaca">还原</button></div>
@@ -1677,11 +1945,15 @@ function flagHtml(c){if(!c||c==='??'||LOCAL_CODES[c])return flagBadge(c==='LO'?'
 document.addEventListener('error',e=>{const i=e.target;if(i&&i.tagName==='IMG'&&i.classList.contains('flg')){const s=document.createElement('span');s.className='fb';s.textContent=i.alt||'?';i.replaceWith(s)}},true);
 function shortPath(p){if(!p)return '';const q=p.indexOf('?');if(q>0&&p.length>q+1)return p.slice(0,q)+' ?…';return p.length>96?p.slice(0,96)+'…':p}
 const pageTitles={overview:'概览',traffic:'流量',blocks:'拦截',settings:'设置'};
-function switchTab(id){document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));document.getElementById('pt').textContent=pageTitles[id]||'';if(window.innerWidth<=768)document.getElementById('sb').classList.remove('on');if(id==='overview')loadOverview();if(id==='traffic')loadTraffic();if(id==='blocks'){sigBlk='';loadBlocks()}}
+function closeSidebar(){const sb=document.getElementById('sb'),mask=document.getElementById('sbMask');if(sb)sb.classList.remove('on');if(mask)mask.classList.remove('on')}
+function openSidebar(){const sb=document.getElementById('sb'),mask=document.getElementById('sbMask');if(sb)sb.classList.add('on');if(mask)mask.classList.add('on')}
+function toggleSidebar(){const sb=document.getElementById('sb');if(sb&&sb.classList.contains('on'))closeSidebar();else openSidebar()}
+function switchTab(id){document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));document.getElementById('pt').textContent=pageTitles[id]||'';if(window.innerWidth<=768)closeSidebar();if(id==='overview')loadOverview();if(id==='traffic')loadTraffic();if(id==='blocks'){sigBlk='';loadBlocks()}}
 document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
-document.getElementById('mmb').addEventListener('click',()=>document.getElementById('sb').classList.toggle('on'));
+document.getElementById('mmb').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();toggleSidebar()});
+const sbMaskEl=document.getElementById('sbMask');if(sbMaskEl)sbMaskEl.addEventListener('click',closeSidebar);
 function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portNow').textContent=p;document.getElementById('portChip').textContent=':'+p}
-async function loadConfig(){try{const r=await fetch('/admin/api/config',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const c=await r.json();const wl=c.whitelist||[];document.getElementById('whitelist').value=wl.join('\n');renderWl(wl);document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('geoAPI').checked=!!c.geo_api;document.getElementById('geoAPIURL').value=c.geo_api_url||'';applyPort(c.effective_port)}catch(e){toast('加载配置失败: '+e.message,'err')}}
+async function loadConfig(){try{const r=await fetch('/admin/api/config',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const c=await r.json();const wl=c.whitelist||[];document.getElementById('whitelist').value=wl.join('\n');renderWl(wl);document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('geoAPI').checked=!!c.geo_api;document.getElementById('geoAPIURL').value=c.geo_api_url||'';applyPort(c.effective_port);if(typeof loadFirewall==='function')loadFirewall()}catch(e){toast('加载配置失败: '+e.message,'err')}}
 let sigIP='',sigReg='',sigBlk='';const trState={range:{from:'',to:''}};
 let miniTrendChart=null,ovLoading=false;
 async function loadOverview(){if(ovLoading)return;ovLoading=true;try{const[t,b,c]=await Promise.all([fetch('/admin/api/traffic',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null),fetch('/admin/api/blocks?page=1&size=5',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null),fetch('/admin/api/config',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null)]);if(t){renderMiniTrend(t.trend||[]);renderOvRegion(t.country_counts||{})}if(b)renderOvBlocks(b.items||[]);renderOvSystem(c)}catch(e){}finally{ovLoading=false}}
@@ -1727,10 +1999,68 @@ document.getElementById('geoAPIURL').addEventListener('change',async()=>{if(awai
 document.getElementById('geoTest').addEventListener('click',async()=>{const btn=document.getElementById('geoTest'),out=document.getElementById('geoResult');btn.disabled=true;out.innerHTML='<div style="margin-top:12px;color:var(--t3);font-size:13px">正在请求接口…</div>';await save({});try{const r=await fetch('/admin/api/geotest',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(d.ok){out.innerHTML='<div style="margin-top:12px;color:var(--ok);font-size:13px">接口正常：'+esc(d.ip)+' → '+esc(d.name)+'（'+esc(d.code)+'）</div>'}else{out.innerHTML='<div style="margin-top:12px;color:var(--w);font-size:13px">接口失败：'+esc(d.error)+'</div>'}}catch(e){out.innerHTML='<div style="margin-top:12px;color:var(--w);font-size:13px">请求失败：'+esc(e.message)+'</div>'}btn.disabled=false});
 document.getElementById('regeoBtn').addEventListener('click',async()=>{const btn=document.getElementById('regeoBtn');btn.disabled=true;try{const r=await fetch('/admin/api/regeo',{method:'POST'});const d=await r.json();toast(d.started?'开始重新识别':'正在识别中','ok');setTimeout(()=>{loadStats();btn.disabled=false},700)}catch(e){toast('启动失败: '+e.message,'err');btn.disabled=false}});
 function confirmAction(opts){return new Promise(resolve=>{const modal=document.getElementById('modal');document.getElementById('modalTitle').textContent=opts.title;document.getElementById('modalBody').innerHTML='<div style="font-size:13.5px;line-height:1.75;color:var(--t2);margin-bottom:20px">'+(opts.body||'')+'</div><div class="acts" style="justify-content:flex-end;margin-top:0"><button class="btn g" id="cfCancel">取消</button><button class="btn b" id="cfOk" style="'+(opts.danger?'background:#dc2626':'')+'">'+(opts.okText||'确定')+'</button></div>';modal.classList.add('on');const close=v=>{modal.classList.remove('on');resolve(v)};document.getElementById('cfOk').onclick=()=>close(true);document.getElementById('cfCancel').onclick=()=>close(false)})}
+
+document.getElementById('changePassBtn').addEventListener('click',async()=>{
+  const oldP=document.getElementById('oldPass').value;
+  const n1=document.getElementById('newPass').value;
+  const n2=document.getElementById('newPass2').value;
+  if(!oldP){toast('请输入当前密码','err');return}
+  if(!n1||n1.length<6){toast('新密码至少 6 位','err');return}
+  if(n1!==n2){toast('两次新密码不一致','err');return}
+  const btn=document.getElementById('changePassBtn');btn.disabled=true;
+  try{
+    const r=await fetch('/admin/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_pass:oldP,new_pass:n1})});
+    const txt=await r.text();
+    if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
+    document.getElementById('oldPass').value='';document.getElementById('newPass').value='';document.getElementById('newPass2').value='';
+    toast('密码已修改，请使用新密码重新登录','ok');
+  }catch(e){toast('修改失败: '+e.message,'err')}
+  btn.disabled=false;
+});
+let fwLoading=false;
+async function loadFirewall(){
+  const desc=document.getElementById('fwDesc'),hint=document.getElementById('fwHint'),sw=document.getElementById('fwAllow');
+  if(!desc||!sw)return;
+  try{
+    const r=await fetch('/admin/api/firewall',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    if(!d.available){
+      desc.textContent='未检测到防火墙，无法自动放行';
+      sw.disabled=true;sw.checked=false;
+      if(hint)hint.textContent='系统需安装并启用 firewalld、ufw 或 iptables，且服务以 root 运行。';
+      return;
+    }
+    sw.disabled=false;
+    fwLoading=true;sw.checked=!!d.open;fwLoading=false;
+    const name=d.backend==='firewalld'?'firewalld':d.backend==='ufw'?'UFW':'iptables';
+    desc.textContent=(d.open?'已放行':'未放行')+' · 端口 '+d.port+'/tcp · '+name;
+    if(hint)hint.textContent='开启后允许外网访问本服务端口；关闭则移除对应放行规则（不影响本机访问）。';
+  }catch(e){
+    desc.textContent='防火墙状态获取失败';
+    if(hint)hint.textContent=e.message||'';
+  }
+}
+document.getElementById('fwAllow').addEventListener('change',async()=>{
+  if(fwLoading)return;
+  const sw=document.getElementById('fwAllow'),allow=sw.checked;
+  sw.disabled=true;
+  try{
+    const r=await fetch('/admin/api/firewall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({allow})});
+    const txt=await r.text();
+    if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
+    toast(allow?'已放行服务端口':'已关闭端口放行','ok');
+    await loadFirewall();
+  }catch(e){
+    toast('操作失败: '+e.message,'err');
+    await loadFirewall();
+  }
+  sw.disabled=false;
+});
 document.getElementById('resetConfigBtn').addEventListener('click',async()=>{const ok=await confirmAction({title:'还原初始化设置',body:'将恢复为默认值：<br>· 仅允许中国大陆 IP：<b>关闭</b><br>· 目标域名白名单：<b>清空</b><br>· 在线 IP 查询：<b>开启</b><br>· 接口地址：<b>恢复默认</b><br><br>监听端口保持不变，统计数据与密码不受影响。',okText:'确认还原',danger:true});if(!ok)return;try{const r=await fetch('/admin/api/reset-config',{method:'POST'});const txt=await r.text();if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));const c=JSON.parse(txt);if(c.effective_port)applyPort(c.effective_port);await loadConfig();loadStats();toast('已还原为默认设置','ok')}catch(e){toast('还原失败: '+e.message,'err')}});
 document.getElementById('clearStatsBtn').addEventListener('click',async()=>{const ok=await confirmAction({title:'清空所有统计',body:'以下数据将被清除，<b style="color:#dc2626">不可恢复</b>：<br>· 今日/累计请求数与流量<br>· IP 与地区分布<br>· 拦截记录与拦截计数<br><br>配置、白名单、管理密码<b>不受影响</b>。',okText:'确认清空',danger:true});if(!ok)return;try{const r=await fetch('/admin/api/clear-stats',{method:'POST'});if(!r.ok){const txt=await r.text();throw new Error(txt.trim()||('HTTP '+r.status))}toast('统计已清空','ok');loadStats();if(document.getElementById('overview').classList.contains('on'))loadOverview()}catch(e){toast('清空失败: '+e.message,'err')}});
 document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
-loadConfig();loadStats();loadOverview();setInterval(loadStats,5000);
+loadConfig();loadStats();loadOverview();loadFirewall();setInterval(loadStats,5000);
 </script>
 </body>
 </html>
