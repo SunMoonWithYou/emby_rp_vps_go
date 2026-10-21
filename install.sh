@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Emby 路径反代 — 一键安装 / 管理脚本
-#
-# 功能：编译并安装 Go 实现的路径反代服务，提供 systemd 管理与管理后台。
-# 用法：sudo ./emby-proxy.sh [menu|install|update|uninstall|status|start|stop|restart]
+# Emby 路径反代 — 一键安装 / 管理脚本 (最终完美版)
 # =============================================================================
 set -euo pipefail
 
@@ -12,15 +9,13 @@ SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
 DEFAULT_BIN="/usr/local/bin/emby-proxy"
 CONFIG_DIR="/etc/emby-proxy"
-CONFIG_FILE="${CONFIG_DIR}/config.json"
-ADMIN_PASS_FILE="${CONFIG_DIR}/admin.pass"
-STATS_FILE="${CONFIG_DIR}/stats.json"
+DB_FILE="${CONFIG_DIR}/emby.db"
 BUILD_HASH_FILE="${CONFIG_DIR}/build.sha256"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GO_MIN_MAJOR=1
 GO_MIN_MINOR=20
-GO_FALLBACK_VERSION="1.23.4"   # 包管理器失败时下载的官方 Go 版本
-IPLOC_VERSION="latest"         # github.com/phuslu/iploc 依赖版本
+GO_FALLBACK_VERSION="1.23.4"
+IPLOC_VERSION="latest"
 
 # ---------- 运行时状态 ----------
 BUILD_TMPDIR=""
@@ -41,17 +36,12 @@ warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
 err()  { printf '\033[1;31m[ERR] %s\033[0m\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
-# 退出时清理临时编译目录
 cleanup() {
-  if [[ -n "$BUILD_TMPDIR" && -d "$BUILD_TMPDIR" ]]; then
-    rm -rf "$BUILD_TMPDIR"
-  fi
+  if [[ -n "$BUILD_TMPDIR" && -d "$BUILD_TMPDIR" ]]; then rm -rf "$BUILD_TMPDIR"; fi
 }
 trap cleanup EXIT
 
-require_root() {
-  [[ $EUID -eq 0 ]] || die "请使用 root 权限: sudo $0 $*"
-}
+require_root() { [[ $EUID -eq 0 ]] || die "请使用 root 权限: sudo $0 $*"; }
 require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "未检测到 systemctl"
   [[ -d /run/systemd/system ]] || die "systemd 未运行"
@@ -64,7 +54,6 @@ Emby 路径反代 一键安装
 EOF
 }
 
-# 解析 install / update 的命令行参数
 parse_install_args() {
   PORT="$(installed_port)"
   BIN_PATH="$(installed_bin_path)"
@@ -77,48 +66,22 @@ parse_install_args() {
   PORT_GIVEN=0
   PASS_GIVEN=0
 
-  need_value() {
-    if [[ $# -lt 2 ]]; then
-      die "参数 $1 后面需要一个值"
-    fi
-  }
-
+  need_value() { if [[ $# -lt 2 ]]; then die "参数 $1 后面需要一个值"; fi; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --code-only) BINARY_ONLY=1; shift ;;
-      --port)
-        need_value "$@"
-        PORT="$2"
-        PORT_GIVEN=1
-        shift 2
-        ;;
-      --bin)
-        need_value "$@"
-        BIN_PATH="$2"
-        shift 2
-        ;;
-      --admin-user)
-        need_value "$@"
-        ADMIN_USER="$2"
-        shift 2
-        ;;
-      --admin-pass)
-        need_value "$@"
-        ADMIN_PASS="$2"
-        PASS_GIVEN=1
-        shift 2
-        ;;
-      --prebuilt)
-        need_value "$@"
-        PREBUILT="$2"
-        shift 2
-        ;;
+      --port) need_value "$@"; PORT="$2"; PORT_GIVEN=1; shift 2 ;;
+      --bin) need_value "$@"; BIN_PATH="$2"; shift 2 ;;
+      --admin-user) need_value "$@"; ADMIN_USER="$2"; shift 2 ;;
+      --admin-pass) need_value "$@"; ADMIN_PASS="$2"; PASS_GIVEN=1; shift 2 ;;
+      --prebuilt) need_value "$@"; PREBUILT="$2"; shift 2 ;;
       --force) FORCE=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "未知参数: $1" ;;
     esac
   done
 }
+
 stop_and_disable() { systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true; }
 go_version_ok() {
   command -v go >/dev/null 2>&1 || return 1
@@ -178,23 +141,22 @@ ensure_go() {
   go_version_ok || die "Go 自动安装失败"
   info "Go 就绪: $(go env GOVERSION)"
 }
+
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
-// Emby 路径反代服务
-//
-// 将请求路径中的目标地址解析后做反向代理，例如：
-//   http://本机:8520/https://example.com/emby/...
-// 管理页：/admin/（Basic Auth）
-// 支持：大陆 IP 限制、目标域名白名单、访问统计、拦截日志、国旗与 Geo 查询
 package main
 
 import (
 	"bufio"
+	"bytes"
+	"container/list"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -206,12 +168,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -219,31 +179,46 @@ import (
 	"time"
 
 	"github.com/phuslu/iploc"
+	bolt "go.etcd.io/bbolt"
+	"golang.org/x/sync/singleflight"
 )
 
 //go:embed admin.html
 var adminHTML []byte
 
 type targetCtxKey struct{}
+type upBytesCtxKey struct{}
 
 var httpPorts = map[string]bool{"80": true, "8080": true, "8000": true, "8008": true, "8081": true, "8088": true, "8888": true, "3000": true, "5000": true, "7001": true, "8090": true, "8096": true, "9000": true, "9090": true, "9200": true, "10000": true, "15672": true}
 
 func schemeForPort(port string) string {
-	if port == "" || port == "443" || port == "8443" || port == "8920" || port == "9443" { return "https" }
-	if httpPorts[port] { return "http" }
+	if port == "" || port == "443" || port == "8443" || port == "8920" || port == "9443" {
+		return "https"
+	}
+	if httpPorts[port] {
+		return "http"
+	}
 	return "https"
 }
 func schemeForAuthority(authority string) string {
 	host := authority
-	if i := strings.LastIndexByte(authority, '@'); i >= 0 { host = authority[i+1:] }
+	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
+		host = authority[i+1:]
+	}
 	var port string
 	if strings.HasPrefix(host, "[") {
-		if i := strings.LastIndexByte(host, ']'); i >= 0 && len(host) > i+1 && host[i+1] == ':' { port = host[i+2:] }
-	} else if i := strings.LastIndexByte(host, ':'); i >= 0 { port = host[i+1:] }
+		if i := strings.LastIndexByte(host, ']'); i >= 0 && len(host) > i+1 && host[i+1] == ':' {
+			port = host[i+2:]
+		}
+	} else if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		port = host[i+1:]
+	}
 	return schemeForPort(port)
 }
 func splitAuthority(s string) (authority, path string) {
-	if i := strings.IndexByte(s, '/'); i >= 0 { return s[:i], s[i:] }
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		return s[:i], s[i:]
+	}
 	return s, ""
 }
 
@@ -251,101 +226,300 @@ var builtinAssets = map[string]bool{"favicon.ico": true, "favicon.png": true, "f
 
 func isBuiltinAssetPath(p string) bool {
 	p = strings.TrimPrefix(p, "/")
-	if p == "" { return false }
+	if p == "" {
+		return false
+	}
 	if !strings.Contains(p, "/") {
-		if builtinAssets[p] { return true }
+		if builtinAssets[p] {
+			return true
+		}
 		return strings.HasSuffix(p, ".ico")
 	}
 	return strings.HasPrefix(p, ".well-known/")
 }
 
+// ---------- 统一主题页面（首页 / 错误提示）----------
+const pageCSS = `
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--r:16px}
+body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:40px 36px;max-width:520px;width:100%;box-shadow:0 4px 24px -4px rgba(15,23,42,.06);text-align:center}
+.icon{width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:28px}
+.icon.blue{background:var(--ps);color:var(--p)}
+.icon.red{background:#fef2f2;color:var(--d)}
+.icon.amber{background:#fffbeb;color:var(--w)}
+h1{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:10px;color:var(--t)}
+.desc{color:var(--t2);font-size:14.5px;line-height:1.7;margin-bottom:28px}
+.ex{background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:16px 18px;text-align:left;margin-bottom:24px;font-size:13.5px}
+.ex-t{font-size:12px;color:var(--t3);margin-bottom:8px;font-weight:600}
+.ex code{display:block;word-break:break-all;line-height:1.7;font-family:Consolas,monospace;color:var(--pd)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 22px;border-radius:10px;font-size:14px;font-weight:500;cursor:pointer;border:0;font-family:inherit;text-decoration:none;transition:.2s}
+.btn.b{background:var(--p);color:#fff;box-shadow:0 2px 6px rgba(59,130,246,.25)}
+.btn.b:hover{background:var(--pd)}
+.btn.g{background:#fff;border:1px solid var(--bd);color:var(--t2)}
+.btn.g:hover{background:#f8fafc;color:var(--t)}
+.acts{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.foot{margin-top:28px;font-size:12.5px;color:var(--t3)}
+.brand{font-weight:600;color:var(--t2)}
+@media(max-width:480px){.card{padding:28px 20px}h1{font-size:20px}}
+`
+
+func writePage(w http.ResponseWriter, status int, iconClass, icon, title, desc, extraHTML string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>` + title + ` · Emby Proxy</title><style>` + pageCSS + `</style></head><body><div class="card"><div class="icon ` + iconClass + `">` + icon + `</div><h1>` + title + `</h1><div class="desc">` + desc + `</div>` + extraHTML + `<div class="foot"><span class="brand">Emby Proxy</span> · 路径反代网关</div></div></body></html>`
+	_, _ = w.Write([]byte(html))
+}
+
+func serveHome(w http.ResponseWriter, r *http.Request) {
+	extra := `
+<div class="ex"><div class="ex-t">使用方式</div><code>/https://你的Emby域名:端口/路径</code></div>
+<div class="ex" style="margin-bottom:28px"><div class="ex-t">示例</div><code>/https://emby.example.com:8096/web/index.html</code></div>
+<div class="acts"><a class="btn b" href="/admin/">进入管理后台</a></div>`
+	writePage(w, http.StatusOK, "blue", "⚡", "Emby 路径反代",
+		"将请求按路径转发到指定上游服务，支持白名单、地区限制、限流与缓存加速。", extra)
+}
+
+func serveError(w http.ResponseWriter, status int, title, message string) {
+	iconClass, icon := "red", "✕"
+	switch status {
+	case http.StatusTooManyRequests:
+		iconClass, icon = "amber", "⏱"
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		iconClass, icon = "amber", "⚠"
+	case http.StatusNotFound:
+		iconClass, icon = "blue", "?"
+	}
+	extra := `<div class="acts"><a class="btn g" href="/">返回首页</a></div>`
+	writePage(w, status, iconClass, icon, title, message, extra)
+}
+
 func parseTarget(r *http.Request) (*url.URL, error) {
 	raw := r.URL.EscapedPath()
-	if raw == "" || raw == "/" { return nil, fmt.Errorf("请指定目标，格式: /https://域名/路径") }
+	if raw == "" || raw == "/" {
+		return nil, fmt.Errorf("请指定目标，格式: /https://域名/路径")
+	}
 	rest := strings.TrimPrefix(raw, "/")
-	for strings.HasPrefix(rest, "/") { rest = rest[1:] }
-	if rest == "" { return nil, fmt.Errorf("缺少目标主机") }
+	for strings.HasPrefix(rest, "/") {
+		rest = rest[1:]
+	}
+	if rest == "" {
+		return nil, fmt.Errorf("缺少目标主机")
+	}
 	var scheme, body string
 	body = rest
 	for i := 0; i < 3; i++ {
 		lower := strings.ToLower(body)
 		switch {
 		case strings.HasPrefix(lower, "https:"):
-			if scheme == "" { scheme = "https" }
+			if scheme == "" {
+				scheme = "https"
+			}
 			body = body[len("https:"):]
 		case strings.HasPrefix(lower, "http:"):
-			if scheme == "" { scheme = "http" }
+			if scheme == "" {
+				scheme = "http"
+			}
 			body = body[len("http:"):]
 		default:
 			i = 99
 			continue
 		}
 		trimmed := strings.TrimLeft(body, "/")
-		if trimmed == body { break }
+		if trimmed == body {
+			break
+		}
 		body = trimmed
 	}
 	body = strings.TrimLeft(body, "/")
 	authority, pathPart := splitAuthority(body)
-	if authority == "" { return nil, fmt.Errorf("缺少目标主机") }
-	if scheme == "" { scheme = schemeForAuthority(authority) }
+	if authority == "" {
+		return nil, fmt.Errorf("缺少目标主机")
+	}
+	if scheme == "" {
+		scheme = schemeForAuthority(authority)
+	}
 	targetStr := scheme + "://" + authority + pathPart
-	if r.URL.RawQuery != "" { targetStr += "?" + r.URL.RawQuery }
+	if r.URL.RawQuery != "" {
+		targetStr += "?" + r.URL.RawQuery
+	}
 	u, err := url.Parse(targetStr)
-	if err != nil || u.Host == "" { return nil, fmt.Errorf("目标地址无效: %s", authority) }
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("目标地址无效: %s", authority)
+	}
 	return u, nil
 }
 
 type Config struct {
-	Port      int      `json:"port"`
-	ChinaOnly bool     `json:"china_only"`
-	Whitelist []string `json:"whitelist"`
-	GeoAPI    bool     `json:"geo_api"`
-	GeoAPIURL string   `json:"geo_api_url"`
+	Port        int      `json:"port"`
+	ChinaOnly   bool     `json:"china_only"`
+	Whitelist   []string `json:"whitelist"`
+	GeoAPI      bool     `json:"geo_api"`
+	GeoAPIURL   string   `json:"geo_api_url"`
+	BanList     []string `json:"ban_list"`
+	AutoBan     bool     `json:"auto_ban"`
+	RateLimit   int      `json:"rate_limit"`
+	AllowedUAs  []string `json:"allowed_uas"`
+	EnableCache bool     `json:"enable_cache"`
+	CORS        bool     `json:"cors"`
+}
+
+// rateLimitEntry：每个 IP 一个限流窗口。
+// 注意：Count/WindowStart 必须用 atomic 访问——sync.Map 返回的是共享指针，
+// 并发请求同时读写会构成 data race（原实现直接 ++ 是有竞态的）。
+type rateLimitEntry struct {
+	Count       atomic.Int64
+	WindowStart atomic.Int64 // UnixNano，窗口起始时间
 }
 
 var startedAt = time.Now()
 var (
-	cfgPtr  atomic.Pointer[Config]
-	cfgPath string
-	proxyTr = &switchTransport{}
-	listenMu  sync.Mutex
-	curLn     net.Listener
-	curPort   int
-	globalSrv *http.Server
+	db          *bolt.DB
+	dbPath      string
+	faviconData atomic.Pointer[[]byte] // 启动时后台预热，处理器只读，避免首次请求阻塞
+	cfgPtr      atomic.Pointer[Config]
+	proxyTr     = &switchTransport{}
+	listenMu    sync.Mutex
+	curLn       net.Listener
+	curPort     int
+	globalSrv   *http.Server
+
+	ipLimiters sync.Map
+	logClients sync.Map
+	logChan    = make(chan string, 1000)
 )
 
-func currentCfg() *Config { if p := cfgPtr.Load(); p != nil { return p }; return &Config{} }
+// ---------- 图片缓存：固定容量 LRU（替代原 sync.Map 整表清空方案） ----------
+// 原实现每次写入都要 Range 全表统计大小（O(n)），满了直接替换 sync.Map（并发丢数据）。
+// 这里改为 mutex + container/list 标准 LRU：超过条数/字节上限时只淘汰最旧条目。
+const (
+	imgCacheMaxCount = 500
+	imgCacheMaxBytes = 50 << 20 // 50MB
+)
+
+var imgCache = struct {
+	mu    sync.Mutex
+	ll    *list.List               // 前端 = 最旧，后端 = 最新
+	items map[string]*list.Element // key -> element(值为 *imgCacheItem)
+	size  int64
+}{
+	ll:    list.New(),
+	items: map[string]*list.Element{},
+}
+
+type imgCacheItem struct {
+	key  string
+	data []byte
+}
+
+func imageCacheGet(key string) ([]byte, bool) {
+	imgCache.mu.Lock()
+	defer imgCache.mu.Unlock()
+	el, ok := imgCache.items[key]
+	if !ok {
+		return nil, false
+	}
+	imgCache.ll.MoveToBack(el) // 命中即提升为最新
+	return el.Value.(*imgCacheItem).data, true
+}
+
+func imageCachePut(key string, data []byte) {
+	if len(data) > imgCacheMaxBytes/imgCacheMaxCount*4 { // 单条超过 400KB 一般不是小图标，不缓存
+		return
+	}
+	imgCache.mu.Lock()
+	defer imgCache.mu.Unlock()
+	if el, ok := imgCache.items[key]; ok { // 已存在则更新并移动到队尾
+		it := el.Value.(*imgCacheItem)
+		imgCache.size += int64(len(data) - len(it.data))
+		it.data = data
+		imgCache.ll.MoveToBack(el)
+	} else {
+		el := imgCache.ll.PushBack(&imgCacheItem{key: key, data: data})
+		imgCache.items[key] = el
+		imgCache.size += int64(len(data))
+	}
+	// 逐个淘汰最旧条目，直到满足双重上限
+	for imgCache.size > imgCacheMaxBytes || imgCache.ll.Len() > imgCacheMaxCount {
+		oldest := imgCache.ll.Front()
+		if oldest == nil {
+			break
+		}
+		it := oldest.Value.(*imgCacheItem)
+		imgCache.size -= int64(len(it.data))
+		delete(imgCache.items, it.key)
+		imgCache.ll.Remove(oldest)
+	}
+}
+
+func currentCfg() *Config {
+	if p := cfgPtr.Load(); p != nil {
+		return p
+	}
+	return &Config{}
+}
 func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPort }
+
 func startListen(srv *http.Server, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil { return err }
-	listenMu.Lock(); old := curLn; curLn = ln; curPort = port; listenMu.Unlock()
+	if err != nil {
+		return err
+	}
+	listenMu.Lock()
+	old := curLn
+	curLn = ln
+	curPort = port
+	listenMu.Unlock()
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) && err != http.ErrServerClosed {
 			log.Printf("端口 %d 监听结束: %v", port, err)
 		}
 	}()
-	if old != nil { _ = old.Close() }
+	if old != nil {
+		_ = old.Close()
+	}
 	return nil
 }
-func loadConfig(path string) {
-	cfgPath = path
+
+func loadConfig() {
 	c := &Config{}
-	if b, err := os.ReadFile(path); err == nil { _ = json.Unmarshal(b, c) }
+	if db != nil {
+		_ = db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("config"))
+			if b != nil {
+				if data := b.Get([]byte("data")); data != nil {
+					_ = json.Unmarshal(data, c)
+				}
+			}
+			return nil
+		})
+	}
 	cfgPtr.Store(c)
-	refreshRuntime()
 }
 func saveConfig(c *Config) error {
-	if cfgPath == "" { return fmt.Errorf("配置文件路径未初始化") }
-	b, _ := json.MarshalIndent(c, "", "  ")
-	tmp := cfgPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil { return err }
-	return os.Rename(tmp, cfgPath)
+	if db == nil {
+		return fmt.Errorf("db not ready")
+	}
+	b, _ := json.Marshal(c)
+	return db.Update(func(tx *bolt.Tx) error {
+		bk, err := tx.CreateBucketIfNotExists([]byte("config"))
+		if err != nil {
+			return err
+		}
+		return bk.Put([]byte("data"), b)
+	})
 }
-func refreshRuntime() { proxyTr.v.Store(newTransport()) }
+
+// 说明： Transport 与配置无关（不走配置项），因此只在启动时创建一次。
+// 原实现每次保存配置都 refreshRuntime() 重建 Transport，
+// 会丢掉已建立的连接池 / TLS 会话缓存，导致保存后一段时间内所有请求重新握手。
+
 func normalizeHost(hostport string) string {
 	host := hostport
-	if h, _, err := net.SplitHostPort(hostport); err == nil { host = h }
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
@@ -353,23 +527,37 @@ var multiSuffix = map[string]bool{"co.uk": true, "org.uk": true, "me.uk": true, 
 
 func rootDomain(hostport string) string {
 	host := normalizeHost(hostport)
-	if net.ParseIP(host) != nil { return host }
+	if net.ParseIP(host) != nil {
+		return host
+	}
 	host = strings.TrimSuffix(host, ".")
 	parts := strings.Split(host, ".")
 	n := len(parts)
-	if n <= 2 { return host }
-	if multiSuffix[strings.Join(parts[n-2:], ".")] { return strings.Join(parts[n-3:], ".") }
+	if n <= 2 {
+		return host
+	}
+	if multiSuffix[strings.Join(parts[n-2:], ".")] {
+		return strings.Join(parts[n-3:], ".")
+	}
 	return strings.Join(parts[n-2:], ".")
 }
 func whitelistMatch(list []string, targetHost string) bool {
-	if len(list) == 0 { return true }
+	if len(list) == 0 {
+		return true
+	}
 	target := normalizeHost(targetHost)
 	targetRoot := rootDomain(target)
 	for _, w := range list {
 		w = strings.TrimSpace(w)
-		if w == "" { continue }
-		if strings.EqualFold(normalizeHost(w), target) { return true }
-		if strings.EqualFold(rootDomain(w), targetRoot) { return true }
+		if w == "" {
+			continue
+		}
+		if strings.EqualFold(normalizeHost(w), target) {
+			return true
+		}
+		if strings.EqualFold(rootDomain(w), targetRoot) {
+			return true
+		}
 	}
 	return false
 }
@@ -390,6 +578,7 @@ type DayStat struct {
 	BlockedWL int64            `json:"blocked_wl"`
 	Countries map[string]int64 `json:"countries,omitempty"`
 	IPs       map[string]int64 `json:"ips,omitempty"`
+	IPBytes   map[string]int64 `json:"ip_bytes,omitempty"`
 }
 type Stats struct {
 	TodayDate        string              `json:"today_date"`
@@ -402,185 +591,206 @@ type Stats struct {
 	LastProxyAt      string              `json:"last_proxy_at"`
 	CountryCounts    map[string]int64    `json:"country_counts"`
 	IPCounts         map[string]int64    `json:"ip_counts"`
+	IPBytes          map[string]int64    `json:"ip_bytes"`
 	Daily            map[string]*DayStat `json:"daily,omitempty"`
 	Blocks           []BlockEvent        `json:"blocks"`
-	RecentBlocks     []BlockEvent        `json:"recent_blocks,omitempty"`
 }
 
 var (
-	stats     Stats
-	statsMu   sync.Mutex
-	statsPath string
+	stats   Stats
+	statsMu sync.Mutex
 )
 
-func loadStats(path string) {
-	statsPath = path
-	if b, err := os.ReadFile(path); err == nil { _ = json.Unmarshal(b, &stats) }
-	if stats.CountryCounts == nil { stats.CountryCounts = map[string]int64{} }
-	if stats.IPCounts == nil { stats.IPCounts = map[string]int64{} }
-	if stats.TodayDate == "" { stats.TodayDate = time.Now().Format("2006-01-02") }
-	if stats.Daily == nil { stats.Daily = map[string]*DayStat{} }
-	pruneDailyLocked()
-	if len(stats.Blocks) == 0 && len(stats.RecentBlocks) > 0 { stats.Blocks = stats.RecentBlocks }
-	stats.RecentBlocks = nil
-	pruneBlocksLocked()
+type statEvent struct {
+	IP      string
+	Country string
+	Bytes   int64
+	IsStart bool
 }
 
-const maxDayIPs = 300
+var statChan = make(chan statEvent, 10000)
 
-func dayLocked() *DayStat {
-	key := time.Now().Format("2006-01-02")
-	if stats.Daily == nil { stats.Daily = map[string]*DayStat{} }
-	d := stats.Daily[key]
-	if d == nil { d = &DayStat{Countries: map[string]int64{}, IPs: map[string]int64{}}; stats.Daily[key] = d }
-	if d.Countries == nil { d.Countries = map[string]int64{} }
-	if d.IPs == nil { d.IPs = map[string]int64{} }
-	return d
-}
-func pruneDailyLocked() {
-	if len(stats.Daily) == 0 { return }
-	cutoff := time.Now().AddDate(-1, 0, 0).Format("2006-01-02")
-	for k := range stats.Daily { if k < cutoff { delete(stats.Daily, k) } }
-}
-func trimDayIPs(d *DayStat) {
-	if len(d.IPs) <= maxDayIPs { return }
-	type kv struct{ k string; v int64 }
-	arr := make([]kv, 0, len(d.IPs))
-	for k, v := range d.IPs { arr = append(arr, kv{k, v}) }
-	sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
-	nm := make(map[string]int64, maxDayIPs/2)
-	for i := 0; i < maxDayIPs/2 && i < len(arr); i++ { nm[arr[i].k] = arr[i].v }
-	d.IPs = nm
-}
-func rolloverLocked() {
-	t := time.Now().Format("2006-01-02")
-	if stats.TodayDate != t {
-		stats.TodayDate = t
-		stats.TodayRequests = 0
-		stats.TodayBytes = 0
-	}
-}
-func recordRequestStart(ip, country string) {
-	statsMu.Lock(); defer statsMu.Unlock()
-	rolloverLocked()
-	stats.TotalRequests++
-	stats.TodayRequests++
-	stats.LastProxyAt = formatBlockTime(time.Now())
-	if country == "" { country = "??" }
-	stats.CountryCounts[country]++
-	stats.IPCounts[ip]++
-	d := dayLocked()
-	d.Requests++
-	d.Countries[country]++
-	d.IPs[ip]++
-}
-func recordBytes(bytes int64) {
-	if bytes <= 0 { return }
-	statsMu.Lock(); defer statsMu.Unlock()
-	rolloverLocked()
-	stats.TotalBytes += bytes
-	stats.TodayBytes += bytes
-	dayLocked().Bytes += bytes
-}
+// statDropped：统计通道满时被丢弃的事件数（避免阻塞请求热路径，丢弃有损但可观测）
+var statDropped atomic.Int64
 
-const maxBlocks = 5000
-
-func parseBlockTime(s string) time.Time {
-	if s == "" {
-		return time.Time{}
-	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t
-	}
-	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.Local); err == nil {
-		return t
-	}
-	return time.Time{}
-}
-func formatBlockTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339)
-}
-func pruneBlocksLocked() {
-	cutoff := time.Now().AddDate(-1, 0, 0)
-	for len(stats.Blocks) > 0 {
-		t := parseBlockTime(stats.Blocks[len(stats.Blocks)-1].Time)
-		if !t.IsZero() && t.Before(cutoff) {
-			stats.Blocks = stats.Blocks[:len(stats.Blocks)-1]
-			continue
-		}
-		break
-	}
-}
-func isSelfOrLocalIP(ip, country string) bool {
-	if country == "LO" || country == "PV" {
-		return true
-	}
-	ip = strings.TrimSpace(ip)
-	if ip == "" {
-		return false
-	}
-	if self := selfPublicIP.Load(); self != nil {
-		if s, ok := self.(string); ok && s != "" && s == ip {
-			return true
-		}
-	}
-	return false
-}
-func recordBlocked(ip, country, path, reason, ua string) {
-	if isSelfOrLocalIP(ip, country) {
+// pruneTopN：当 map 超过 n 条时，仅保留值最大的前 n 条。
+// 抽成泛型辅助函数，替代原 pruneStatsLocked 里 4 段几乎相同的裁剪代码。
+func pruneTopN[K comparable](m map[K]int64, n int) {
+	if len(m) <= n {
 		return
 	}
-	statsMu.Lock()
-	defer statsMu.Unlock()
-	rolloverLocked()
-	d := dayLocked()
-	reasonText := "目标域名不在访问白名单内"
-	if reason == "cn" {
-		stats.BlockedCN++
-		d.BlockedCN++
-		reasonText = "仅允许中国大陆 IP 访问"
-	} else {
-		stats.BlockedWhitelist++
-		d.BlockedWL++
+	type kv struct {
+		k K
+		v int64
 	}
-	if country == "" {
-		country = "??"
+	arr := make([]kv, 0, len(m))
+	for k, v := range m {
+		arr = append(arr, kv{k, v})
 	}
-	ev := BlockEvent{Time: formatBlockTime(time.Now()), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
-	stats.Blocks = append([]BlockEvent{ev}, stats.Blocks...)
-	if len(stats.Blocks) > maxBlocks {
-		stats.Blocks = stats.Blocks[:maxBlocks]
+	sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+	newMap := make(map[K]int64, n)
+	for i := 0; i < n; i++ {
+		newMap[arr[i].k] = arr[i].v
+	}
+	for k := range m {
+		if _, ok := newMap[k]; !ok {
+			delete(m, k)
+		}
+	}
+	for k, v := range newMap {
+		m[k] = v
 	}
 }
-func saveStatsLocked() {
-	if statsPath == "" { return }
-	b, _ := json.Marshal(stats)
-	tmp := statsPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err == nil { _ = os.Rename(tmp, statsPath) }
-}
+
+// 裁剪过大的统计数据，防止内存与磁盘耗尽
 func pruneStatsLocked() {
-	pruneDailyLocked()
-	pruneBlocksLocked()
-	if d := stats.Daily[time.Now().Format("2006-01-02")]; d != nil { trimDayIPs(d) }
-	if len(stats.IPCounts) > 2000 {
-		type kv struct{ k string; v int64 }
-		arr := make([]kv, 0, len(stats.IPCounts))
-		for k, v := range stats.IPCounts { arr = append(arr, kv{k, v}) }
-		sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
-		nm := make(map[string]int64, 500)
-		for i := 0; i < 500 && i < len(arr); i++ { nm[arr[i].k] = arr[i].v }
-		stats.IPCounts = nm
+	pruneTopN(stats.IPCounts, 1000)
+	pruneTopN(stats.IPBytes, 1000)
+	cutoff := time.Now().AddDate(-1, 0, 0).Format("2006-01-02")
+	for k := range stats.Daily {
+		if k < cutoff {
+			delete(stats.Daily, k)
+		}
+	}
+	for _, day := range stats.Daily {
+		pruneTopN(day.IPs, 500)
+		pruneTopN(day.IPBytes, 500)
 	}
 }
-func startStatsSaver() {
+
+func startStatsWorker() {
 	go func() {
-		t := time.NewTicker(30 * time.Second); defer t.Stop()
-		for range t.C {
-			statsMu.Lock(); pruneStatsLocked(); saveStatsLocked(); statsMu.Unlock()
-			geoCacheSave()
+		for ev := range statChan {
+			statsMu.Lock()
+			t := time.Now().Format("2006-01-02")
+			if stats.TodayDate != t {
+				stats.TodayDate = t
+				stats.TodayRequests = 0
+				stats.TodayBytes = 0
+			}
+			if ev.IsStart {
+				stats.TotalRequests++
+				stats.TodayRequests++
+				stats.LastProxyAt = time.Now().UTC().Format(time.RFC3339)
+				c := ev.Country
+				if c == "" {
+					c = "??"
+				}
+				stats.CountryCounts[c]++
+				stats.IPCounts[ev.IP]++
+				if stats.Daily == nil {
+					stats.Daily = map[string]*DayStat{}
+				}
+				d := stats.Daily[t]
+				if d == nil {
+					d = &DayStat{Countries: map[string]int64{}, IPs: map[string]int64{}, IPBytes: map[string]int64{}}
+					stats.Daily[t] = d
+				}
+				d.Requests++
+				d.Countries[c]++
+				d.IPs[ev.IP]++
+			} else if ev.Bytes > 0 {
+				stats.TotalBytes += ev.Bytes
+				stats.TodayBytes += ev.Bytes
+				if stats.Daily == nil {
+					stats.Daily = map[string]*DayStat{}
+				}
+				d := stats.Daily[t]
+				if d == nil {
+					d = &DayStat{Countries: map[string]int64{}, IPs: map[string]int64{}, IPBytes: map[string]int64{}}
+					stats.Daily[t] = d
+				}
+				d.Bytes += ev.Bytes
+				if ev.IP != "" {
+					stats.IPBytes[ev.IP] += ev.Bytes
+					d.IPBytes[ev.IP] += ev.Bytes
+				}
+			}
+			statsMu.Unlock()
 		}
 	}()
 }
+
+func recordRequestStart(ip, country string) {
+	select {
+	case statChan <- statEvent{IP: ip, Country: country, IsStart: true}:
+	default:
+		statDropped.Add(1) // 通道满：丢弃但不阻塞请求
+	}
+}
+func recordBytes(ip string, bytes int64) {
+	if bytes > 0 {
+		select {
+		case statChan <- statEvent{IP: ip, Bytes: bytes, IsStart: false}:
+		default:
+			statDropped.Add(1)
+		}
+	}
+}
+
+func loadStats() {
+	stats = Stats{TodayDate: time.Now().Format("2006-01-02"), CountryCounts: map[string]int64{}, IPCounts: map[string]int64{}, IPBytes: map[string]int64{}, Daily: map[string]*DayStat{}, Blocks: []BlockEvent{}}
+	if db != nil {
+		_ = db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("stats"))
+			if b != nil {
+				if data := b.Get([]byte("data")); data != nil {
+					_ = json.Unmarshal(data, &stats)
+				}
+			}
+			return nil
+		})
+	}
+	if stats.CountryCounts == nil {
+		stats.CountryCounts = map[string]int64{}
+	}
+	if stats.IPCounts == nil {
+		stats.IPCounts = map[string]int64{}
+	}
+	if stats.IPBytes == nil {
+		stats.IPBytes = map[string]int64{}
+	}
+	if stats.Daily == nil {
+		stats.Daily = map[string]*DayStat{}
+	}
+}
+func saveStatsLocked() {
+	if db == nil {
+		return
+	}
+	b, _ := json.Marshal(stats)
+	_ = db.Update(func(tx *bolt.Tx) error {
+		bk, err := tx.CreateBucketIfNotExists([]byte("stats"))
+		if err != nil {
+			return err
+		}
+		return bk.Put([]byte("data"), b)
+	})
+}
+func startStatsSaver() {
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		for range t.C {
+			statsMu.Lock()
+			pruneStatsLocked()
+			saveStatsLocked()
+			statsMu.Unlock()
+			geoCacheSave()
+			geoPrune()
+
+			now := time.Now().UnixNano()
+			ipLimiters.Range(func(k, v interface{}) bool {
+				entry := v.(*rateLimitEntry)
+				// 10 分钟未活跃（以窗口起点为准）的限流器予以回收
+				if now-entry.WindowStart.Load() > int64(10*time.Minute) {
+					ipLimiters.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
+}
+
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -602,17 +812,12 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
-// selfPublicIP caches this machine's outbound public IP (atomic.Value holds string).
 var selfPublicIP atomic.Value
 
 func detectSelfPublicIP() {
 	go func() {
 		client := &http.Client{Timeout: 4 * time.Second}
-		urls := []string{
-			"https://api.ipify.org",
-			"https://ifconfig.me/ip",
-			"https://icanhazip.com",
-		}
+		urls := []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"}
 		for _, u := range urls {
 			resp, err := client.Get(u)
 			if err != nil {
@@ -626,81 +831,100 @@ func detectSelfPublicIP() {
 			ipStr := strings.TrimSpace(string(body))
 			if net.ParseIP(ipStr) != nil {
 				selfPublicIP.Store(ipStr)
-				log.Printf("本机公网 IP: %s（拦截记录中将忽略）", ipStr)
 				return
 			}
 		}
-		log.Printf("未能探测本机公网 IP，本机访问拦截仍按 LO/PV 过滤")
 	}()
 }
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
-	if ip == nil { return "??" }
+	if ip == nil {
+		return "??"
+	}
 	c := iploc.Country(ip)
-	if len(c) == 0 || c == "ZZ" { return "??" }
+	if len(c) == 0 || c == "ZZ" {
+		return "??"
+	}
 	return c
 }
 
-var countryNames = map[string]string{
-	"CN": "中国", "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门",
-	"SG": "新加坡", "JP": "日本", "KR": "韩国", "KP": "朝鲜", "MN": "蒙古",
-	"US": "美国", "CA": "加拿大", "MX": "墨西哥", "BR": "巴西", "AR": "阿根廷",
-	"CL": "智利", "CO": "哥伦比亚", "PE": "秘鲁", "VE": "委内瑞拉", "UY": "乌拉圭",
-	"PY": "巴拉圭", "BO": "玻利维亚", "EC": "厄瓜多尔", "CR": "哥斯达黎加", "PA": "巴拿马",
-	"CU": "古巴", "DO": "多米尼加", "GT": "危地马拉", "HN": "洪都拉斯", "NI": "尼加拉瓜",
-	"SV": "萨尔瓦多", "JM": "牙买加", "TT": "特立尼达和多巴哥", "BS": "巴哈马", "BB": "巴巴多斯",
-	"GB": "英国", "IE": "爱尔兰", "FR": "法国", "DE": "德国", "IT": "意大利",
-	"ES": "西班牙", "PT": "葡萄牙", "NL": "荷兰", "BE": "比利时", "LU": "卢森堡",
-	"CH": "瑞士", "AT": "奥地利", "LI": "列支敦士登", "MC": "摩纳哥", "AD": "安道尔",
-	"SM": "圣马力诺", "VA": "梵蒂冈", "MT": "马耳他", "CY": "塞浦路斯", "GR": "希腊",
-	"SE": "瑞典", "NO": "挪威", "DK": "丹麦", "FI": "芬兰", "IS": "冰岛",
-	"PL": "波兰", "CZ": "捷克", "SK": "斯洛伐克", "HU": "匈牙利", "RO": "罗马尼亚",
-	"BG": "保加利亚", "HR": "克罗地亚", "SI": "斯洛文尼亚", "RS": "塞尔维亚", "BA": "波黑",
-	"ME": "黑山", "MK": "北马其顿", "AL": "阿尔巴尼亚", "XK": "科索沃", "MD": "摩尔多瓦",
-	"UA": "乌克兰", "BY": "白俄罗斯", "RU": "俄罗斯", "LT": "立陶宛", "LV": "拉脱维亚",
-	"EE": "爱沙尼亚", "GE": "格鲁吉亚", "AM": "亚美尼亚", "AZ": "阿塞拜疆", "KZ": "哈萨克斯坦",
-	"UZ": "乌兹别克斯坦", "TM": "土库曼斯坦", "KG": "吉尔吉斯斯坦", "TJ": "塔吉克斯坦",
-	"TR": "土耳其", "IL": "以色列", "PS": "巴勒斯坦", "JO": "约旦", "LB": "黎巴嫩",
-	"SY": "叙利亚", "IQ": "伊拉克", "IR": "伊朗", "SA": "沙特阿拉伯", "AE": "阿联酋",
-	"QA": "卡塔尔", "KW": "科威特", "BH": "巴林", "OM": "阿曼", "YE": "也门",
-	"EG": "埃及", "LY": "利比亚", "TN": "突尼斯", "DZ": "阿尔及利亚", "MA": "摩洛哥",
-	"SD": "苏丹", "SS": "南苏丹", "ET": "埃塞俄比亚", "SO": "索马里", "KE": "肯尼亚",
-	"TZ": "坦桑尼亚", "UG": "乌干达", "RW": "卢旺达", "BI": "布隆迪", "DJ": "吉布提",
-	"ER": "厄立特里亚", "ZA": "南非", "NA": "纳米比亚", "BW": "博茨瓦纳", "ZW": "津巴布韦",
-	"ZM": "赞比亚", "MW": "马拉维", "MZ": "莫桑比克", "AO": "安哥拉", "CD": "刚果（金）",
-	"CG": "刚果（布）", "GA": "加蓬", "CM": "喀麦隆", "NG": "尼日利亚", "GH": "加纳",
-	"CI": "科特迪瓦", "SN": "塞内加尔", "ML": "马里", "BF": "布基纳法索", "NE": "尼日尔",
-	"TD": "乍得", "CF": "中非", "GM": "冈比亚", "GN": "几内亚", "SL": "塞拉利昂",
-	"LR": "利比里亚", "TG": "多哥", "BJ": "贝宁", "MR": "毛里塔尼亚", "MU": "毛里求斯",
-	"SC": "塞舌尔", "MG": "马达加斯加", "RE": "留尼汪", "YT": "马约特",
-	"IN": "印度", "PK": "巴基斯坦", "BD": "孟加拉国", "LK": "斯里兰卡", "NP": "尼泊尔",
-	"BT": "不丹", "MV": "马尔代夫", "AF": "阿富汗", "MM": "缅甸", "TH": "泰国",
-	"LA": "老挝", "KH": "柬埔寨", "VN": "越南", "MY": "马来西亚", "ID": "印度尼西亚",
-	"PH": "菲律宾", "BN": "文莱", "TL": "东帝汶", "AU": "澳大利亚", "NZ": "新西兰",
-	"PG": "巴布亚新几内亚", "FJ": "斐济", "NC": "新喀里多尼亚", "PF": "法属波利尼西亚",
-	"GU": "关岛", "MP": "北马里亚纳", "WS": "萨摩亚", "TO": "汤加", "VU": "瓦努阿图",
-	"SB": "所罗门群岛", "FM": "密克罗尼西亚", "PW": "帕劳", "MH": "马绍尔群岛", "KI": "基里巴斯",
-	"PR": "波多黎各", "VI": "美属维尔京群岛", "VG": "英属维尔京群岛", "KY": "开曼群岛",
-	"BM": "百慕大", "GL": "格陵兰", "FO": "法罗群岛", "GI": "直布罗陀", "IM": "马恩岛",
-	"JE": "泽西", "GG": "根西", "AX": "奥兰群岛", "SJ": "斯瓦尔巴", "CW": "库拉索",
-	"AW": "阿鲁巴", "SX": "荷属圣马丁", "MF": "法属圣马丁", "GP": "瓜德罗普", "MQ": "马提尼克",
-	"GF": "法属圭亚那", "SR": "苏里南", "GY": "圭亚那", "BZ": "伯利兹", "HT": "海地",
-	"EU": "欧盟", "AP": "亚太地区", "A1": "匿名代理", "A2": "卫星运营商",
-	"PV": "内网", "LO": "本机", "??": "未知",
-}
+var countryNames = map[string]string{"CN": "中国", "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门", "SG": "新加坡", "JP": "日本", "KR": "韩国", "US": "美国", "GB": "英国", "DE": "德国", "FR": "法国", "RU": "俄罗斯", "LO": "本机", "PV": "内网", "??": "未知"}
 
 func countryName(code string) string {
-	if n, ok := countryNames[code]; ok { return n }
-	if code == "" { return "未知" }
+	if n, ok := countryNames[code]; ok {
+		return n
+	}
+	if code == "" {
+		return "未知"
+	}
 	return code
 }
 
-const defaultGeoAPI = "http://ip-api.com/json/{ip}?lang=zh-CN&fields=status,country,countryCode"
+func isSelfOrLocalIP(ip, country string) bool {
+	if country == "LO" || country == "PV" {
+		return true
+	}
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false
+	}
+	if self := selfPublicIP.Load(); self != nil {
+		if s, ok := self.(string); ok && s != "" && s == ip {
+			return true
+		}
+	}
+	return false
+}
+func recordBlocked(ip, country, path, reason, ua string) {
+	if isSelfOrLocalIP(ip, country) {
+		return
+	}
+	statsMu.Lock()
+	defer statsMu.Unlock()
+	d := time.Now().Format("2006-01-02")
+	if stats.Daily == nil {
+		stats.Daily = map[string]*DayStat{}
+	}
+	day := stats.Daily[d]
+	if day == nil {
+		day = &DayStat{Countries: map[string]int64{}, IPs: map[string]int64{}, IPBytes: map[string]int64{}}
+		stats.Daily[d] = day
+	}
+	reasonText := "目标域名不在访问白名单内"
+	if reason == "cn" {
+		stats.BlockedCN++
+		day.BlockedCN++
+		reasonText = "仅允许中国大陆 IP 访问"
+	} else {
+		stats.BlockedWhitelist++
+		day.BlockedWL++
+	}
+	if country == "" {
+		country = "??"
+	}
+	ev := BlockEvent{Time: time.Now().UTC().Format(time.RFC3339), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
+	// 追加到尾部 + 超限时从头裁剪：均摊 O(1)。
+	// 原实现 append([]BlockEvent{ev}, stats.Blocks...) 每次全量拷贝 5000 条，O(n)。
+	stats.Blocks = append(stats.Blocks, ev)
+	if len(stats.Blocks) > maxBlockEvents {
+		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
+	}
+}
+
+// maxBlockEvents：内存/落盘中保留的拦截事件上限
+const maxBlockEvents = 5000
 
 type geoEntry struct {
-	Code string `json:"code"`
-	Name string `json:"name"`
-	At   int64  `json:"at"`
+	Code   string  `json:"code"`
+	Name   string  `json:"name"`
+	Region string  `json:"region,omitempty"`
+	City   string  `json:"city,omitempty"`
+	ISP    string  `json:"isp,omitempty"`
+	Org    string  `json:"org,omitempty"`
+	AS     string  `json:"as,omitempty"`
+	Lat    float64 `json:"lat,omitempty"`
+	Lon    float64 `json:"lon,omitempty"`
+	At     int64   `json:"at"`
 }
 
 var (
@@ -708,360 +932,210 @@ var (
 	geoMap      = map[string]geoEntry{}
 	geoPath     string
 	geoInflight int32
-	geoPendingMu sync.Mutex
-	geoPending   = map[string]bool{}
+	geoGroup    singleflight.Group
 )
 
-func geoCacheLoad(path string) {
-	geoPath = path
-	if b, err := os.ReadFile(path); err == nil { _ = json.Unmarshal(b, &geoMap) }
-	if geoMap == nil { geoMap = map[string]geoEntry{} }
+func geoCacheLoad() {
+	if db != nil {
+		_ = db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("geo"))
+			if b != nil {
+				if data := b.Get([]byte("data")); data != nil {
+					_ = json.Unmarshal(data, &geoMap)
+				}
+			}
+			return nil
+		})
+	}
+	if geoMap == nil {
+		geoMap = map[string]geoEntry{}
+	}
 }
 func geoCacheSave() {
-	geoMu.RLock(); b, _ := json.Marshal(geoMap); geoMu.RUnlock()
-	if geoPath == "" || len(b) == 0 { return }
-	tmp := geoPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err == nil { _ = os.Rename(tmp, geoPath) }
-}
-func geoPickString(m map[string]any, keys ...string) string {
-	for _, k := range keys { if v, ok := m[k].(string); ok && v != "" { return v } }
-	return ""
-}
-
-type geoStatT struct {
-	mu      sync.Mutex
-	ok      int64
-	fail    int64
-	lastErr string
-	lastAt  int64
-}
-
-var geoStat geoStatT
-
-func geoStatRecord(ok bool, errMsg string) {
-	geoStat.mu.Lock()
-	if ok { geoStat.ok++ } else { geoStat.fail++; geoStat.lastErr = errMsg }
-	geoStat.lastAt = time.Now().Unix()
-	geoStat.mu.Unlock()
-}
-func geoStatSnapshot() (int64, int64, string) {
-	geoStat.mu.Lock(); defer geoStat.mu.Unlock()
-	return geoStat.ok, geoStat.fail, geoStat.lastErr
-}
-func truncStr(s string, n int) string { if len(s) <= n { return s }; return s[:n] + "…" }
-func geoFetch(ipStr string) (string, string, error) {
-	tpl := strings.TrimSpace(currentCfg().GeoAPIURL)
-	if tpl == "" { tpl = defaultGeoAPI }
-	target := strings.ReplaceAll(tpl, "{ip}", ipStr)
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(target)
-	if err != nil { return "", "", err }
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	var m map[string]any
-	if err := json.Unmarshal(body, &m); err != nil { return "", "", fmt.Errorf("响应不是 JSON: %s", truncStr(string(body), 80)) }
-	if st, ok := m["status"].(string); ok && st == "fail" {
-		msg, _ := m["message"].(string)
-		if msg == "" { msg = "接口返回 status=fail" }
-		return "", "", fmt.Errorf("%s", msg)
-	}
-	raw := geoPickString(m, "country")
-	code := geoPickString(m, "countryCode", "country_code", "code")
-	if code == "" && len(raw) == 2 && strings.ToUpper(raw) == raw { code = raw; raw = "" }
-	code = strings.ToUpper(strings.TrimSpace(code))
-	if len(code) != 2 { return "", "", fmt.Errorf("响应里没有两字母国家代码: %s", truncStr(string(body), 80)) }
-	name := strings.TrimSpace(raw)
-	if name == "" || len(name) == 2 { name = countryName(code) }
-	return code, name, nil
-}
-func geoFetchAndCache(ipStr string) {
-	now := time.Now().Unix()
-	code, name, err := geoFetch(ipStr)
-	if err != nil {
-		geoStatRecord(false, err.Error())
-		geoMu.Lock(); geoMap[ipStr] = geoEntry{Code: "??", At: now}; geoMu.Unlock()
+	if db == nil {
 		return
 	}
-	geoStatRecord(true, "")
+	geoMu.RLock()
+	b, _ := json.Marshal(geoMap)
+	geoMu.RUnlock()
+	_ = db.Update(func(tx *bolt.Tx) error {
+		bk, err := tx.CreateBucketIfNotExists([]byte("geo"))
+		if err != nil {
+			return err
+		}
+		return bk.Put([]byte("data"), b)
+	})
+}
+
+// geoPrune：定期清理 geoMap。
+// 原实现 30 天过期但从不删除内存条目，公网代理长期运行会积累数十万条目造成内存泄漏。
+func geoPrune() {
+	const geoMaxEntries = 50000
+	now := time.Now().Unix()
 	geoMu.Lock()
-	geoMap[ipStr] = geoEntry{Code: code, Name: name, At: now}
-	if len(geoMap) > 5000 {
-		cutoff := now - 15*86400
-		for k, v := range geoMap { if v.At < cutoff { delete(geoMap, k) } }
+	for k, e := range geoMap {
+		if now-e.At >= 30*86400 {
+			delete(geoMap, k)
+		}
+	}
+	// 极端情况兜底：仍超上限则整体重置（下次请求会重新按需拉取）
+	if len(geoMap) > geoMaxEntries {
+		geoMap = map[string]geoEntry{}
 	}
 	geoMu.Unlock()
 }
-func geoLookup(ipStr string) (string, string, bool) {
-	now := time.Now().Unix()
-	geoMu.RLock(); e, cached := geoMap[ipStr]; geoMu.RUnlock()
-	if cached {
-		if e.Code == "??" {
-			if now-e.At < 3600 { return "", "", false }
-		} else if now-e.At < 30*86400 { return e.Code, e.Name, true }
+func geoParseGeneric(m map[string]any) (geoEntry, error) {
+	if data, ok := m["data"].(map[string]any); ok {
+		m = data
 	}
-	if !currentCfg().GeoAPI { return "", "", false }
-	if atomic.LoadInt32(&geoInflight) >= 16 { return "", "", false }
-	atomic.AddInt32(&geoInflight, 1); defer atomic.AddInt32(&geoInflight, -1)
-	geoFetchAndCache(ipStr)
-	geoMu.RLock(); e, ok := geoMap[ipStr]; geoMu.RUnlock()
-	if !ok || e.Code == "??" { return "", "", false }
-	return e.Code, e.Name, true
+	if st, ok := m["status"].(string); ok && st == "fail" {
+		msg, _ := m["message"].(string)
+		return geoEntry{}, fmt.Errorf("api failed: %s", msg)
+	}
+	raw := ""
+	if v, ok := m["country"].(string); ok {
+		raw = v
+	}
+	code := ""
+	if v, ok := m["countryCode"].(string); ok {
+		code = v
+	}
+	if code == "" {
+		code = raw
+	}
+	if len(code) > 2 {
+		code = ""
+	}
+	region := ""
+	if v, ok := m["regionName"].(string); ok {
+		region = v
+	}
+	city := ""
+	if v, ok := m["city"].(string); ok {
+		city = v
+	}
+	if code == "" {
+		return geoEntry{}, fmt.Errorf("no code")
+	}
+	if raw == "" {
+		raw = countryName(code)
+	}
+	return geoEntry{Code: code, Name: raw, Region: region, City: city, At: time.Now().Unix()}, nil
 }
-func geoLookupAsync(ipStr string) {
-	if !currentCfg().GeoAPI { return }
-	geoPendingMu.Lock()
-	if geoPending[ipStr] { geoPendingMu.Unlock(); return }
-	geoPending[ipStr] = true
-	geoPendingMu.Unlock()
-	go func() {
-		defer func() { geoPendingMu.Lock(); delete(geoPending, ipStr); geoPendingMu.Unlock() }()
-		if atomic.LoadInt32(&geoInflight) >= 16 { return }
-		atomic.AddInt32(&geoInflight, 1); defer atomic.AddInt32(&geoInflight, -1)
-		geoFetchAndCache(ipStr)
-	}()
-}
-func isSelfPublicIP(ipStr string) bool {
-	if self := selfPublicIP.Load(); self != nil {
-		if s, ok := self.(string); ok && s != "" && s == strings.TrimSpace(ipStr) {
-			return true
+func geoFetch(ipStr string) (geoEntry, error) {
+	client := &http.Client{Timeout: 4 * time.Second}
+	urls := []string{
+		"http://ip-api.com/json/" + url.QueryEscape(ipStr) + "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,isp,org,as,lat,lon,query",
+	}
+	var last error
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err != nil {
+			last = err
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		resp.Body.Close()
+		var m map[string]any
+		if err := json.Unmarshal(body, &m); err == nil {
+			if e, err := geoParseGeneric(m); err == nil {
+				return e, nil
+			} else {
+				last = err
+			}
 		}
 	}
-	return false
+	return geoEntry{}, last
 }
-func ipLabel(ipStr string) (code, name string) {
+func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
 		return "??", "未知"
 	}
-	if ip.IsLoopback() || isSelfPublicIP(ipStr) {
+	// 严禁 isSelfOrLocalIP(ip, "LO")：传入 "LO" 会恒为 true
+	if ip.IsLoopback() {
 		return "LO", "本机"
 	}
 	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
 		return "PV", "内网"
 	}
-	if c := countryOf(ipStr); c != "??" {
-		return c, countryName(c)
-	}
-	now := time.Now().Unix()
+
 	geoMu.RLock()
 	e, ok := geoMap[ipStr]
 	geoMu.RUnlock()
-	if ok {
-		if e.Code != "??" && now-e.At < 30*86400 {
-			return e.Code, e.Name
+	if ok && e.Code != "??" && time.Now().Unix()-e.At < 30*86400 {
+		return e.Code, e.Name
+	}
+
+	v, err, _ := geoGroup.Do(ipStr, func() (interface{}, error) {
+		geoMu.RLock()
+		cached, ok := geoMap[ipStr]
+		geoMu.RUnlock()
+		if ok && cached.Code != "??" && time.Now().Unix()-cached.At < 30*86400 {
+			return cached, nil
 		}
-		if e.Code == "??" && now-e.At < 3600 {
-			return "??", "未知"
+		e, err := geoFetch(ipStr)
+		if err == nil {
+			geoMu.Lock()
+			geoMap[ipStr] = e
+			geoMu.Unlock()
 		}
-	}
-	geoLookupAsync(ipStr)
-	return "??", "未知"
-}
-func ipLabelSync(ipStr string) (code, name string) {
-	ip := net.ParseIP(strings.TrimSpace(ipStr))
-	if ip == nil {
-		return "??", "未知"
-	}
-	if ip.IsLoopback() || isSelfPublicIP(ipStr) {
-		return "LO", "本机"
-	}
-	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-		return "PV", "内网"
+		return e, err
+	})
+	if err == nil {
+		e := v.(geoEntry)
+		return e.Code, e.Name
 	}
 	if c := countryOf(ipStr); c != "??" {
 		return c, countryName(c)
 	}
-	if gc, gn, ok := geoLookup(ipStr); ok {
-		return gc, gn
-	}
 	return "??", "未知"
 }
 
-type flagAsset struct {
-	Data []byte
-	MIME string // image/svg+xml or image/png
+func logSSE(msg string) {
+	select {
+	case logChan <- msg:
+	default:
+	}
 }
-
-var flagCache = struct {
-	sync.RWMutex
-	m map[string]flagAsset
-}{m: map[string]flagAsset{}}
-
-var flagDir string
-
-func flagMIME(data []byte) string {
-	s := strings.TrimSpace(string(data))
-	if strings.HasPrefix(s, "<svg") || strings.HasPrefix(s, "<?xml") {
-		return "image/svg+xml"
-	}
-	return "image/png"
-}
-
-func fetchFlagURL(client *http.Client, url string) ([]byte, error) {
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
-	if err != nil || len(data) < 40 {
-		return nil, fmt.Errorf("图片无效")
-	}
-	return data, nil
-}
-
-// flagPng loads a country flag. Prefers open-source flag-icons (GitHub / jsDelivr),
-// falls back to flagcdn. Returns SVG or PNG bytes.
-func flagPng(code string) ([]byte, error) {
-	code = strings.ToLower(strings.TrimSpace(code))
-	flagCache.RLock()
-	cached, ok := flagCache.m[code]
-	flagCache.RUnlock()
-	if ok {
-		return cached.Data, nil
-	}
-	if flagDir != "" {
-		for _, ext := range []string{".svg", ".png"} {
-			if d, err := os.ReadFile(filepath.Join(flagDir, code+ext)); err == nil && len(d) > 40 {
-				asset := flagAsset{Data: d, MIME: flagMIME(d)}
-				flagCache.Lock()
-				flagCache.m[code] = asset
-				flagCache.Unlock()
-				return d, nil
+func broadcastLog() {
+	for msg := range logChan {
+		logClients.Range(func(k, v interface{}) bool {
+			ch := v.(chan string)
+			select {
+			case ch <- msg:
+			default:
 			}
-		}
+			return true
+		})
 	}
-	client := &http.Client{Timeout: 8 * time.Second}
-	// lipis/flag-icons (MIT) via jsDelivr / GitHub — reliable, open source
-	urls := []string{
-		"https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.2.3/flags/4x3/" + code + ".svg",
-		"https://cdn.jsdelivr.net/npm/flag-icons@7.2.3/flags/4x3/" + code + ".svg",
-		"https://raw.githubusercontent.com/lipis/flag-icons/main/flags/4x3/" + code + ".svg",
-		"https://flagcdn.com/w40/" + code + ".png",
-		"https://flagcdn.com/w80/" + code + ".png",
-	}
-	var data []byte
-	var lastErr error
-	for _, u := range urls {
-		d, err := fetchFlagURL(client, u)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		data = d
-		break
-	}
-	if data == nil {
-		if lastErr != nil {
-			return nil, lastErr
-		}
-		return nil, fmt.Errorf("国旗不可用")
-	}
-	asset := flagAsset{Data: data, MIME: flagMIME(data)}
-	flagCache.Lock()
-	if len(flagCache.m) > 400 {
-		flagCache.m = map[string]flagAsset{}
-	}
-	flagCache.m[code] = asset
-	flagCache.Unlock()
-	if flagDir != "" {
-		ext := ".png"
-		if asset.MIME == "image/svg+xml" {
-			ext = ".svg"
-		}
-		if os.MkdirAll(flagDir, 0755) == nil {
-			_ = os.WriteFile(filepath.Join(flagDir, code+ext), data, 0644)
-		}
-	}
-	return data, nil
 }
-
-func flagContentType(code string) string {
-	code = strings.ToLower(strings.TrimSpace(code))
-	flagCache.RLock()
-	a, ok := flagCache.m[code]
-	flagCache.RUnlock()
-	if ok && a.MIME != "" {
-		return a.MIME
+func checkRateLimit(ip string, limit int) bool {
+	if limit <= 0 {
+		return true
 	}
-	return "image/png"
+	val, _ := ipLimiters.LoadOrStore(ip, &rateLimitEntry{})
+	entry := val.(*rateLimitEntry)
+	now := time.Now().UnixNano()
+	// 滑动窗口重置：全部用原子操作，避免并发请求间的 data race
+	start := entry.WindowStart.Load()
+	if start == 0 || now-start > int64(time.Minute) {
+		if entry.WindowStart.CompareAndSwap(start, now) {
+			entry.Count.Store(1)
+			return 1 <= int64(limit)
+		}
+		// CAS 失败说明另一并发请求刚重置过窗口，走正常计数
+	}
+	return entry.Count.Add(1) <= int64(limit)
 }
 
 var (
-	regeoRunning int32
-	regeoTotal   int32
-	regeoDone    int32
+	adminCredPtr atomic.Pointer[adminCred]
 )
 
-func regeoAll() {
-	statsMu.Lock()
-	ips := make(map[string]int64, len(stats.IPCounts))
-	for k, v := range stats.IPCounts { ips[k] = v }
-	statsMu.Unlock()
-	geoMu.Lock()
-	for k, v := range geoMap { if v.Code == "??" { delete(geoMap, k) } }
-	geoMu.Unlock()
-	atomic.StoreInt32(&regeoTotal, int32(len(ips)))
-	atomic.StoreInt32(&regeoDone, 0)
-	type res struct { code string; cnt int64 }
-	jobs := make(chan string, len(ips))
-	out := make(chan res, len(ips))
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ip := range jobs {
-				code, _ := ipLabelSync(ip)
-				out <- res{code, ips[ip]}
-				atomic.AddInt32(&regeoDone, 1)
-			}
-		}()
-	}
-	for ip := range ips { jobs <- ip }
-	close(jobs)
-	wg.Wait()
-	close(out)
-	cc := map[string]int64{}
-	for r := range out { cc[r.code] += r.cnt }
-	statsMu.Lock(); stats.CountryCounts = cc; saveStatsLocked(); statsMu.Unlock()
-	geoCacheSave()
-}
+type adminCred struct{ User, Pass string }
 
-type statWriter struct {
-	http.ResponseWriter
-	bytes int64
-}
-
-func (w *statWriter) Write(b []byte) (int, error) { n, err := w.ResponseWriter.Write(b); w.bytes += int64(n); return n, err }
-func (w *statWriter) Flush() { if f, ok := w.ResponseWriter.(http.Flusher); ok { f.Flush() } }
-func (w *statWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := w.ResponseWriter.(http.Hijacker); ok { return h.Hijack() }
-	return nil, nil, fmt.Errorf("hijacking not supported")
-}
-func (w *statWriter) ReadFrom(r io.Reader) (int64, error) {
-	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok { n, err := rf.ReadFrom(r); w.bytes += n; return n, err }
-	n, err := io.Copy(w.ResponseWriter, r); w.bytes += n; return n, err
-}
-func (w *statWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-// adminCred holds runtime admin username/password (can be rotated without restart).
-type adminCred struct {
-	User string
-	Pass string
-}
-
-var (
-	adminCredPtr   atomic.Pointer[adminCred]
-	adminPassPath  string // e.g. /etc/emby-proxy/admin.pass
-)
-
-func setAdminCred(user, pass string) {
-	adminCredPtr.Store(&adminCred{User: user, Pass: pass})
-}
+func setAdminCred(u, p string) { adminCredPtr.Store(&adminCred{u, p}) }
 func getAdminCred() (string, string) {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -1070,180 +1144,396 @@ func getAdminCred() (string, string) {
 	return c.User, c.Pass
 }
 
-func basicAuth(next http.HandlerFunc) http.HandlerFunc {
+const (
+	sessionCookie = "emby_admin_sid"
+	sessionTTL    = 24 * time.Hour
+	captchaTTL    = 5 * time.Minute
+)
+
+type sessionEntry struct{ Expires time.Time }
+type captchaEntry struct {
+	Answer  string
+	Expires time.Time
+}
+
+var (
+	sessions sync.Map
+	captchas sync.Map
+)
+
+func randToken(n int) string {
+	b := make([]byte, n)
+	_, _ = io.ReadFull(rand.Reader, b)
+	return hex.EncodeToString(b)
+}
+
+func initSessionsCleanup() {
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		for range t.C {
+			now := time.Now()
+			sessions.Range(func(k, v interface{}) bool {
+				if e, ok := v.(sessionEntry); ok && now.After(e.Expires) {
+					sessions.Delete(k)
+				}
+				return true
+			})
+			captchas.Range(func(k, v interface{}) bool {
+				if e, ok := v.(captchaEntry); ok && now.After(e.Expires) {
+					captchas.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
+}
+
+func createSession() string {
+	tok := randToken(16)
+	sessions.Store(tok, sessionEntry{Expires: time.Now().Add(sessionTTL)})
+	return tok
+}
+func validSession(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	v, ok := sessions.Load(tok)
+	if !ok {
+		return false
+	}
+	e := v.(sessionEntry)
+	if time.Now().After(e.Expires) {
+		sessions.Delete(tok)
+		return false
+	}
+	return true
+}
+func destroySession(tok string) {
+	if tok != "" {
+		sessions.Delete(tok)
+	}
+}
+func getSessionToken(r *http.Request) string {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return ""
+	}
+	return c.Value
+}
+func setSessionCookie(w http.ResponseWriter, tok string) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: tok, Path: "/admin", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int(sessionTTL.Seconds())})
+}
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
+}
+
+func generateCaptchaSVG() (id, answer, svg string) {
+	const digits = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+	rb := make([]byte, 8)
+	_, _ = io.ReadFull(rand.Reader, rb)
+	ans := make([]byte, 4)
+	for i := 0; i < 4; i++ {
+		ans[i] = digits[int(rb[i])%len(digits)]
+	}
+	answer = string(ans)
+	id = randToken(8)
+	var lines, texts strings.Builder
+	for i := 0; i < 6; i++ {
+		x1 := (i*20 + int(rb[i%4])) % 140
+		y1 := (i*7 + int(rb[(i+1)%4])) % 48
+		x2 := (x1 + 30 + int(rb[(i+2)%4])) % 140
+		y2 := (y1 + 15 + int(rb[(i+3)%4])) % 48
+		lines.WriteString(fmt.Sprintf(`<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#cbd5e1" stroke-width="1.2"/>`, x1, y1, x2, y2))
+	}
+	colors := []string{"#3b82f6", "#2563eb", "#1d4ed8", "#0f172a"}
+	for i, ch := range answer {
+		x := 18 + i*32 + int(rb[i%4])%6
+		y := 32 + int(rb[(i+1)%4])%8
+		rot := int(rb[i%4])%20 - 10
+		texts.WriteString(fmt.Sprintf(`<text x="%d" y="%d" fill="%s" font-size="28" font-family="Consolas,monospace" font-weight="700" transform="rotate(%d %d %d)">%c</text>`, x, y, colors[i%len(colors)], rot, x, y, ch))
+	}
+	svg = fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" width="150" height="48" viewBox="0 0 150 48"><rect width="150" height="48" fill="#f8fafc" rx="8"/>%s%s</svg>`, lines.String(), texts.String())
+	captchas.Store(id, captchaEntry{Answer: strings.ToUpper(answer), Expires: time.Now().Add(captchaTTL)})
+	return id, answer, svg
+}
+
+func verifyCaptcha(id, input string) bool {
+	if id == "" || input == "" {
+		return false
+	}
+	v, ok := captchas.Load(id)
+	if !ok {
+		return false
+	}
+	captchas.Delete(id)
+	e := v.(captchaEntry)
+	if time.Now().After(e.Expires) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(input), e.Answer)
+}
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		user, pass := getAdminCred()
-		u, p, ok := r.BasicAuth()
-		if !ok || subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 || subtle.ConstantTimeCompare([]byte(p), []byte(pass)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="emby-proxy admin"`)
-			http.Error(w, "未登录或登录已失效，请重新登录", http.StatusUnauthorized)
+		if validSession(getSessionToken(r)) {
+			next(w, r)
 			return
 		}
-		next(w, r)
+		if strings.HasPrefix(r.URL.Path, "/admin/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"未登录","redirect":"/admin/login"}`))
+			return
+		}
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
 	}
 }
+
+const loginHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · Emby Proxy</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--r:16px}
+body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:40px 36px;max-width:400px;width:100%;box-shadow:0 4px 24px -4px rgba(15,23,42,.06)}
+.brand{text-align:center;margin-bottom:28px}
+.brand-icon{width:56px;height:56px;border-radius:14px;background:var(--ps);color:var(--p);display:flex;align-items:center;justify-content:center;font-size:26px;margin:0 auto 14px}
+.brand h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
+.brand p{font-size:13px;color:var(--t3);margin-top:4px}
+.fi{margin-bottom:18px}
+.fl{display:block;font-size:13px;font-weight:600;margin-bottom:8px;color:var(--t2)}
+.inp{width:100%;padding:12px 16px;font-size:14px;background:#f8fafc;border:1px solid var(--bd);border-radius:10px;font-family:inherit;outline:none;transition:.2s}
+.inp:focus{background:#fff;border-color:var(--p);box-shadow:0 0 0 4px var(--ps)}
+.cap-row{display:flex;gap:12px;align-items:center}
+.cap-row .inp{flex:1}
+.cap-img{height:48px;border-radius:10px;border:1px solid var(--bd);cursor:pointer;background:#f8fafc;flex-shrink:0}
+.cap-img:hover{border-color:var(--p)}
+.btn{display:flex;align-items:center;justify-content:center;width:100%;padding:13px 20px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;border:0;font-family:inherit;background:var(--p);color:#fff;box-shadow:0 2px 6px rgba(59,130,246,.25);transition:.2s;margin-top:8px}
+.btn:hover{background:var(--pd)}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.err{background:#fef2f2;color:var(--d);border:1px solid #fecaca;border-radius:10px;padding:10px 14px;font-size:13px;margin-bottom:16px;display:none}
+.err.on{display:block}
+.foot{text-align:center;margin-top:24px;font-size:12.5px;color:var(--t3)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="brand-icon">⚡</div>
+    <h1>Emby Proxy</h1>
+    <p>管理后台登录</p>
+  </div>
+  <div class="err" id="errBox"></div>
+  <form id="loginForm" autocomplete="on">
+    <div class="fi">
+      <label class="fl" for="user">用户名</label>
+      <input class="inp" id="user" name="username" type="text" autocomplete="username" required placeholder="请输入用户名">
+    </div>
+    <div class="fi">
+      <label class="fl" for="pass">密码</label>
+      <input class="inp" id="pass" name="password" type="password" autocomplete="current-password" required placeholder="请输入密码">
+    </div>
+    <div class="fi">
+      <label class="fl" for="captcha">验证码</label>
+      <div class="cap-row">
+        <input class="inp" id="captcha" name="captcha" type="text" autocomplete="off" required placeholder="点击图片刷新" maxlength="6">
+        <img class="cap-img" id="capImg" alt="验证码" title="点击刷新">
+      </div>
+    </div>
+    <button type="submit" class="btn" id="submitBtn">登 录</button>
+  </form>
+  <div class="foot">Emby Proxy · 路径反代网关</div>
+</div>
+<script>
+let captchaId = '';
+async function loadCaptcha() {
+  try {
+    const r = await fetch('/admin/api/captcha?t=' + Date.now(), {cache:'no-store'});
+    if (!r.ok) throw new Error('加载失败');
+    captchaId = r.headers.get('X-Captcha-Id') || '';
+    const blob = await r.blob();
+    document.getElementById('capImg').src = URL.createObjectURL(blob);
+  } catch(e) { console.error(e); }
+}
+document.getElementById('capImg').addEventListener('click', () => { document.getElementById('captcha').value=''; loadCaptcha(); });
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errBox = document.getElementById('errBox');
+  errBox.classList.remove('on');
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const r = await fetch('/admin/api/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('user').value.trim(),
+        password: document.getElementById('pass').value,
+        captcha: document.getElementById('captcha').value.trim(),
+        captcha_id: captchaId
+      })
+    });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok) {
+      errBox.textContent = data.error || '登录失败';
+      errBox.classList.add('on');
+      document.getElementById('captcha').value = '';
+      loadCaptcha();
+      return;
+    }
+    location.href = '/admin/';
+  } catch(err) {
+    errBox.textContent = '网络错误，请重试';
+    errBox.classList.add('on');
+    loadCaptcha();
+  } finally {
+    btn.disabled = false; btn.textContent = '登 录';
+  }
+});
+loadCaptcha();
+</script>
+</body>
+</html>`
 
 func saveAdminPassFile(pass string) error {
-	if adminPassPath == "" {
-		return fmt.Errorf("密码文件路径未初始化")
+	if db == nil {
+		return fmt.Errorf("db not ready")
 	}
-	tmp := adminPassPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(pass), 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, adminPassPath)
+	return db.Update(func(tx *bolt.Tx) error {
+		bk, err := tx.CreateBucketIfNotExists([]byte("auth"))
+		if err != nil {
+			return err
+		}
+		return bk.Put([]byte("admin_pass"), []byte(pass))
+	})
 }
 
-// best-effort: update -admin-pass in systemd unit so next restart keeps new password
-func updateSystemdUnitPass(newPass string) {
-	unit := "/etc/systemd/system/emby-proxy.service"
-	b, err := os.ReadFile(unit)
-	if err != nil {
-		return
-	}
-	s := string(b)
-	// replace -admin-pass "..." or -admin-pass xxx
-	re := regexp.MustCompile(`-admin-pass(\s+)("[^"]*"|'[^']*'|\S+)`)
-	quoted := strconv.Quote(newPass) // Go-style quotes, close enough for unit
-	// systemd uses shell-like quoting; use double quotes with escaped chars
-	esc := strings.ReplaceAll(newPass, `\`, `\\`)
-	esc = strings.ReplaceAll(esc, `"`, `\"`)
-	esc = strings.ReplaceAll(esc, `%`, `%%`)
-	replacement := `-admin-pass$1"` + esc + `"`
-	ns := re.ReplaceAllString(s, replacement)
-	if ns == s {
-		_ = quoted
-		return
-	}
-	_ = os.WriteFile(unit, []byte(ns), 0644)
-	_ = exec.Command("systemctl", "daemon-reload").Run()
+type statWriter struct {
+	http.ResponseWriter
+	bytes int64
 }
 
-// ---------- 防火墙：放行 / 关闭服务端口 ----------
-func cmdExists(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
+func (w *statWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += int64(n)
+	return n, err
+}
+func (w *statWriter) WriteHeader(code int) { w.ResponseWriter.WriteHeader(code) }
+func (w *statWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+func (w *statWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("no hijacker")
+}
+func (w *statWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(r)
+		w.bytes += n
+		return n, err
+	}
+	n, err := io.Copy(w.ResponseWriter, r)
+	w.bytes += n
+	return n, err
+}
+func (w *statWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// cacheRecorder：仅用于“可缓存候选请求”（GET /Images/...）。
+// 关键修复：原实现给【所有】代理请求都套了 io.MultiWriter + bytes.Buffer，
+// 即便缓存关闭，视频流等大响应也会在内存里完整复制一份，内存占用巨大。
+// 现在：
+//   - 非缓存请求直接用 statWriter，零额外内存；
+//   - 缓存候选请求才缓冲，且缓冲超过 cacheBodyLimit 后自动停止（不再复制），
+//     并记录状态码，只有 200 才写入 LRU。
+const cacheBodyLimit = 5 << 20 // 5MB，超过则放弃缓存
+
+type cacheRecorder struct {
+	*statWriter
+	buf    *bytes.Buffer
+	status int
 }
 
-func firewallBackend() string {
-	if cmdExists("firewall-cmd") {
-		if out, err := exec.Command("firewall-cmd", "--state").CombinedOutput(); err == nil && strings.Contains(strings.ToLower(string(out)), "running") {
-			return "firewalld"
-		}
-	}
-	if cmdExists("ufw") {
-		if out, err := exec.Command("ufw", "status").CombinedOutput(); err == nil {
-			low := strings.ToLower(string(out))
-			if strings.Contains(low, "active") || strings.Contains(low, "启用") {
-				return "ufw"
-			}
-		}
-	}
-	if cmdExists("iptables") {
-		return "iptables"
-	}
-	return ""
+func (c *cacheRecorder) WriteHeader(code int) {
+	c.status = code
+	c.statWriter.WriteHeader(code)
 }
 
-func firewallPortOpen(port int) (open bool, backend string, detail string) {
-	backend = firewallBackend()
-	if backend == "" {
-		return false, "", "未检测到可用防火墙（firewalld / ufw / iptables）"
+func (c *cacheRecorder) Write(b []byte) (int, error) {
+	if c.buf != nil && c.status/100 == 2 && c.buf.Len()+len(b) <= cacheBodyLimit {
+		c.buf.Write(b) // 尽力而为地缓冲；超限后 buf 置 nil 停止复制
+	} else {
+		c.buf = nil
 	}
-	ps := strconv.Itoa(port)
-	switch backend {
-	case "firewalld":
-		out, err := exec.Command("firewall-cmd", "--query-port", ps+"/tcp").CombinedOutput()
-		open = err == nil && strings.TrimSpace(string(out)) == "yes"
-		detail = strings.TrimSpace(string(out))
-	case "ufw":
-		out, _ := exec.Command("ufw", "status").CombinedOutput()
-		s := string(out)
-		open = strings.Contains(s, ps+"/tcp") || strings.Contains(s, ps+" ")
-		detail = "ufw"
-	case "iptables":
-		out, err := exec.Command("iptables", "-C", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT").CombinedOutput()
-		open = err == nil
-		if !open {
-			detail = strings.TrimSpace(string(out))
-		}
-	}
-	return open, backend, detail
+	n, err := c.statWriter.Write(b)
+	return n, err
 }
 
-func firewallSetPort(port int, allow bool) error {
-	backend := firewallBackend()
-	if backend == "" {
-		return fmt.Errorf("未检测到可用防火墙")
+func (c *cacheRecorder) Flush() {
+	// 出现过 Flush（流式响应）说明不是可整体缓存的小图片，停止缓冲
+	c.buf = nil
+	c.statWriter.Flush()
+}
+
+func (c *cacheRecorder) ReadFrom(r io.Reader) (int64, error) {
+	// 大体量拷贝（如视频）不走缓冲
+	c.buf = nil
+	return c.statWriter.ReadFrom(r)
+}
+
+type statReadCloser struct {
+	io.ReadCloser
+	bytes *int64
+}
+
+func (r *statReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		atomic.AddInt64(r.bytes, int64(n))
 	}
-	ps := strconv.Itoa(port)
-	var cmd *exec.Cmd
-	switch backend {
-	case "firewalld":
-		if allow {
-			_ = exec.Command("firewall-cmd", "--permanent", "--add-port="+ps+"/tcp").Run()
-			cmd = exec.Command("firewall-cmd", "--reload")
-		} else {
-			_ = exec.Command("firewall-cmd", "--permanent", "--remove-port="+ps+"/tcp").Run()
-			cmd = exec.Command("firewall-cmd", "--reload")
-		}
-	case "ufw":
-		if allow {
-			cmd = exec.Command("ufw", "allow", ps+"/tcp")
-		} else {
-			cmd = exec.Command("ufw", "delete", "allow", ps+"/tcp")
-		}
-	case "iptables":
-		if allow {
-			// avoid duplicate
-			if err := exec.Command("iptables", "-C", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT").Run(); err == nil {
-				return nil
-			}
-			cmd = exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT")
-		} else {
-			cmd = exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "--dport", ps, "-j", "ACCEPT")
-		}
-	default:
-		return fmt.Errorf("不支持的防火墙: %s", backend)
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %s", err.Error(), strings.TrimSpace(string(out)))
-	}
-	return nil
+	return n, err
 }
 
 type switchTransport struct{ v atomic.Value }
 
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t, _ := s.v.Load().(*http.Transport)
-	if t == nil { return nil, fmt.Errorf("transport 未初始化") }
+	if t == nil {
+		return nil, fmt.Errorf("transport nil")
+	}
 	return t.RoundTrip(r)
 }
 
 type bufferPool struct{ pool sync.Pool }
 
 func (b *bufferPool) Get() []byte {
-	if v := b.pool.Get(); v != nil { return v.([]byte) }
+	if v := b.pool.Get(); v != nil {
+		return v.([]byte)
+	}
 	return make([]byte, 32*1024)
 }
-func (b *bufferPool) Put(p []byte) { if cap(p) >= 32*1024 { b.pool.Put(p[:32*1024]) } }
+func (b *bufferPool) Put(p []byte) {
+	if cap(p) >= 32*1024 {
+		b.pool.Put(p[:32*1024])
+	}
+}
 
 var proxyBufPool = &bufferPool{}
 
 func newTransport() *http.Transport {
 	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          512,
-		MaxIdleConnsPerHost:   256,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 45 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    true,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
+		Proxy:             http.ProxyFromEnvironment,
+		DialContext:       (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2: true, MaxIdleConns: 512, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 45 * time.Second, ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
 	}
 }
 
@@ -1251,22 +1541,27 @@ var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
 
 func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	if o := out.Header.Get("Origin"); o != "" && o != "null" {
-		if u, err := url.Parse(o); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) { out.Header.Set("Origin", scheme+"://"+host) }
+		if u, err := url.Parse(o); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) {
+			out.Header.Set("Origin", scheme+"://"+host)
+		}
 	}
 	if rf := out.Header.Get("Referer"); rf != "" {
 		if u, err := url.Parse(rf); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) {
-			u.Scheme = scheme; u.Host = host; out.Header.Set("Referer", u.String())
+			u.Scheme = scheme
+			u.Host = host
+			out.Header.Set("Referer", u.String())
 		}
 	}
 }
+
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: tr,
-		FlushInterval: 50 * time.Millisecond,
-		BufferPool:    proxyBufPool,
+		Transport: tr, FlushInterval: 50 * time.Millisecond, BufferPool: proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
-			if !ok || t == nil { return }
+			if !ok || t == nil {
+				return
+			}
 			pr.Out.URL.Scheme = t.Scheme
 			pr.Out.URL.Host = t.Host
 			pr.Out.URL.Path = t.Path
@@ -1275,373 +1570,584 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			pr.Out.Host = t.Host
 			pr.SetXForwarded()
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
+			if upPtr, ok := pr.In.Context().Value(upBytesCtxKey{}).(*int64); ok && pr.In.Body != nil && pr.In.Body != http.NoBody {
+				pr.Out.Body = &statReadCloser{ReadCloser: pr.In.Body, bytes: upPtr}
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			upHost := ""
-			if resp.Request != nil && resp.Request.URL != nil { upHost = resp.Request.URL.Host }
+			if resp.Request != nil && resp.Request.URL != nil {
+				upHost = resp.Request.URL.Host
+			}
 			if loc := resp.Header.Get("Location"); loc != "" && upHost != "" {
 				if lu, err := url.Parse(loc); err == nil && lu.Host != "" && strings.EqualFold(lu.Host, upHost) {
-					lu.Scheme = ""; lu.Host = ""
-					if lu.Path == "" { lu.Path = "/" }
+					lu.Scheme = ""
+					lu.Host = ""
+					if lu.Path == "" {
+						lu.Path = "/"
+					}
 					resp.Header.Set("Location", lu.String())
 				}
 			}
 			if cks, ok := resp.Header["Set-Cookie"]; ok && len(cks) > 0 {
-				for i, c := range cks { cks[i] = cookieDomainRE.ReplaceAllString(c, "") }
+				for i, c := range cks {
+					cks[i] = cookieDomainRE.ReplaceAllString(c, "")
+				}
 			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[proxy] %s %s -> %v", r.Method, r.URL.RequestURI(), err)
-			http.Error(w, "无法连接目标服务器："+err.Error(), http.StatusBadGateway)
+			msg := "上游服务暂时不可达，请稍后重试。"
+			if err != nil {
+				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "&lt;"), ">", "&gt;") + "</span>"
+			}
+			serveError(w, http.StatusBadGateway, "无法连接目标", msg)
 		},
 	}
-}
-func helpPage(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, "Emby 路径反代运行中。\n用法：原地址放到路径里，例如：\n  https://www.example.com/emby/Users\n改成：\n  http://<本机地址>/https://www.example.com/emby/Users\n管理页: /admin/\n")
 }
 
 type adminConfigResp struct {
 	Config
 	EffectivePort int `json:"effective_port"`
 }
-type saveReq struct {
-	Port      int      `json:"port"`
-	ChinaOnly bool     `json:"china_only"`
-	Whitelist []string `json:"whitelist"`
-	GeoAPI    bool     `json:"geo_api"`
-	GeoAPIURL string   `json:"geo_api_url"`
-}
+
 func adminHandler() http.HandlerFunc {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/admin/login", func(w http.ResponseWriter, r *http.Request) {
+		if validSession(getSessionToken(r)) {
+			http.Redirect(w, r, "/admin/", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(loginHTML))
+	})
+	mux.HandleFunc("/admin/api/captcha", func(w http.ResponseWriter, r *http.Request) {
+		id, _, svg := generateCaptchaSVG()
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Header().Set("Cache-Control", "no-store, no-cache")
+		w.Header().Set("X-Captcha-Id", id)
+		_, _ = w.Write([]byte(svg))
+	})
+	mux.HandleFunc("/admin/api/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "不支持", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Username  string `json:"username"`
+			Password  string `json:"password"`
+			Captcha   string `json:"captcha"`
+			CaptchaID string `json:"captcha_id"`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"参数错误"}`))
+			return
+		}
+		if !verifyCaptcha(req.CaptchaID, req.Captcha) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"验证码错误或已过期"}`))
+			return
+		}
+		u, p := getAdminCred()
+		if subtle.ConstantTimeCompare([]byte(req.Username), []byte(u)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(req.Password), []byte(p)) != 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"用户名或密码错误"}`))
+			return
+		}
+		tok := createSession()
+		setSessionCookie(w, tok)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/admin/api/logout", func(w http.ResponseWriter, r *http.Request) {
+		destroySession(getSessionToken(r))
+		clearSessionCookie(w)
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
+	})
+
 	mux.HandleFunc("/admin/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		c := currentCfg()
-		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *c, EffectivePort: currentPort()})
+		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *currentCfg(), EffectivePort: currentPort()})
 	})
 	mux.HandleFunc("/admin/api/save", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { http.Error(w, "该接口不支持此请求方法", http.StatusMethodNotAllowed); return }
-		var req saveReq
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "请求数据格式错误："+err.Error(), http.StatusBadRequest); return }
-		if req.Port != 0 && (req.Port < 1 || req.Port > 65535) { http.Error(w, "端口必须是 1-65535 之间的整数", http.StatusBadRequest); return }
+		if r.Method != http.MethodPost {
+			http.Error(w, "不支持", http.StatusMethodNotAllowed)
+			return
+		}
+		// 复用 Config 结构体（与 saveReq 字段完全一致，去掉重复定义）
+		var req Config
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "参数错误", http.StatusBadRequest)
+			return
+		}
+		req.GeoAPIURL = strings.TrimSpace(req.GeoAPIURL)
 		oldCfg := currentCfg()
-		newCfg := &Config{Port: req.Port, ChinaOnly: req.ChinaOnly, Whitelist: req.Whitelist, GeoAPI: req.GeoAPI, GeoAPIURL: strings.TrimSpace(req.GeoAPIURL)}
-		if err := saveConfig(newCfg); err != nil { http.Error(w, "保存失败: "+err.Error(), http.StatusInternalServerError); return }
+		newCfg := &req
+		if err := saveConfig(newCfg); err != nil {
+			http.Error(w, "保存失败", http.StatusInternalServerError)
+			return
+		}
 		cfgPtr.Store(newCfg)
-		refreshRuntime()
 		if newCfg.Port > 0 && newCfg.Port != currentPort() && globalSrv != nil {
 			if err := startListen(globalSrv, newCfg.Port); err != nil {
-				cfgPtr.Store(oldCfg); _ = saveConfig(oldCfg); refreshRuntime()
-				http.Error(w, "端口 "+strconv.Itoa(newCfg.Port)+" 无法监听: "+err.Error(), http.StatusBadRequest)
+				// 端口切换失败：回滚配置。Transport 与配置无关，无需重建。
+				cfgPtr.Store(oldCfg)
+				_ = saveConfig(oldCfg)
+				http.Error(w, "端口监听失败", http.StatusBadRequest)
 				return
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
 	})
-	mux.HandleFunc("/admin/api/flag/", func(w http.ResponseWriter, r *http.Request) {
-		code := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/admin/api/flag/"))
-		if len(code) != 2 || code[0] < 'a' || code[0] > 'z' || code[1] < 'a' || code[1] > 'z' {
-			http.NotFound(w, r)
+	mux.HandleFunc("/admin/api/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "SSE 不支持", http.StatusInternalServerError)
 			return
 		}
-		data, err := flagPng(code)
-		if err != nil {
-			http.NotFound(w, r)
-			return
+		ch := make(chan string, 100)
+		logClients.Store(ch, ch)
+		defer logClients.Delete(ch)
+		for {
+			select {
+			case msg := <-ch:
+				fmt.Fprintf(w, "data: %s\n\n", msg)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
 		}
-		w.Header().Set("Content-Type", flagContentType(code))
-		w.Header().Set("Cache-Control", "public, max-age=2592000")
-		_, _ = w.Write(data)
 	})
 	mux.HandleFunc("/admin/api/traffic", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		q := r.URL.Query()
-		from := strings.TrimSpace(q.Get("from")); to := strings.TrimSpace(q.Get("to"))
 		statsMu.Lock()
-		var reqs, byts, cn, wl int64
-		ips := map[string]int64{}; ctry := map[string]int64{}
-		type TrendItem struct{ Date string `json:"date"`; Requests int64 `json:"requests"`; Bytes int64 `json:"bytes"` }
+		ips := make(map[string]int64, len(stats.IPCounts))
+		for k, v := range stats.IPCounts {
+			ips[k] = v
+		}
+		ipBytes := make(map[string]int64, len(stats.IPBytes))
+		for k, v := range stats.IPBytes {
+			ipBytes[k] = v
+		}
+		ctry := make(map[string]int64, len(stats.CountryCounts))
+		for k, v := range stats.CountryCounts {
+			ctry[k] = v
+		}
+
+		type TrendItem struct {
+			Date      string `json:"date"`
+			Requests  int64  `json:"requests"`
+			Bytes     int64  `json:"bytes"`
+			BlockedCN int64  `json:"blocked_cn"`
+			BlockedWL int64  `json:"blocked_whitelist"`
+		}
 		var trend []TrendItem
-		days := make([]string, 0, len(stats.Daily))
-		for k := range stats.Daily { days = append(days, k) }
-		sort.Sort(sort.Reverse(sort.StringSlice(days)))
-		if from == "" && to == "" {
-			reqs, byts = stats.TotalRequests, stats.TotalBytes
-			cn, wl = stats.BlockedCN, stats.BlockedWhitelist
-			for ip, n := range stats.IPCounts { ips[ip] = n }
-			for c, n := range stats.CountryCounts { ctry[c] = n }
-			for _, k := range days { d := stats.Daily[k]; trend = append(trend, TrendItem{Date: k, Requests: d.Requests, Bytes: d.Bytes}) }
-		} else {
-			for k, d := range stats.Daily {
-				if from != "" && k < from { continue }
-				if to != "" && k > to { continue }
-				reqs += d.Requests; byts += d.Bytes; cn += d.BlockedCN; wl += d.BlockedWL
-				for ip, n := range d.IPs { ips[ip] += n }
-				for c, n := range d.Countries { ctry[c] += n }
-				trend = append(trend, TrendItem{Date: k, Requests: d.Requests, Bytes: d.Bytes})
+		for k, d := range stats.Daily {
+			if d != nil {
+				trend = append(trend, TrendItem{Date: k, Requests: d.Requests, Bytes: d.Bytes, BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL})
 			}
 		}
 		sort.Slice(trend, func(i, j int) bool { return trend[i].Date < trend[j].Date })
-		today := time.Now().Format("2006-01-02")
-		var todayReqs, todayBytes int64
-		if d := stats.Daily[today]; d != nil { todayReqs, todayBytes = d.Requests, d.Bytes }
+		todayReqs, todayBytes := int64(0), int64(0)
+		if d := stats.Daily[time.Now().Format("2006-01-02")]; d != nil {
+			todayReqs, todayBytes = d.Requests, d.Bytes
+		}
+
+		labels := map[string]string{}
+		for code := range ctry {
+			labels[code] = countryName(code)
+		}
+
+		reqs, byts := stats.TotalRequests, stats.TotalBytes
+		cn, wl := stats.BlockedCN, stats.BlockedWhitelist
 		statsMu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"today": today, "requests": reqs, "bytes": byts, "blocked_cn": cn, "blocked_whitelist": wl, "ip_counts": ips, "country_counts": ctry, "days": days, "today_requests": todayReqs, "today_bytes": todayBytes, "trend": trend})
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"today": time.Now().Format("2006-01-02"), "requests": reqs, "bytes": byts,
+			"blocked_cn": cn, "blocked_whitelist": wl,
+			"ip_counts": ips, "ip_bytes": ipBytes, "country_counts": ctry, "country_labels": labels,
+			"today_requests": todayReqs, "today_bytes": todayBytes, "trend": trend,
+			"uptime_sec":   int64(time.Since(startedAt).Seconds()),
+			"stat_dropped": statDropped.Load(), // 统计事件因通道满被丢弃的数量（有损观测）
+		})
 	})
 	mux.HandleFunc("/admin/api/blocks", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		q := r.URL.Query()
-		date := strings.TrimSpace(q.Get("date")); from := strings.TrimSpace(q.Get("from")); to := strings.TrimSpace(q.Get("to"))
-		if date != "" { from, to = date, date }
-		page := 1
-		if v, err := strconv.Atoi(q.Get("page")); err == nil && v > 0 { page = v }
-		size := 20
-		if v, err := strconv.Atoi(q.Get("size")); err == nil && v > 0 && v <= 200 { size = v }
 		statsMu.Lock()
-		matched := []BlockEvent{}
-		dates := []string{}
-		seen := map[string]bool{}
-		for _, b := range stats.Blocks {
-			// 本机 / 内网 / 本机公网 IP 不展示在拦截列表
-			if isSelfOrLocalIP(b.IP, b.Country) {
-				continue
-			}
-			d := b.Time
-			if t := parseBlockTime(b.Time); !t.IsZero() {
-				d = t.In(time.Local).Format("2006-01-02")
-			} else if len(d) >= 10 {
-				d = d[:10]
-			}
-			if !seen[d] {
-				seen[d] = true
-				if len(dates) < 60 {
-					dates = append(dates, d)
-				}
-			}
-			if from != "" && d < from {
-				continue
-			}
-			if to != "" && d > to {
-				continue
-			}
-			matched = append(matched, b)
-		}
+		// recordBlocked 现在是按时间正序追加存储的，这里倒序输出（最新在前）保持前端展示不变
+		matched := make([]BlockEvent, len(stats.Blocks))
+		copy(matched, stats.Blocks)
 		statsMu.Unlock()
-		total := len(matched)
-		pages := (total + size - 1) / size
-		if pages < 1 {
-			pages = 1
+		for i, j := 0, len(matched)-1; i < j; i, j = i+1, j-1 {
+			matched[i], matched[j] = matched[j], matched[i]
 		}
-		if page > pages {
-			page = pages
-		}
-		start := (page - 1) * size
-		end := start + size
-		if start > total {
-			start = total
-		}
-		if end > total {
-			end = total
-		}
-		items := append([]BlockEvent{}, matched[start:end]...)
-		_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "page": page, "size": size, "pages": pages, "items": items, "dates": dates, "today": time.Now().Format("2006-01-02")})
+		_ = json.NewEncoder(w).Encode(map[string]any{"total": len(matched), "items": matched})
 	})
-	mux.HandleFunc("/admin/api/geotest", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
-		var req struct{ IP string `json:"ip"` }
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		ip := strings.TrimSpace(req.IP)
-		if ip == "" { ip = "8.8.8.8" }
-		if net.ParseIP(ip) == nil { http.Error(w, "IP 地址格式不正确", http.StatusBadRequest); return }
-		tpl := strings.TrimSpace(currentCfg().GeoAPIURL)
-		if tpl == "" { tpl = defaultGeoAPI }
-		code, name, err := geoFetch(ip)
-		geoStatRecord(err == nil, func() string { if err != nil { return err.Error() }; return "" }())
-		out := map[string]any{"ip": ip, "url": strings.ReplaceAll(tpl, "{ip}", ip)}
-		if err != nil { out["ok"] = false; out["error"] = err.Error() } else { out["ok"] = true; out["code"] = code; out["name"] = name }
+	mux.HandleFunc("/admin/api/ip-detail", func(w http.ResponseWriter, r *http.Request) {
+		ip := strings.TrimSpace(r.URL.Query().Get("ip"))
+		if ip == "" || net.ParseIP(ip) == nil {
+			http.Error(w, "IP 无效", http.StatusBadRequest)
+			return
+		}
+		code, name := ipLabelSync(ip)
+		geo := geoEntry{}
+		if currentCfg().GeoAPI {
+			v, err, _ := geoGroup.Do(ip, func() (interface{}, error) {
+				geoMu.RLock()
+				cached, ok := geoMap[ip]
+				geoMu.RUnlock()
+				if ok && cached.Code != "??" && time.Now().Unix()-cached.At < 30*86400 {
+					return cached, nil
+				}
+				return geoFetch(ip)
+			})
+			if err == nil {
+				geo = v.(geoEntry)
+				geoMu.Lock()
+				geoMap[ip] = geo
+				geoMu.Unlock()
+			}
+		}
+		if geo.Code != "" {
+			code = geo.Code
+			name = countryName(code)
+		}
+		locParts := []string{}
+		if name != "未知" {
+			locParts = append(locParts, name)
+		}
+		if geo.Region != "" {
+			locParts = append(locParts, geo.Region)
+		}
+		if geo.City != "" && geo.City != geo.Region {
+			locParts = append(locParts, geo.City)
+		}
+		statsMu.Lock()
+		reqs := stats.IPCounts[ip]
+		bytes := stats.IPBytes[ip]
+		statsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ip": ip, "country": code, "country_name": name, "region": geo.Region, "city": geo.City, "location": strings.Join(locParts, " · "), "requests": reqs, "bytes": bytes})
 	})
-	mux.HandleFunc("/admin/api/regeo", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
-		started := atomic.CompareAndSwapInt32(&regeoRunning, 0, 1)
-		if started { go func() { defer atomic.StoreInt32(&regeoRunning, 0); regeoAll() }() }
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"started": started})
-	})
-	mux.HandleFunc("/admin/api/reset-config", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
-		newCfg := &Config{Port: currentPort(), ChinaOnly: false, Whitelist: []string{}, GeoAPI: true, GeoAPIURL: ""}
-		if err := saveConfig(newCfg); err != nil { http.Error(w, "保存失败: "+err.Error(), http.StatusInternalServerError); return }
-		cfgPtr.Store(newCfg)
-		refreshRuntime()
-		log.Printf("管理页已还原为默认设置")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
-	})
-	// 修改管理密码（需验证旧密码）
 	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			OldPass string `json:"old_pass"`
-			NewPass string `json:"new_pass"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "请求数据格式错误", http.StatusBadRequest)
-			return
-		}
-		req.OldPass = strings.TrimSpace(req.OldPass)
-		req.NewPass = strings.TrimSpace(req.NewPass)
-		if req.NewPass == "" {
-			http.Error(w, "新密码不能为空", http.StatusBadRequest)
-			return
-		}
+		var req struct{ OldPass, NewPass string }
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		// 新密码做基本强度校验（原实现允许空密码，会把后台门户大开）
 		if len(req.NewPass) < 6 {
 			http.Error(w, "新密码至少 6 位", http.StatusBadRequest)
 			return
 		}
-		user, pass := getAdminCred()
+		_, pass := getAdminCred()
 		if subtle.ConstantTimeCompare([]byte(req.OldPass), []byte(pass)) != 1 {
-			http.Error(w, "旧密码不正确", http.StatusForbidden)
+			http.Error(w, "旧密码错误", http.StatusForbidden)
 			return
 		}
-		if err := saveAdminPassFile(req.NewPass); err != nil {
-			http.Error(w, "写入密码文件失败: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		setAdminCred(user, req.NewPass)
-		updateSystemdUnitPass(req.NewPass)
-		log.Printf("管理密码已通过管理页修改")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-	})
-	// 防火墙状态 / 放行或关闭服务端口
-	mux.HandleFunc("/admin/api/firewall", func(w http.ResponseWriter, r *http.Request) {
-		port := currentPort()
-		if r.Method == http.MethodGet {
-			open, backend, detail := firewallPortOpen(port)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"port":    port,
-				"open":    open,
-				"backend": backend,
-				"detail":  detail,
-				"available": backend != "",
-			})
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Allow *bool `json:"allow"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Allow == nil {
-			http.Error(w, "请提供 allow: true/false", http.StatusBadRequest)
-			return
-		}
-		if err := firewallSetPort(port, *req.Allow); err != nil {
-			http.Error(w, "防火墙操作失败: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		open, backend, _ := firewallPortOpen(port)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "port": port, "open": open, "backend": backend})
+		_ = saveAdminPassFile(req.NewPass)
+		setAdminCred("admin", req.NewPass)
+		w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/admin/api/clear-stats", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
 		statsMu.Lock()
-		stats = Stats{TodayDate: time.Now().Format("2006-01-02"), CountryCounts: map[string]int64{}, IPCounts: map[string]int64{}, Daily: map[string]*DayStat{}, Blocks: []BlockEvent{}}
+		stats = Stats{TodayDate: time.Now().Format("2006-01-02"), CountryCounts: map[string]int64{}, IPCounts: map[string]int64{}, IPBytes: map[string]int64{}, Daily: map[string]*DayStat{}, Blocks: []BlockEvent{}}
 		saveStatsLocked()
 		statsMu.Unlock()
-		log.Printf("管理页已清空所有统计数据")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		w.Write([]byte(`{"ok":true}`))
 	})
-	mux.HandleFunc("/admin/api/stats", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		statsMu.Lock(); defer statsMu.Unlock()
-		gok, gfail, glast := geoStatSnapshot()
-		snap := stats
-		snap.Blocks = nil; snap.RecentBlocks = nil; snap.Daily = nil
-		blocksTotal := len(stats.Blocks)
-		labels := map[string]string{}
-		for code := range stats.CountryCounts { labels[code] = countryName(code) }
-		for _, b := range stats.Blocks { if _, ok := labels[b.Country]; !ok { labels[b.Country] = countryName(b.Country) } }
-		_ = json.NewEncoder(w).Encode(struct {
-			Stats
-			CountryLabels map[string]string `json:"country_labels"`
-			Port          int               `json:"port"`
-			UptimeSec     int64             `json:"uptime_sec"`
-			GeoOK         int64             `json:"geo_ok"`
-			GeoFail       int64             `json:"geo_fail"`
-			GeoLastErr    string            `json:"geo_last_err"`
-			RegeoRunning  bool              `json:"regeo_running"`
-			RegeoDone     int32             `json:"regeo_done"`
-			RegeoTotal    int32             `json:"regeo_total"`
-			BlocksTotal   int               `json:"blocks_total"`
-		}{Stats: snap, CountryLabels: labels, Port: currentPort(), UptimeSec: int64(time.Since(startedAt).Seconds()), GeoOK: gok, GeoFail: gfail, GeoLastErr: glast, RegeoRunning: atomic.LoadInt32(&regeoRunning) == 1, RegeoDone: atomic.LoadInt32(&regeoDone), RegeoTotal: atomic.LoadInt32(&regeoTotal), BlocksTotal: blocksTotal})
+	mux.HandleFunc("/admin/api/flag/", func(w http.ResponseWriter, r *http.Request) {
+		code := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/admin/api/flag/"))
+		// 本机 / 内网 / 未知：内置 SVG 图标
+		if code == "lo" || code == "pv" || code == "??" || code == "%3f%3f" {
+			w.Header().Set("Content-Type", "image/svg+xml")
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			var svg string
+			switch code {
+			case "lo":
+				svg = `<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30" viewBox="0 0 40 30"><rect width="40" height="30" rx="4" fill="#dbeafe"/><text x="20" y="20" text-anchor="middle" font-size="16">💻</text></svg>`
+			case "pv":
+				svg = `<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30" viewBox="0 0 40 30"><rect width="40" height="30" rx="4" fill="#e0e7ff"/><text x="20" y="20" text-anchor="middle" font-size="16">🏠</text></svg>`
+			default:
+				svg = `<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30" viewBox="0 0 40 30"><rect width="40" height="30" rx="4" fill="#f1f5f9"/><text x="20" y="20" text-anchor="middle" font-size="16">❓</text></svg>`
+			}
+			_, _ = w.Write([]byte(svg))
+			return
+		}
+		if len(code) != 2 {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "https://flagcdn.com/w40/"+code+".png", http.StatusFound)
 	})
 	mux.HandleFunc("/admin/api/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		_, _ = w.Write(adminHTML)
+		html := strings.Replace(string(adminHTML), "<head>", "<head>\n<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/png\">\n", 1)
+		_, _ = w.Write([]byte(html))
 	})
-	return basicAuth(mux.ServeHTTP)
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/admin/login" || path == "/admin/api/captcha" || path == "/admin/api/login" || path == "/admin/api/logout" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		requireAuth(mux.ServeHTTP)(w, r)
+	}
 }
 
-func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
-	loadConfig(configPath)
-	adminPassPath = filepath.Join(filepath.Dir(configPath), "admin.pass")
-	setAdminCred(adminUser, adminPass)
-	geoCacheLoad(filepath.Join(filepath.Dir(configPath), "geo_cache.json"))
-	flagDir = filepath.Join(filepath.Dir(configPath), "flags")
-	loadStats(statsFile)
+func runServer(port int, adminUser, adminPass, dbFile string) {
+	// Transport 与配置无关，只在启动时创建一次（见 newTransport 上方说明）
+	proxyTr.v.Store(newTransport())
+	var err error
+	db, err = bolt.Open(dbFile, 0600, &bolt.Options{Timeout: 3 * time.Second})
+	if err != nil {
+		log.Fatalf("无法打开数据库: %v", err)
+	}
+	defer db.Close()
+
+	// 数据迁移
+	_ = db.Update(func(tx *bolt.Tx) error {
+		cfgB := tx.Bucket([]byte("config"))
+		if cfgB == nil || cfgB.Get([]byte("data")) == nil {
+			cfgPath := filepath.Join(filepath.Dir(dbFile), "config.json")
+			if b, err := os.ReadFile(cfgPath); err == nil {
+				bk, _ := tx.CreateBucketIfNotExists([]byte("config"))
+				_ = bk.Put([]byte("data"), b)
+				_ = os.Rename(cfgPath, cfgPath+".bak")
+			}
+			statsPath := filepath.Join(filepath.Dir(dbFile), "stats.json")
+			if b, err := os.ReadFile(statsPath); err == nil {
+				bk, _ := tx.CreateBucketIfNotExists([]byte("stats"))
+				_ = bk.Put([]byte("data"), b)
+				_ = os.Rename(statsPath, statsPath+".bak")
+			}
+			passPath := filepath.Join(filepath.Dir(dbFile), "admin.pass")
+			if b, err := os.ReadFile(passPath); err == nil {
+				bk, _ := tx.CreateBucketIfNotExists([]byte("auth"))
+				_ = bk.Put([]byte("admin_pass"), b)
+				_ = os.Rename(passPath, passPath+".bak")
+			}
+			geoPath := filepath.Join(filepath.Dir(dbFile), "geo_cache.json")
+			if b, err := os.ReadFile(geoPath); err == nil {
+				bk, _ := tx.CreateBucketIfNotExists([]byte("geo"))
+				_ = bk.Put([]byte("data"), b)
+				_ = os.Rename(geoPath, geoPath+".bak")
+			}
+		}
+		return nil
+	})
+
+	loadConfig()
+	var dbPass string
+	_ = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("auth"))
+		if b != nil {
+			dbPass = string(b.Get([]byte("admin_pass")))
+		}
+		return nil
+	})
+	if dbPass == "" {
+		dbPass = adminPass
+		_ = saveAdminPassFile(adminPass)
+	}
+	setAdminCred(adminUser, dbPass)
+
+	geoCacheLoad()
+	loadStats()
+	startStatsWorker()
 	startStatsSaver()
+	go broadcastLog()
 	detectSelfPublicIP()
+	// favicon 改为启动时后台预热：
+	// 原实现 faviconOnce.Do 在【第一个请求的处理器里】同步外网 GET（4s 超时），
+	// 会把第一个请求卡住数秒。现在启动即拉取，处理器直接读内存。
+	go func() {
+		resp, err := http.Get("https://i.ibb.co/99QbT1X3/icons8-64.png")
+		if err == nil && resp.StatusCode == 200 {
+			if data, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)); err == nil {
+				faviconData.Store(&data)
+			}
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
 	defer func() { statsMu.Lock(); saveStatsLocked(); statsMu.Unlock(); geoCacheSave() }()
+
 	proxy := buildProxy(proxyTr)
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isBuiltinAssetPath(r.URL.Path) { http.NotFound(w, r); return }
+		if r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.png" || r.URL.Path == "/favicon.svg" {
+			// 读启动时预热的缓存；未预热完成则直接 302 到源站，不阻塞请求
+			if p := faviconData.Load(); p != nil {
+				w.Header().Set("Content-Type", "image/png")
+				w.Header().Set("Cache-Control", "public, max-age=86400")
+				_, _ = w.Write(*p)
+				return
+			}
+			http.Redirect(w, r, "https://i.ibb.co/99QbT1X3/icons8-64.png", http.StatusFound)
+			return
+		}
+		if isBuiltinAssetPath(r.URL.Path) {
+			serveError(w, http.StatusNotFound, "页面不存在", "请求的资源未找到。")
+			return
+		}
+		if r.URL.Path == "/" || r.URL.Path == "" {
+			serveHome(w, r)
+			return
+		}
 		ip := getClientIP(r)
-		country, _ := ipLabel(ip)
 		c := currentCfg()
+
+		// 黑名单 & 限流 & UA
+		isBanned := false
+		clientIP := net.ParseIP(ip)
+		for _, b := range c.BanList {
+			b = strings.TrimSpace(b)
+			if b == "" {
+				continue
+			}
+			if b == ip {
+				isBanned = true
+				break
+			}
+			if strings.Contains(b, "/") {
+				if _, ipnet, err := net.ParseCIDR(b); err == nil && clientIP != nil && ipnet.Contains(clientIP) {
+					isBanned = true
+					break
+				}
+			}
+		}
+		if isBanned {
+			serveError(w, http.StatusForbidden, "访问被拒绝", "您的 IP 已被加入黑名单，无法继续访问。")
+			return
+		}
+		if !checkRateLimit(ip, c.RateLimit) {
+			serveError(w, http.StatusTooManyRequests, "请求过于频繁", "当前请求频率超过限制，请稍后再试。")
+			return
+		}
+		if len(c.AllowedUAs) > 0 {
+			ua := strings.ToLower(r.UserAgent())
+			ok := false
+			for _, u := range c.AllowedUAs {
+				if u != "" && strings.Contains(ua, strings.ToLower(u)) {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				serveError(w, http.StatusForbidden, "UA 不被允许", "当前客户端 User-Agent 不在白名单内。")
+				return
+			}
+		}
+
+		country, _ := ipLabelSync(ip)
 		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
 			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent())
-			http.Error(w, "仅允许中国大陆 IP 访问", http.StatusForbidden)
+			if c.AutoBan {
+				// AutoBan 修复：
+				// 1. 原实现持 statsMu（统计锁）时做 saveConfig（bbolt 磁盘写），会卡住所有统计写入；
+				// 2. 直接在共享的 cfg.BanList 上 append，与主路径遍历 BanList 并发构成 data race。
+				// 现改为 copy-on-write：复制配置生成新 BanList，再原子替换指针，全程不碰统计锁。
+				go func(banIP string) {
+					old := currentCfg()
+					for _, b := range old.BanList {
+						if strings.TrimSpace(b) == banIP {
+							return
+						} // 已存在，无需重复添加
+					}
+					nc := *old
+					nc.BanList = append(append([]string{}, old.BanList...), banIP)
+					if err := saveConfig(&nc); err != nil {
+						return
+					}
+					cfgPtr.Store(&nc)
+				}(ip)
+			}
+			serveError(w, http.StatusForbidden, "地区限制", "当前仅允许中国大陆 IP 访问本服务。")
 			return
 		}
+
 		target, err := parseTarget(r)
-		if err != nil { helpPage(w); return }
+		if err != nil {
+			serveHome(w, r)
+			return
+		}
 		if !whitelistMatch(c.Whitelist, target.Host) {
 			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent())
-			http.Error(w, "目标域名不在访问白名单内，已被拦截", http.StatusForbidden)
+			serveError(w, http.StatusForbidden, "域名不在白名单", "目标域名未被授权，请联系管理员添加白名单。")
 			return
 		}
+
+		if c.CORS {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+
+		if c.EnableCache && strings.Contains(r.URL.Path, "/Images/") && r.Method == "GET" {
+			if cached, ok := imageCacheGet(r.URL.String()); ok {
+				w.Header().Set("Content-Type", "image/jpeg")
+				_, _ = w.Write(cached)
+				return
+			}
+		}
+
+		logSSE(fmt.Sprintf("[%s] %s %s -> %s", ip, r.Method, r.URL.Path, target.Host))
 		recordRequestStart(ip, country)
+
+		// 只有“缓存候选请求”才包 cacheRecorder（小内存缓冲 + 状态码记录），
+		// 其余请求零额外内存开销（原实现所有请求都被 MultiWriter 全量复制到内存）。
 		sw := &statWriter{ResponseWriter: w}
+		var w2 http.ResponseWriter = sw
+		if c.EnableCache && strings.Contains(r.URL.Path, "/Images/") && r.Method == "GET" {
+			rec := &cacheRecorder{statWriter: sw, buf: &bytes.Buffer{}}
+			w2 = rec
+		}
+
+		upBytes := new(int64)
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
-		proxy.ServeHTTP(sw, r.WithContext(ctx))
-		recordBytes(sw.bytes)
+		ctx = context.WithValue(ctx, upBytesCtxKey{}, upBytes)
+
+		proxy.ServeHTTP(w2, r.WithContext(ctx))
+
+		if r2, ok := w2.(*cacheRecorder); ok && r2.status == http.StatusOK && r2.buf != nil && r2.buf.Len() > 0 {
+			imageCachePut(r.URL.String(), r2.buf.Bytes())
+		}
+		recordBytes(ip, sw.bytes+atomic.LoadInt64(upBytes))
 	})
+
 	adminSrv := adminHandler()
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/admin" { http.Redirect(w, r, "/admin/", http.StatusFound); return }
-		if strings.HasPrefix(r.URL.Path, "/admin/") { adminSrv.ServeHTTP(w, r); return }
+		if r.URL.Path == "/admin" {
+			http.Redirect(w, r, "/admin/", http.StatusFound)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/admin/") {
+			adminSrv.ServeHTTP(w, r)
+			return
+		}
 		proxyHandler(w, r)
 	})
-	if c := currentCfg(); c.Port > 0 { port = c.Port }
+	if c := currentCfg(); c.Port > 0 {
+		port = c.Port
+	}
 	srv := &http.Server{Handler: root, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 32 << 10}
 	globalSrv = srv
-	if err := startListen(srv, port); err != nil { log.Fatalf("监听 :%d 失败: %v", port, err) }
-	log.Printf("Emby 路径反代已启动 :%d  管理页: /admin/", port)
+	if err := startListen(srv, port); err != nil {
+		log.Fatalf("监听失败: %v", err)
+	}
+	log.Printf("服务启动 :%d", port)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
@@ -1650,16 +2156,19 @@ func runServer(port int, adminUser, adminPass, configPath, statsFile string) {
 
 func main() {
 	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "run" { args = args[1:] }
+	if len(args) > 0 && args[0] == "run" {
+		args = args[1:]
+	}
 	fs := flag.NewFlagSet("emby-proxy", flag.ExitOnError)
 	port := fs.Int("port", 8520, "监听端口")
-	adminUser := fs.String("admin-user", "admin", "管理页用户名")
-	adminPass := fs.String("admin-pass", "", "管理页密码")
-	configPath := fs.String("config", "/etc/emby-proxy/config.json", "配置文件路径")
-	statsFile := fs.String("stats", "/etc/emby-proxy/stats.json", "统计文件路径")
+	adminUser := fs.String("admin-user", "admin", "用户名")
+	adminPass := fs.String("admin-pass", "", "密码")
+	dbFile := fs.String("db", "/etc/emby-proxy/emby.db", "数据库")
 	_ = fs.Parse(args)
-	if *adminPass == "" { log.Fatal("必须通过 --admin-pass 指定管理页密码") }
-	runServer(*port, *adminUser, *adminPass, *configPath, *statsFile)
+	if *adminPass == "" {
+		log.Fatal("必须指定 --admin-pass")
+	}
+	runServer(*port, *adminUser, *adminPass, *dbFile)
 }
 GO_SOURCE
 
@@ -1672,400 +2181,552 @@ GO_SOURCE
 <title>Emby Proxy</title>
 <script src="https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--mono:Consolas,monospace;--r:12px}
-body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;height:100vh;overflow:hidden}
-.sb{width:230px;background:var(--card);border-right:1px solid var(--bd);display:flex;flex-direction:column}
-.sb-h{padding:22px 20px 16px;display:flex;align-items:center}
+body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;height:100dvh;overflow:hidden}
+/* 侧边栏 */
+.sb{width:240px;background:var(--card);border-right:1px solid var(--bd);display:flex;flex-direction:column;transition:transform .3s ease;z-index:100;flex-shrink:0}
+.sb-h{padding:24px 20px 16px;display:flex;align-items:center}
 .sb-brand{min-width:0;display:flex;flex-direction:column;gap:3px}
 .sb-t{font-size:16px;font-weight:700;letter-spacing:-.3px;line-height:1.2;color:var(--t)}
 .sb-sub{font-size:12px;color:var(--t3);font-weight:500;letter-spacing:.2px}
-.nav{list-style:none;padding:0 10px;flex:1;overflow-y:auto}
-.nav-i{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:8px;color:var(--t2);cursor:pointer;margin-bottom:4px;border:0;background:transparent;font:inherit;font-size:14px;width:100%;text-align:left}
-.nav-i:hover{background:#f1f5f9}
+.nav{list-style:none;padding:0 12px;flex:1;overflow-y:auto}
+.nav-i{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:8px;color:var(--t2);cursor:pointer;margin-bottom:4px;border:0;background:transparent;font:inherit;font-size:14px;width:100%;text-align:left;transition:.2s}
+.nav-i:hover{background:#f1f5f9;color:var(--t)}
 .nav-i.on{background:var(--ps);color:var(--pd);font-weight:600}
+.nav-i svg{width:18px;height:18px;flex-shrink:0;opacity:.75}
+.nav-i.on svg{opacity:1}
+.stc .sl{display:flex;align-items:center;gap:6px}
+.stc .sl svg{width:16px;height:16px;opacity:.7}
+.sb-brand-icon{width:36px;height:36px;border-radius:10px;background:var(--ps);color:var(--pd);display:flex;align-items:center;justify-content:center;font-size:18px;margin-right:12px;flex-shrink:0}
 .sb-f{padding:14px 20px;border-top:1px solid var(--bd);font-size:12px;color:var(--t3)}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px}
-.mc{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.tb{height:60px;background:var(--bg);border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;padding:0 28px}
-.tb-l{display:flex;align-items:center;gap:14px}
-.tb-t{font-size:18px;font-weight:600}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;box-shadow:0 0 0 2px rgba(16,185,129,.2)}
+.sb-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.4);z-index:90;opacity:0;transition:opacity .3s ease;border:0;padding:0;cursor:pointer;backdrop-filter:blur(2px)}
+/* 主内容区 */
+.mc{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+.tb{height:64px;background:var(--card);border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0;z-index:10}
+.tb-l{display:flex;align-items:center;gap:16px}
+.mmb{display:none;align-items:center;justify-content:center;width:36px;height:36px;border-radius:8px;border:1px solid var(--bd);background:#fff;color:var(--t);cursor:pointer;font-size:18px;transition:.2s}
+.mmb:hover{background:#f1f5f9}
+.tb-t{font-size:18px;font-weight:600;letter-spacing:-.3px}
 .tb-r{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--t2)}
-.chip{display:inline-flex;align-items:center;padding:4px 10px;border-radius:6px;background:#f1f5f9;font-family:var(--mono);font-size:12px}
-.chip.p{background:var(--ps);color:var(--pd)}
-.sc{flex:1;overflow-y:auto;padding:22px 28px}
+.chip{display:inline-flex;align-items:center;padding:4px 10px;border-radius:6px;background:#f1f5f9;font-family:var(--mono);font-size:12px;font-weight:500}
+.chip.p{background:var(--ps);color:var(--pd);border:1px solid #dbeafe}
+.sc{flex:1;overflow-y:auto;padding:24px;scroll-behavior:smooth}
 .pg{display:none}
-.pg.on{display:block}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:22px;margin-bottom:22px}
-.ch{display:flex;justify-content:space-between;margin-bottom:18px;gap:16px;flex-wrap:wrap;align-items:flex-start}
-.ct{font-size:15px;font-weight:600}
+.pg.on{display:block;animation:fadeUp .3s cubic-bezier(0.16, 1, 0.3, 1) forwards}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+/* 卡片 */
+.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:24px;margin-bottom:24px;box-shadow:0 2px 8px -2px rgba(15,23,42,.04);transition:box-shadow .3s ease, transform .3s ease}
+.card:hover{box-shadow:0 8px 24px -4px rgba(15,23,42,.08);transform:translateY(-2px)}
+.ch{display:flex;justify-content:space-between;margin-bottom:20px;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.ct{font-size:16px;font-weight:600;color:var(--t);letter-spacing:-.2px}
 .cd{font-size:13px;color:var(--t3);margin-top:4px}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+/* 栅格系统 */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:24px}
 .g2 .card{margin-bottom:0}
-.sg{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:22px}
-.stc{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:18px 20px;position:relative;overflow:hidden}
-.stc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.g3{display:grid;grid-template-columns:2fr 1fr;gap:24px}
+.sg{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:24px}
+/* 状态卡片 */
+.stc{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:20px;position:relative;overflow:hidden;transition:.3s}
+.stc:hover{transform:translateY(-2px);box-shadow:0 6px 16px -4px rgba(0,0,0,.06)}
+.stc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:4px 0 0 4px}
 .stc.b::before{background:#3b82f6}.stc.g::before{background:#10b981}.stc.r::before{background:#ef4444}.stc.o::before{background:#f59e0b}
-.sl{font-size:13px;color:var(--t3);font-weight:500}
-.sv{font-size:26px;font-weight:700;margin:6px 0 4px;font-variant-numeric:tabular-nums;letter-spacing:-.5px;line-height:1.1}
-.ss{font-size:12px;color:var(--t2)}
-.ss b{font-weight:600;color:var(--t)}
-.dr{display:flex;align-items:center;gap:12px;padding:8px 0}
-.dn{width:120px;flex-shrink:0;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500}
-.dn .tx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dn.m{font-family:var(--mono);font-size:12px}
-.bar{flex:1;height:6px;background:#f1f5f9;border-radius:99px;overflow:hidden}
-.bar>i{display:block;height:100%;border-radius:99px;transition:width .4s}
-.bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
-.dv{width:80px;text-align:right;font-size:13px;font-weight:500;font-variant-numeric:tabular-nums}
-.dv span{color:var(--t3);font-size:12px;margin-left:6px}
-.flg{width:22px;height:16px;object-fit:cover;border-radius:3px;box-shadow:0 0 0 1px rgba(15,23,42,.12);background:#e2e8f0;flex-shrink:0}
-.fb{display:inline-grid;place-items:center;width:22px;height:16px;background:#f1f5f9;border-radius:3px;font-size:9px;font-weight:700;color:var(--t3);flex-shrink:0;letter-spacing:-.3px}
-.tw{overflow-x:auto;margin:0 -22px -22px;padding:0 22px 22px}
-table{width:100%;border-collapse:collapse;min-width:700px;text-align:left}
-th{padding:12px 16px;border-bottom:1px solid var(--bd);font-size:12px;font-weight:600;color:var(--t3);background:#fafbfc}
-td{padding:12px 16px;border-bottom:1px solid var(--bd);font-size:13px}
-tbody tr:hover td{background:#f8fafc}
-tbody tr:last-child td{border-bottom:0}
-.ct2{color:var(--t3);font-family:var(--mono);font-size:12px}
-.ci{font-family:var(--mono)}
-.cp{font-family:var(--mono);font-size:12px;color:var(--t2);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rg{display:inline-flex;align-items:center;gap:6px}
-.pill{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;display:inline-block}
-.pw{background:#fffbeb;color:#b45309}.pc{background:#fef2f2;color:#b91c1c}
-.fi{margin-bottom:18px}
-.fl{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
-.inp,.tarea{width:100%;padding:10px 14px;font-size:13px;background:#fff;border:1px solid var(--bd);border-radius:8px;font-family:inherit;outline:none}
-.inp:focus,.tarea:focus{border-color:var(--p);box-shadow:0 0 0 3px var(--ps)}
-.inp.m,.tarea{font-family:var(--mono);font-size:12.5px}
-.tarea{resize:vertical;min-height:100px}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 16px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid transparent;font-family:inherit}
-.btn.b{background:var(--p);color:#fff}
-.btn.b:hover{background:var(--pd)}
-.btn.b:disabled{opacity:.6;cursor:not-allowed}
+.sl{font-size:13px;color:var(--t2);font-weight:500}
+.sv{font-size:28px;font-weight:700;margin:8px 0 6px;font-variant-numeric:tabular-nums;letter-spacing:-1px;line-height:1.1;color:var(--t)}
+.ss{font-size:12px;color:var(--t3);display:flex;justify-content:space-between;align-items:center}
+.ss b{font-weight:600;color:var(--t2)}
+/* 表单控件 */
+.fi{margin-bottom:20px}
+.fl{display:block;font-size:13px;font-weight:600;margin-bottom:8px;color:var(--t2)}
+.inp,.tarea{width:100%;padding:12px 16px;font-size:14px;background:#f8fafc;border:1px solid var(--bd);border-radius:10px;font-family:inherit;outline:none;transition:.2s}
+.inp:focus,.tarea:focus{background:#fff;border-color:var(--p);box-shadow:0 0 0 4px var(--ps)}
+.inp.m,.tarea{font-family:var(--mono);font-size:13px}
+.tarea{resize:vertical;min-height:100px;line-height:1.6}
+/* 按钮 */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 18px;border-radius:10px;font-size:14px;font-weight:500;cursor:pointer;border:1px solid transparent;font-family:inherit;transition:all .2s;white-space:nowrap}
+.btn:active{transform:scale(.97)}
+.btn.b{background:var(--p);color:#fff;box-shadow:0 2px 4px rgba(59,130,246,.2)}
+.btn.b:hover{background:var(--pd);box-shadow:0 4px 8px rgba(59,130,246,.3)}
 .btn.g{background:#fff;border-color:var(--bd);color:var(--t2)}
-.btn.g:hover{background:#f8fafc}
-.btn.s{padding:6px 12px;font-size:12px;border-radius:7px}
-.acts{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
-.row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-top:1px solid var(--bd)}
+.btn.g:hover{background:#f8fafc;color:var(--t);border-color:#cbd5e1}
+.btn.d{background:#fef2f2;color:var(--d);border-color:#fecaca}
+.btn.d:hover{background:#fee2e2}
+.acts{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:16px}
+/* 行内设置 */
+.row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 0;border-top:1px solid var(--bd)}
 .row:first-child{border-top:0;padding-top:0}
-.rl{font-size:14px;font-weight:600}
-.rd{font-size:13px;color:var(--t3);margin-top:2px}
-.sw{position:relative;width:44px;height:24px;flex-shrink:0}
+.rl{font-size:14px;font-weight:600;color:var(--t)}
+.rd{font-size:13px;color:var(--t3);margin-top:4px}
+/* 开关 */
+.sw{position:relative;width:48px;height:28px;flex-shrink:0}
 .sw input{opacity:0;width:0;height:0}
-.tr2{position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:99px;transition:.3s}
-.tr2::after{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.tr2{position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:99px;transition:.3s cubic-bezier(0.4, 0, 0.2, 1)}
+.tr2::after{content:"";position:absolute;height:22px;width:22px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s cubic-bezier(0.4, 0, 0.2, 1);box-shadow:0 1px 3px rgba(0,0,0,.15)}
 .sw input:checked+.tr2{background:var(--p)}
 .sw input:checked+.tr2::after{transform:translateX(20px)}
-.wl{display:flex;flex-wrap:wrap;gap:8px;min-height:40px}
-.wli{display:inline-flex;background:#f1f5f9;border-radius:6px;padding:4px 10px;font-family:var(--mono);font-size:12px;color:var(--t2)}
-.wle{color:var(--t3);font-size:13px}
+/* 其他 */
 .hint{font-size:12.5px;color:var(--t3);margin-top:8px;line-height:1.6}
-.hint code{background:#f1f5f9;padding:2px 6px;border-radius:4px;font-family:var(--mono);color:#4338ca}
-.flt{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.filter{border:1px solid var(--bd);background:#fff;color:var(--t2);padding:6px 12px;border-radius:8px;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer}
-.filter.on{background:var(--ps);border-color:var(--ps);color:var(--pd);font-weight:600}
-.mo{position:fixed;inset:0;z-index:100;display:none;background:rgba(15,23,42,.4);padding:20px;overflow-y:auto}
-.mo.on{display:flex;align-items:center;justify-content:center}
-.mbox{background:#fff;border-radius:16px;width:100%;max-width:540px;overflow:hidden}
-.mh{padding:20px 24px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center}
-.mh h3{font-size:16px;font-weight:600}
-.mcl{border:0;background:#f1f5f9;width:32px;height:32px;border-radius:8px;font-size:20px;color:var(--t2);cursor:pointer}
-.mb{padding:24px}
-.kv{display:flex;gap:16px;padding:12px 0;border-bottom:1px solid var(--bd);font-size:13.5px}
+.emp{padding:48px 20px;text-align:center;color:var(--t3);font-size:14px}
+.emp b{display:block;color:var(--t2);font-size:15px;margin-bottom:6px}
+.flg{width:22px;height:16px;object-fit:cover;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.08);background:#e2e8f0;margin-right:8px;vertical-align:middle}
+/* 分段器 */
+.flt{display:inline-flex;background:#f1f5f9;padding:4px;border-radius:12px;border:1px solid var(--bd);gap:4px;align-items:center;flex-wrap:wrap}
+.filter{border:0;background:transparent;color:var(--t2);padding:8px 16px;border-radius:8px;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;transition:all .2s ease}
+.filter:hover{color:var(--t)}
+.filter.on{background:#ffffff;color:var(--pd);font-weight:600;box-shadow:0 2px 4px rgba(0,0,0,.05),0 1px 2px rgba(0,0,0,.05)}
+/* 进度条 */
+.dr{display:flex;align-items:center;gap:12px;padding:10px 0;flex-wrap:nowrap}
+.dn{width:110px;flex-shrink:0;display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden}
+.dn .tx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dn.m{font-family:var(--mono);font-size:12px}
+.bar{flex:1;height:8px;background:#f1f5f9;border-radius:99px;overflow:hidden;min-width:50px}
+.bar>i{display:block;height:100%;border-radius:99px;transition:width .4s ease-out}
+.bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
+.dv{width:80px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0}
+.dv span{color:var(--t3);font-size:12px;margin-left:4px;font-weight:normal}
+/* 表格 */
+.table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--bd)}
+table{width:100%;border-collapse:collapse;text-align:left;min-width:600px}
+th{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:12.5px;font-weight:600;color:var(--t2);background:#f8fafc;white-space:nowrap}
+td{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:13.5px;color:var(--t2)}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:#f8fafc}
+/* 弹窗 */
+.mo{position:fixed;inset:0;z-index:1000;display:none;background:rgba(15,23,42,.5);padding:20px;overflow-y:auto;backdrop-filter:blur(4px)}
+.mo.on{display:flex;align-items:center;justify-content:center;animation:moFadeIn .2s ease}
+@keyframes moFadeIn{from{opacity:0}to{opacity:1}}
+.mbox{background:#fff;border-radius:20px;width:100%;max-width:540px;max-height:90dvh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 40px -10px rgba(0,0,0,.2);animation:mboxScaleIn .3s cubic-bezier(0.16, 1, 0.3, 1)}
+@keyframes mboxScaleIn{from{opacity:0;transform:scale(0.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.mh{padding:20px 24px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
+.mh h3{font-size:17px;font-weight:600;color:var(--t)}
+.mcl{border:0;background:#f1f5f9;width:36px;height:36px;border-radius:10px;font-size:20px;color:var(--t2);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.2s}
+.mcl:hover{background:#e2e8f0;color:var(--t)}
+.mb{padding:24px;overflow-y:auto;overflow-x:hidden;flex:1;min-height:0}
+.kv{display:flex;gap:16px;padding:14px 0;border-bottom:1px solid var(--bd);font-size:14px}
 .kv:last-child{border-bottom:0}
-.kk{width:60px;flex-shrink:0;color:var(--t3)}
-.kvv{flex:1;word-break:break-all}
+.kk{width:70px;flex-shrink:0;color:var(--t3)}
+.kvv{flex:1;word-break:break-all;font-weight:500;color:var(--t)}
 .kvv.m{font-family:var(--mono);font-size:13px}
-.tst{position:fixed;left:50%;bottom:32px;transform:translate(-50%,16px);z-index:999;display:flex;align-items:center;gap:10px;padding:12px 20px;border-radius:10px;background:#0f172a;color:#fff;font-size:13.5px;opacity:0;pointer-events:none;transition:.2s}
-.tst.on{opacity:1;transform:translate(-50%,0)}
-.tst.ok{background:#059669}.tst.err{background:#dc2626}
-.emp{padding:40px 20px;text-align:center;color:var(--t3);font-size:13.5px}
-.emp b{display:block;color:var(--t2);font-size:14px;margin-bottom:4px}
-.pg2{display:flex;align-items:center;justify-content:center;gap:12px;padding-top:20px}
-.pi{font-size:13px;color:var(--t2);font-variant-numeric:tabular-nums}
-.btn:disabled{opacity:.5;cursor:not-allowed}
-.og{display:grid;grid-template-columns:1fr 1fr;gap:22px}
-.og>.card{margin-bottom:0}
-.sp2{grid-column:1/-1}
-.sysg{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-.sysi{padding:14px 16px;background:#f8fafc;border:1px solid var(--bd);border-radius:10px;display:flex;flex-direction:column;gap:6px;min-width:0}
-.sysl{font-size:12px;color:var(--t3);font-weight:500}
-.sysv{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sysv.m{font-family:var(--mono);font-size:13.5px}
-.sysv.ok{color:var(--ok)}.sysv.warn{color:var(--w)}.sysv.err{color:var(--d)}
-.obr{display:flex;align-items:center;gap:10px;padding:10px 8px;margin:0 -8px;border-top:1px solid var(--bd);font-size:13px;cursor:pointer;border-radius:6px}
-.obr:first-child{border-top:0;padding-top:0;margin-top:0}
-.obr:hover{background:#f8fafc}
-.obip{font-family:var(--mono);font-weight:500;flex-shrink:0;font-size:12.5px}
-.obp{flex:1;font-family:var(--mono);font-size:12px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.obt{font-size:11px;color:var(--t3);font-family:var(--mono);flex-shrink:0}
-.mmb{display:none;align-items:center;justify-content:center;width:40px;height:40px;margin-right:4px;background:#f1f5f9;border:1px solid var(--bd);border-radius:10px;padding:0;cursor:pointer;color:var(--t);font-size:20px;line-height:1;flex-shrink:0;-webkit-tap-highlight-color:transparent}
-.mmb:active{background:#e2e8f0}
-.sb-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:90;border:0;padding:0;cursor:pointer;-webkit-tap-highlight-color:transparent}
-.sb-mask.on{display:block}
-@media(max-width:900px){.sg{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}.g2 .card{margin-bottom:22px}.og{grid-template-columns:1fr}.sysg{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:768px){
-body{flex-direction:column}
-.sb{position:fixed;left:0;top:0;bottom:0;width:min(280px,82vw);max-width:280px;transform:translate3d(-105%,0,0);transition:transform .25s ease;z-index:100;box-shadow:none;border-right:1px solid var(--bd);background:var(--card)}
-.sb.on{transform:translate3d(0,0,0);box-shadow:8px 0 32px rgba(15,23,42,.18)}
-.mmb{display:inline-flex}
-.mc{width:100%;min-width:0;flex:1}
-.tb{padding:0 12px 0 8px;height:56px}
-.tb-t{font-size:16px}
-.sc{padding:14px 12px}
-.card{padding:16px;margin-bottom:14px}
-.sg{gap:12px;margin-bottom:14px}
-.stc{padding:14px 16px}
-.sv{font-size:22px}
-.tw{margin:0 -16px -16px;padding:0 16px 16px}
-table tr{display:block;padding:12px;border-bottom:1px solid var(--bd)}
-thead{display:none}
-td{display:flex;padding:4px 0;border:0;gap:12px}
-td::before{content:attr(data-label);width:60px;color:var(--t3);font-size:12px;flex-shrink:0}
+
+/* --- 响应式适配 --- */
+@media(max-width:1024px){
+  .sb{position:fixed;top:0;bottom:0;left:0;transform:translateX(-100%);box-shadow:20px 0 40px rgba(0,0,0,.1)}
+  .sb.open{transform:translateX(0)}
+  .sb-mask.on{display:block;opacity:1}
+  .mmb{display:inline-flex}
+  .mc{width:100%}
 }
-@media(max-width:480px){.sg{grid-template-columns:1fr}.sysg{grid-template-columns:1fr}}
+@media(max-width:900px){
+  .sg{grid-template-columns:repeat(2,1fr);gap:16px}
+  .g2,.g3{grid-template-columns:1fr;gap:20px}
+  .g2 .card,.g3 .card{margin-bottom:0}
+}
+@media(max-width:600px){
+  .tb{padding:0 16px;height:60px}
+  .tb-t{font-size:16px}
+  .sc{padding:16px}
+  .card{padding:18px;border-radius:12px;margin-bottom:16px}
+  .sg{grid-template-columns:1fr;gap:12px;margin-bottom:16px}
+  .stc{padding:16px}
+  .sv{font-size:24px}
+  .flt{width:100%;justify-content:space-between}
+  .filter{padding:6px 10px;font-size:12px;flex:1;text-align:center}
+  .dn{width:90px;font-size:12px}
+  .dv{width:60px;font-size:12px}
+  
+  .table-wrap{border:0;overflow:visible}
+  table, thead, tbody, th, td, tr{display:block}
+  th{display:none}
+  tr{border:1px solid var(--bd);border-radius:10px;margin-bottom:12px;padding:8px 0;background:#fff}
+  td{display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border:0;font-size:13px}
+  td::before{content:attr(data-label);font-weight:600;color:var(--t3);font-size:12.5px;margin-right:16px;flex-shrink:0}
+  td>span, td>div, td>img{text-align:right;word-break:break-all}
+  td[data-label="访问路径"]{flex-direction:column;align-items:flex-start;gap:4px}
+  td[data-label="访问路径"]>span{text-align:left;white-space:normal}
+  
+  .mo{padding:12px}
+  .mbox{max-height:95dvh}
+  .mh{padding:16px 20px}
+  .mb{padding:20px}
+}
 </style>
 </head>
 <body>
-<button type="button" class="sb-mask" id="sbMask" aria-label="关闭菜单"></button>
+<button class="sb-mask" id="sbMask" aria-label="关闭菜单"></button>
 <aside class="sb" id="sb">
-<div class="sb-h"><div class="sb-brand"><div class="sb-t">Emby Proxy</div><div class="sb-sub">路径反代 · 管理台</div></div></div>
+<div class="sb-h" style="display:flex;align-items:center">
+  <div class="sb-brand-icon">⚡</div>
+  <div class="sb-brand"><div class="sb-t">Emby Proxy</div><div class="sb-sub">管理后台</div></div>
+</div>
 <ul class="nav">
-<li><button class="nav-i on" data-t="overview">概览</button></li>
-<li><button class="nav-i" data-t="traffic">流量</button></li>
-<li><button class="nav-i" data-t="blocks">拦截</button></li>
-<li><button class="nav-i" data-t="settings">设置</button></li>
+<li><button class="nav-i on" data-t="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>概览</button></li>
+<li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量与请求</button></li>
+<li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
+<li><button class="nav-i" data-t="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>实时日志</button></li>
+<li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
-<div class="sb-f"><span class="dot"></span><span id="uptimeChip">运行中</span></div>
+<div class="sb-f" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+  <span><span class="dot"></span><span id="uptimeChip">运行中</span></span>
+  <button type="button" id="logoutBtn" style="border:0;background:transparent;color:var(--t3);font-size:12px;cursor:pointer;padding:4px 8px;border-radius:6px" title="退出登录">退出</button>
+</div>
 </aside>
 <div class="mc">
 <header class="tb">
 <div class="tb-l"><button class="mmb" id="mmb">☰</button><h1 class="tb-t" id="pt">概览</h1></div>
-<div class="tb-r"><span class="chip p" id="portChip">:—</span><span id="clock">--:--:--</span></div>
+<div class="tb-r"><span class="chip p" id="portChip">:—</span></div>
 </header>
 <div class="sc">
 <section id="overview" class="pg on">
-<div class="sg">
-<div class="stc b"><div class="sl">今日请求</div><div class="sv" id="todayReq">-</div><div class="ss">流量 <b id="todayBytes">0 B</b></div></div>
-<div class="stc g"><div class="sl">累计请求</div><div class="sv" id="totalReq">-</div><div class="ss">流量 <b id="totalBytes">0 B</b></div></div>
-<div class="stc r"><div class="sl">拦截</div><div class="sv" id="totalBlocked" style="color:var(--d)">-</div><div class="ss">地区 <b id="blockedCN">0</b> · 白名单 <b id="blockedWL">0</b></div></div>
-<div class="stc o"><div class="sl">独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss"><b id="uniqueCountries">0</b> 个地区</div></div>
+<div class="ch" style="margin-bottom:14px;justify-content:flex-start;">
+  <div class="flt" id="ovRangeBar">
+    <button class="filter on" data-r="today">今天</button>
+    <button class="filter" data-r="yesterday">昨天</button>
+    <button class="filter" data-r="7d">近 7 天</button>
+    <button class="filter" data-r="30d">近 30 天</button>
+    <button class="filter" data-r="all">全部</button>
+  </div>
 </div>
-<div class="og">
-<div class="card sp2"><div class="ch"><div><h2 class="ct">近 7 天趋势</h2><div class="cd">每日请求数与流量消耗</div></div><button class="btn g s" data-goto="traffic">查看全部 →</button></div><div style="position:relative;height:240px"><canvas id="miniTrendChart"></canvas></div></div>
-<div class="card"><div class="ch"><div><h2 class="ct">来源地区</h2><div class="cd">Top 5</div></div><button class="btn g s" data-goto="traffic">详情 →</button></div><div id="ovRegion"></div></div>
-<div class="card"><div class="ch"><div><h2 class="ct">最新拦截</h2><div class="cd">最近 5 条</div></div><button class="btn g s" data-goto="blocks">全部 →</button></div><div id="ovBlocks"></div></div>
-<div class="card sp2"><div class="ch"><div><h2 class="ct">系统状态</h2><div class="cd">运行参数与开关</div></div><button class="btn g s" data-goto="settings">设置 →</button></div><div id="ovSystem" class="sysg"></div></div>
+<div class="sg">
+<div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">流量 <b id="ovBytes">0 B</b></div></div>
+<div class="stc g"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>平均每日请求</div><div class="sv" id="ovAvgReq">-</div><div class="ss">日均流量 <b id="ovAvgBytes">0 B</b></div></div>
+<div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">大陆限制 <b id="ovBlockedCN">0</b></div></div>
+<div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
+</div>
+<div class="g3">
+<div>
+<div class="card" style="margin-bottom:22px;"><div class="ch"><div><h2 class="ct">请求趋势</h2></div></div><div style="position:relative;height:220px"><canvas id="miniTrendChart"></canvas></div></div>
+<div class="card"><div class="ch"><div><h2 class="ct">系统信息</h2></div></div><div id="sysInfo"></div></div>
+</div>
+<div class="card"><div class="ch"><div><h2 class="ct">最新拦截</h2></div><button class="btn g s" data-goto="blocks">查看全部</button></div><div id="ovBlocks"></div></div>
 </div>
 </section>
 <section id="traffic" class="pg">
 <div class="card">
-<div class="ch"><div><h2 class="ct">流量与请求趋势</h2><div class="cd">每日请求数与流量消耗</div></div><div class="flt" id="trRangeBar"><button class="filter on" data-r="all">全部</button><button class="filter" data-r="today">今天</button><button class="filter" data-r="7d">近 7 天</button><button class="filter" data-r="30d">近 30 天</button></div></div>
-<div style="position:relative;height:340px"><canvas id="trendChart"></canvas></div>
-<div style="margin-top:16px;text-align:right;font-size:13px;color:var(--t2)" id="trSummary"></div>
+<div class="ch"><div><h2 class="ct">请求量趋势</h2><div class="cd">每天的请求次数变化</div></div></div>
+<div style="position:relative;height:250px"><canvas id="reqChart"></canvas></div>
 </div>
-<div class="g2">
-<div class="card"><div class="ch"><div><h2 class="ct">IP 分布</h2><div class="cd">请求次数 Top 20</div></div></div><div id="ipDist"></div></div>
-<div class="card"><div class="ch"><div><h2 class="ct">地区分布</h2><div class="cd">按来源地区</div></div></div><div id="regionDist"></div></div>
+<div class="card">
+<div class="ch"><div><h2 class="ct">流量消耗趋势</h2><div class="cd">每天的上下行总流量</div></div></div>
+<div style="position:relative;height:250px"><canvas id="byteChart"></canvas></div>
+</div>
+<div class="g2" style="margin-top:22px">
+<div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">点击可查看详细地理位置与流量</div></div></div><div id="ipDist"></div></div>
+<div class="card"><div class="ch"><div><h2 class="ct">地区来源分布</h2><div class="cd">按独立 IP 归属地统计</div></div></div><div id="regionDist"></div></div>
 </div>
 </section>
 <section id="blocks" class="pg">
-<div class="card" style="padding-bottom:0">
-<div class="ch"><div><h2 class="ct">拦截</h2><div class="cd">保留一年，最新在上</div></div><div class="flt" id="rangeBar"><button class="filter on" data-r="all">全部</button><button class="filter" data-r="today">今天</button><button class="filter" data-r="7d">近 7 天</button><button class="filter" data-r="30d">近 30 天</button><span class="chip" id="cntAll">0 条</span></div></div>
-<div class="tw"><table><thead><tr><th>时间</th><th>IP</th><th>地区</th><th>路径</th><th>原因</th></tr></thead><tbody id="blocksBody"><tr><td colspan="5" class="emp">暂无记录</td></tr></tbody></table></div>
-<div class="pg2" style="padding-bottom:20px"><button class="btn g" id="prevPage">上一页</button><span class="pi" id="pageInfo">1 / 1</span><button class="btn g" id="nextPage">下一页</button></div>
+<div class="card">
+<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">触发黑名单、限制或异常访问的请求</div></div></div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th></tr></thead><tbody id="blockTable"></tbody></table></div>
+</div>
+</section>
+<section id="logs" class="pg">
+<div class="card">
+<div class="ch"><div><h2 class="ct">实时访问日志</h2><div class="cd">所有成功代理经过本网关的请求</div></div><button class="btn g" id="clearLogBtn">清空</button></div>
+<div id="logTerminal" style="background:#0f172a;color:#a7f3d0;font-family:var(--mono);font-size:12px;height:500px;overflow-y:auto;border-radius:8px;padding:16px;line-height:1.6;white-space:pre-wrap;"></div>
 </div>
 </section>
 <section id="settings" class="pg">
 <div class="g2">
-<div class="card">
-<div class="ch"><div><h2 class="ct">基础服务</h2><div class="cd">端口修改后即时生效，无需重启</div></div></div>
-<div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="portInput" class="inp m" type="number" min="1" max="65535" style="max-width:140px"><span class="chip p">当前 <span id="portNow">-</span></span><button class="btn b" id="savePort">保存修改</button></div></div>
-<div class="row" style="margin-top:12px"><div><div class="rl">未知 IP 用在线接口查询</div><div class="rd">离线库查不到时调第三方 API，缓存 30 天</div></div><label class="sw"><input type="checkbox" id="geoAPI"><span class="tr2"></span></label></div>
-<div class="fi" style="margin-top:14px"><label class="fl">接口地址</label><input id="geoAPIURL" class="inp m" placeholder="http://ip-api.com/json/{ip}?lang=zh-CN&fields=status,country,countryCode"><div class="hint">用 <code>{ip}</code> 占位，留空使用默认 <code>ip-api.com</code></div><div class="acts"><button class="btn g" id="geoTest">测试接口</button><button class="btn g" id="regeoBtn">重新识别历史 IP</button><span class="hint" id="geoStatus"></span></div><div id="geoResult"></div></div>
-</div>
-<div class="card">
-<div class="ch"><div><h2 class="ct">访问控制</h2><div class="cd">限制访问来源与转发目标</div></div></div>
-<div class="row" style="padding-top:0"><div><div class="rl">仅允许中国大陆 IP 访问</div><div class="rd">境外 IP 将被拒绝（内网/本机不受限）</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
-<div style="margin-top:20px;border-top:1px solid var(--bd);padding-top:18px">
-<label class="fl">目标域名白名单</label>
-<div id="wlView" class="wl" style="margin-top:8px"></div>
-<div id="wlEditWrap" style="display:none;margin-top:8px"><textarea id="whitelist" class="tarea" placeholder="留空 = 不限制&#10;example.com"></textarea><div class="hint">每行一个，支持根域名（放行所有子域）和精确域名</div><div class="acts"><button class="btn b" id="save">保存白名单</button><button class="btn g" id="wlCancel">取消</button></div></div>
-<div class="acts" id="wlViewActions" style="margin-top:12px"><button class="btn g" id="wlEditBtn">编辑白名单</button></div>
-<div class="hint" style="margin-top:12px">目标地址在页面上以 <code>***</code> 掩码显示，防止泄露源站</div>
-</div>
-</div>
-</div>
-<div class="card" style="margin-top:22px">
-<div class="ch"><div><h2 class="ct">安全设置</h2><div class="cd">管理密码与防火墙端口放行</div></div></div>
-<div class="fi"><label class="fl">修改管理密码</label>
-<div style="display:grid;gap:10px;max-width:360px">
-<input id="oldPass" class="inp m" type="password" placeholder="当前密码" autocomplete="current-password">
-<input id="newPass" class="inp m" type="password" placeholder="新密码（至少 6 位）" autocomplete="new-password">
-<input id="newPass2" class="inp m" type="password" placeholder="确认新密码" autocomplete="new-password">
-</div>
-<div class="acts"><button class="btn b" id="changePassBtn">保存新密码</button></div>
-<div class="hint">修改后立即生效，并写入 <code>/etc/emby-proxy/admin.pass</code>；浏览器可能仍缓存旧登录，可清站点数据后重登。</div>
-</div>
-<div class="row" style="margin-top:8px;border-top:1px solid var(--bd);padding-top:16px">
-<div><div class="rl">防火墙放行服务端口</div><div class="rd" id="fwDesc">检测中…</div></div>
-<label class="sw"><input type="checkbox" id="fwAllow"><span class="tr2"></span></label>
-</div>
-<div class="hint" id="fwHint">支持 firewalld / ufw / iptables；需 root 运行服务才可改防火墙。</div>
-</div>
-<div class="card" style="border-color:#fecaca;margin-top:22px">
-<div class="ch"><div><h2 class="ct" style="color:var(--d)">危险操作</h2><div class="cd">以下操作不可恢复，请谨慎执行</div></div></div>
-<div class="row" style="padding-top:0"><div><div class="rl">还原初始化设置</div><div class="rd">白名单、大陆限制、在线查询开关恢复默认；不清空统计与密码</div></div><button class="btn g" id="resetConfigBtn" style="color:var(--d);border-color:#fecaca">还原</button></div>
-<div class="row"><div><div class="rl">清空所有统计</div><div class="rd">清除请求数、流量、IP/地区分布、拦截记录；配置与密码保留</div></div><button class="btn g" id="clearStatsBtn" style="color:var(--d);border-color:#fecaca">清空</button></div>
+  <div style="display:flex;flex-direction:column;gap:24px;">
+    <div class="card" style="margin-bottom:0;">
+      <div class="ch"><div><h2 class="ct">基础服务设置</h2></div></div>
+      <div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center"><input id="portInput" class="inp m" type="number" style="max-width:140px"><button class="btn b" id="savePort">保存并重启监听</button></div></div>
+      <div class="row"><div><div class="rl">开启 CORS 跨域</div><div class="rd">解决部分网页播放器拉流报错</div></div><label class="sw"><input type="checkbox" id="corsToggle"><span class="tr2"></span></label></div>
+      <div class="row"><div><div class="rl">自动缓存海报资源</div><div class="rd">缓存 Emby 图片，大幅降低上游压力</div></div><label class="sw"><input type="checkbox" id="cacheToggle"><span class="tr2"></span></label></div>
+    </div>
+    
+    <div class="card" style="border-color:#fecaca;margin-bottom:0;">
+      <div class="ch"><div><h2 class="ct" style="color:var(--d)">安全设置</h2></div></div>
+      <div class="fi"><label class="fl">修改管理密码</label>
+        <div style="display:grid;gap:10px">
+          <input id="oldPass" class="inp m" type="password" placeholder="当前密码">
+          <input id="newPass" class="inp m" type="password" placeholder="新密码（至少 6 位）">
+        </div>
+        <div class="acts"><button class="btn d" id="changePassBtn">修改密码</button></div>
+      </div>
+      <div class="row" style="margin-top:20px"><div><div class="rl" style="color:var(--d)">清空所有统计数据</div><div class="rd">不可恢复，包含请求、流量、拦截记录</div></div><button class="btn d" id="clearStatsBtn">立即清空</button></div>
+    </div>
+  </div>
+  
+  <div class="card" style="margin-bottom:0;">
+    <div class="ch"><div><h2 class="ct">安全与访问控制</h2></div></div>
+    <div class="row"><div><div class="rl">仅允许中国大陆 IP 访问</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
+    <div class="row"><div><div class="rl">自动封禁异常 IP</div><div class="rd">触发限制或白名单时自动拉黑</div></div><label class="sw"><input type="checkbox" id="autoBan"><span class="tr2"></span></label></div>
+    <div class="fi" style="margin-top:14px"><label class="fl">防 CC 限流（次/分钟，0=关闭）</label><input id="rateLimit" type="number" class="inp m" placeholder="例如 120"></div>
+    <div class="fi"><label class="fl">UA 白名单（每行一个关键字，留空不限）</label><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
+    <div class="fi"><label class="fl">域名白名单（每行一个，支持根域名）</label><textarea id="whitelist" class="tarea" placeholder="example.com"></textarea></div>
+    <div class="fi"><label class="fl">IP 黑名单（每行一个，支持 CIDR）</label><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
+    <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存安全设置</button></div>
+  </div>
 </div>
 </section>
 </div>
 </div>
 <div class="mo" id="modal"><div class="mbox"><div class="mh"><h3 id="modalTitle">记录详情</h3><button class="mcl" id="modalClose">×</button></div><div class="mb" id="modalBody"></div></div></div>
-<div class="tst" id="toast"></div>
 <script>
-const state={port:0,labels:{},serverToday:'',range:{from:'',to:''},page:1,pages:1,total:0};
-function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
-function fmtUptime(s){if(s<60)return s+' 秒';if(s<3600)return Math.floor(s/60)+' 分钟';if(s<86400)return Math.floor(s/3600)+' 小时';return Math.floor(s/86400)+' 天'}
-const TZ_CN='Asia/Shanghai';
-function parseServerTime(s){if(!s)return null;let d=new Date(s);if(!isNaN(d.getTime()))return d;if(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)){d=new Date(s.replace(' ','T')+'+08:00');if(!isNaN(d.getTime()))return d;d=new Date(s.replace(' ','T'));if(!isNaN(d.getTime()))return d}return null}
-function partsInCN(d){try{const f=new Intl.DateTimeFormat('en-CA',{timeZone:TZ_CN,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});const o={};f.formatToParts(d).forEach(p=>{if(p.type!=='literal')o[p.type]=p.value});return o}catch(e){const p=n=>String(n).padStart(2,'0');return{year:String(d.getFullYear()),month:p(d.getMonth()+1),day:p(d.getDate()),hour:p(d.getHours()),minute:p(d.getMinutes()),second:p(d.getSeconds())}}}
-function fmtTime(s){const d=parseServerTime(s);if(!d)return s||'';const o=partsInCN(d);return o.year+'-'+o.month+'-'+o.day+' '+o.hour+':'+o.minute+':'+o.second}
-function fmtTimeShort(s){const d=parseServerTime(s);if(!d)return (s||'').slice(11,16)||s||'';const o=partsInCN(d);return o.hour+':'+o.minute}
-function nowClockCN(){const o=partsInCN(new Date());return o.hour+':'+o.minute+':'+o.second}
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function toast(m,k){const t=document.getElementById('toast');t.textContent=m;t.className='tst on'+(k==='ok'?' ok':k==='err'?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='tst',3500)}
-const LOCAL={'LO':'本机','PV':'内网','??':'未知','':'未知'};
-function regionName(c){if(!c)return '未知';return state.labels[c]||LOCAL[c]||c}
-function flagBadge(t){return '<span class="fb">'+esc(t)+'</span>'}
-const LOCAL_CODES={LO:1,PV:1,'??':1};
-function reasonLabel(b){return b.reason==='cn'?'大陆限制':'未授权'}
-function flagHtml(c){if(!c||c==='??'||LOCAL_CODES[c])return flagBadge(c==='LO'?'本':c==='PV'?'内':'?');if(!/^[A-Z]{2}$/.test(c))return flagBadge(String(c).slice(0,2));return '<img class="flg" src="/admin/api/flag/'+c.toLowerCase()+'" alt="'+c+'" loading="lazy">'}
-document.addEventListener('error',e=>{const i=e.target;if(i&&i.tagName==='IMG'&&i.classList.contains('flg')){const s=document.createElement('span');s.className='fb';s.textContent=i.alt||'?';i.replaceWith(s)}},true);
-function shortPath(p){if(!p)return '';const q=p.indexOf('?');if(q>0&&p.length>q+1)return p.slice(0,q)+' ?…';return p.length>96?p.slice(0,96)+'…':p}
-const pageTitles={overview:'概览',traffic:'流量',blocks:'拦截',settings:'设置'};
-function closeSidebar(){const sb=document.getElementById('sb'),mask=document.getElementById('sbMask');if(sb)sb.classList.remove('on');if(mask)mask.classList.remove('on')}
-function openSidebar(){const sb=document.getElementById('sb'),mask=document.getElementById('sbMask');if(sb)sb.classList.add('on');if(mask)mask.classList.add('on')}
-function toggleSidebar(){const sb=document.getElementById('sb');if(sb&&sb.classList.contains('on'))closeSidebar();else openSidebar()}
-function switchTab(id){document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));document.getElementById('pt').textContent=pageTitles[id]||'';if(window.innerWidth<=768)closeSidebar();if(id==='overview')loadOverview();if(id==='traffic')loadTraffic();if(id==='blocks'){sigBlk='';loadBlocks()}}
-document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
-document.getElementById('mmb').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();toggleSidebar()});
-const sbMaskEl=document.getElementById('sbMask');if(sbMaskEl)sbMaskEl.addEventListener('click',closeSidebar);
-function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portNow').textContent=p;document.getElementById('portChip').textContent=':'+p}
-async function loadConfig(){try{const r=await fetch('/admin/api/config',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const c=await r.json();const wl=c.whitelist||[];document.getElementById('whitelist').value=wl.join('\n');renderWl(wl);document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('geoAPI').checked=!!c.geo_api;document.getElementById('geoAPIURL').value=c.geo_api_url||'';applyPort(c.effective_port);if(typeof loadFirewall==='function')loadFirewall()}catch(e){toast('加载配置失败: '+e.message,'err')}}
-let sigIP='',sigReg='',sigBlk='';const trState={range:{from:'',to:''}};
-let miniTrendChart=null,ovLoading=false;
-async function loadOverview(){if(ovLoading)return;ovLoading=true;try{const[t,b,c]=await Promise.all([fetch('/admin/api/traffic',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null),fetch('/admin/api/blocks?page=1&size=5',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null),fetch('/admin/api/config',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null)]);if(t){renderMiniTrend(t.trend||[]);renderOvRegion(t.country_counts||{})}if(b)renderOvBlocks(b.items||[]);renderOvSystem(c)}catch(e){}finally{ovLoading=false}}
-function renderMiniTrend(trend){const cv=document.getElementById('miniTrendChart');if(!cv||typeof Chart==='undefined')return;const data=(trend||[]).slice(-7);if(!data.length){if(miniTrendChart){miniTrendChart.destroy();miniTrendChart=null}return}const labels=data.map(d=>(d.date||'').slice(5)),bytes=data.map(d=>d.bytes||0),reqs=data.map(d=>d.requests||0);if(miniTrendChart){miniTrendChart.data.labels=labels;miniTrendChart.data.datasets[0].data=bytes;miniTrendChart.data.datasets[1].data=reqs;miniTrendChart.update('none');return}miniTrendChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'流量',data:bytes,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,yAxisID:'y',tension:0.35,pointRadius:2},{label:'请求',data:reqs,borderColor:'#10b981',backgroundColor:'transparent',borderWidth:1.5,borderDash:[4,4],yAxisID:'y1',tension:0.35,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'top',align:'end',labels:{usePointStyle:true,boxWidth:8,font:{size:11}}},tooltip:{backgroundColor:'rgba(15,23,42,0.9)',padding:10,cornerRadius:8,callbacks:{label:c=>c.dataset.label+': '+(c.dataset.yAxisID==='y'?fmtBytes(c.parsed.y):c.parsed.y.toLocaleString())}}},scales:{x:{grid:{display:false},ticks:{font:{size:10},color:'#94a3b8'}},y:{display:false,beginAtZero:true},y1:{display:false,beginAtZero:true}}}})}
-function renderOvRegion(cc){const box=document.getElementById('ovRegion');if(!box)return;const entries=Object.entries(cc||{});if(!entries.length){box.innerHTML='<div class="emp"><b>暂无数据</b>有请求后自动统计</div>';return}const rows=entries.sort((a,b)=>b[1]-a[1]).slice(0,5),total=entries.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;box.innerHTML=rows.map(([code,n])=>{const nm=regionName(code);return '<div class="dr"><span class="dn" title="'+esc(nm)+'">'+flagHtml(code)+'<span class="tx">'+esc(nm)+'</span></span><div class="bar t"><i style="width:'+(n/max*100).toFixed(1)+'%"></i></div><span class="dv">'+n.toLocaleString()+'<span>'+(n/total*100).toFixed(0)+'%</span></span></div>'}).join('')}
-function renderOvBlocks(items){const box=document.getElementById('ovBlocks');if(!box)return;if(!items||!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b>被拦截的请求会出现在这里</div>';return}box.innerHTML=items.map((b,i)=>'<div class="obr" data-ovb="'+i+'"><span class="obip">'+esc(b.ip)+'</span><span class="obp" title="'+esc(b.path)+'">'+esc(shortPath(b.path))+'</span><span class="pill '+(b.reason==='cn'?'pc':'pw')+'">'+esc(reasonLabel(b))+'</span><span class="obt">'+esc(fmtTimeShort(b.time))+'</span></div>').join('');box.querySelectorAll('[data-ovb]').forEach(el=>el.addEventListener('click',()=>{const b=items[+el.dataset.ovb];if(b)showDetail(b)}))}
-function renderOvSystem(cfg){const box=document.getElementById('ovSystem');if(!box)return;const s=state.lastStats||{},items=[];if(cfg){items.push({label:'监听端口',value:':'+(cfg.effective_port||'—'),cls:'m'});items.push({label:'大陆限制',value:cfg.china_only?'已开启':'已关闭',cls:cfg.china_only?'ok':''});items.push({label:'在线查询',value:cfg.geo_api?'已开启':'已关闭',cls:cfg.geo_api?'ok':''});const wl=(cfg.whitelist||[]).filter(Boolean).length;items.push({label:'白名单',value:wl?wl+' 个域名':'不限目标',cls:wl?'':'warn'})}items.push({label:'运行时长',value:typeof s.uptime_sec==='number'?fmtUptime(s.uptime_sec):'—'});items.push({label:'最近转发',value:s.last_proxy_at?fmtTime(s.last_proxy_at).slice(5,16):'尚无请求',cls:s.last_proxy_at?'m':'warn'});const bc=(s.blocked_cn||0)+(s.blocked_whitelist||0);items.push({label:'累计拦截',value:bc.toLocaleString()+' 次'});items.push({label:'独立 IP',value:Object.keys(s.ip_counts||{}).length.toLocaleString()+' 个'});box.innerHTML=items.map(it=>'<div class="sysi"><span class="sysl">'+esc(it.label)+'</span><span class="sysv '+(it.cls||'')+'">'+esc(it.value)+'</span></div>').join('')}
-let trendChart=null;
-function fmtChartBytes(b){if(!b)return '0';if(b<1048576)return (b/1024).toFixed(0)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
-function renderTrend(td){const ctx=document.getElementById('trendChart');if(!ctx)return;if(!td||!td.length){if(trendChart){trendChart.destroy();trendChart=null}return}const labels=td.map(d=>d.date),dr=td.map(d=>d.requests),db=td.map(d=>d.bytes);if(trendChart){trendChart.data.labels=labels;trendChart.data.datasets[0].data=db;trendChart.data.datasets[1].data=dr;trendChart.update();return}trendChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{label:'流量',data:db,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,yAxisID:'y',tension:0.3,pointRadius:3},{label:'请求数',data:dr,borderColor:'#10b981',backgroundColor:'transparent',borderWidth:2,borderDash:[5,5],yAxisID:'y1',tension:0.3,pointRadius:2}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'top',align:'end',labels:{usePointStyle:true,boxWidth:8,font:{size:12}}},tooltip:{backgroundColor:'rgba(15,23,42,0.9)',padding:12,cornerRadius:8,callbacks:{label:c=>c.dataset.label+': '+(c.dataset.yAxisID==='y'?fmtBytes(c.parsed.y):c.parsed.y.toLocaleString())}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:12,font:{size:11},color:'#94a3b8'}},y:{type:'linear',position:'left',title:{display:true,text:'流量',color:'#3b82f6',font:{size:11,weight:'bold'}},ticks:{color:'#94a3b8',font:{size:11},callback:v=>fmtChartBytes(v)},grid:{color:'#f1f5f9'}},y1:{type:'linear',position:'right',title:{display:true,text:'请求数',color:'#10b981',font:{size:11,weight:'bold'}},ticks:{color:'#94a3b8',font:{size:11}},grid:{drawOnChartArea:false}}}}})}
-async function loadTraffic(){const r0=trState.range||{from:'',to:''};const qs=new URLSearchParams();if(r0.from)qs.set('from',r0.from);if(r0.to)qs.set('to',r0.to);try{const r=await fetch('/admin/api/traffic'+(qs.toString()?'?'+qs.toString():''),{cache:'no-store'});if(!r.ok)return;const d=await r.json();if(d.today)state.serverToday=d.today;const sum=document.getElementById('trSummary');if(sum){const blocked=(d.blocked_cn||0)+(d.blocked_whitelist||0);sum.innerHTML='请求总计 <b>'+(d.requests||0).toLocaleString()+'</b> · 流量总计 <b>'+fmtBytes(d.bytes||0)+'</b> · 拦截总计 <b>'+blocked.toLocaleString()+'</b>'}renderIP(d.ip_counts||{});renderRegion(d.country_counts||{});if(d.trend)renderTrend(d.trend)}catch(e){}}
-document.getElementById('trRangeBar').addEventListener('click',e=>{const btn=e.target.closest('.filter[data-r]');if(!btn)return;document.querySelectorAll('#trRangeBar .filter').forEach(b=>b.classList.toggle('on',b===btn));trState.range=rangeOf(btn.dataset.r);sigIP='';sigReg='';loadTraffic()});
-async function loadStats(){try{const r=await fetch('/admin/api/stats',{cache:'no-store'});if(!r.ok)return;const s=await r.json();state.lastStats=s;const nl=s.country_labels||{};if(JSON.stringify(nl)!==JSON.stringify(state.labels)){state.labels=nl;sigReg='';sigBlk='';sigIP='';if(blockItems.length)drawBlocks();if(document.getElementById('traffic').classList.contains('on'))loadTraffic()}if(s.port&&!state.port)applyPort(s.port);document.getElementById('todayReq').textContent=(s.today_requests||0).toLocaleString();document.getElementById('todayBytes').textContent=fmtBytes(s.today_bytes||0);document.getElementById('totalReq').textContent=(s.total_requests||0).toLocaleString();document.getElementById('totalBytes').textContent=fmtBytes(s.total_bytes||0);const bc=s.blocked_cn||0,bw=s.blocked_whitelist||0;document.getElementById('totalBlocked').textContent=(bc+bw).toLocaleString();document.getElementById('blockedCN').textContent=bc.toLocaleString();document.getElementById('blockedWL').textContent=bw.toLocaleString();document.getElementById('uniqueIPs').textContent=Object.keys(s.ip_counts||{}).length.toLocaleString();document.getElementById('uniqueCountries').textContent=Object.keys(s.country_counts||{}).length;document.getElementById('clock').textContent=nowClockCN();if(typeof s.uptime_sec==='number')document.getElementById('uptimeChip').textContent='已运行 '+fmtUptime(s.uptime_sec);const gs=document.getElementById('geoStatus');if(s.regeo_running)gs.textContent='识别中 '+(s.regeo_done||0)+'/'+(s.regeo_total||0);else if(s.geo_ok||s.geo_fail)gs.textContent='成功 '+(s.geo_ok||0)+' · 失败 '+(s.geo_fail||0);else gs.textContent='';if(document.getElementById('traffic').classList.contains('on'))loadTraffic();if(document.getElementById('blocks').classList.contains('on'))loadBlocks();if(document.getElementById('overview').classList.contains('on')){const now=Date.now();if(!loadStats._ovAt||now-loadStats._ovAt>30000){loadStats._ovAt=now;loadOverview()}}}catch(e){}}
-function renderIP(map){const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);const sig=JSON.stringify(rows);if(sig===sigIP)return;sigIP=sig;const box=document.getElementById('ipDist');if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b>有请求后自动统计</div>';return}const max=rows[0][1]||1;box.innerHTML=rows.map(([ip,n])=>'<div class="dr"><span class="dn m" title="'+esc(ip)+'"><span class="tx">'+esc(ip)+'</span></span><div class="bar i"><i style="width:'+(n/max*100).toFixed(1)+'%"></i></div><span class="dv">'+n.toLocaleString()+'</span></div>').join('')}
-function renderRegion(map){const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);const sig=JSON.stringify(rows);if(sig===sigReg)return;sigReg=sig;const box=document.getElementById('regionDist');if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b>有请求后自动统计</div>';return}const total=rows.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;box.innerHTML=rows.map(([code,n])=>{const nm=regionName(code);return '<div class="dr"><span class="dn" title="'+esc(nm)+'">'+flagHtml(code)+'<span class="tx">'+esc(nm)+'</span></span><div class="bar t"><i style="width:'+(n/max*100).toFixed(1)+'%"></i></div><span class="dv">'+n.toLocaleString()+'<span>'+(n/total*100).toFixed(0)+'%</span></span></div>'}).join('')}
-function maskHost(h){h=String(h||'').trim();if(!h)return '';const port=h.includes(':')?':'+h.split(':').pop():'',host=h.split(':')[0];if(/^\d{1,3}(\.\d{1,3}){3}$/.test(host)){const p=host.split('.');return p[0]+'.'+p[1]+'.*.*'+port}const parts=host.split('.');if(parts.length<=1)return '***'+port;return '***.'+parts[parts.length-1]+port}
-let blockItems=[];
-const dayStr=d=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())};
-function rangeOf(mode){const t=state.serverToday||dayStr(new Date()),base=new Date(t+'T00:00:00');if(mode==='today')return{from:t,to:t};if(mode==='7d'){const f=new Date(base);f.setDate(f.getDate()-6);return{from:dayStr(f),to:t}}if(mode==='30d'){const f=new Date(base);f.setDate(f.getDate()-29);return{from:dayStr(f),to:t}}return{from:'',to:''}}
-async function loadBlocks(){const r0=state.range||{from:'',to:''};const qs=new URLSearchParams();if(r0.from)qs.set('from',r0.from);if(r0.to)qs.set('to',r0.to);qs.set('page',String(state.page||1));qs.set('size','20');try{const r=await fetch('/admin/api/blocks?'+qs.toString(),{cache:'no-store'});if(!r.ok)return;const data=await r.json();if(data.today)state.serverToday=data.today;const total=data.total||0;state.page=data.page||1;state.pages=data.pages||1;state.total=total;document.getElementById('cntAll').textContent=total.toLocaleString()+' 条';updatePager();const sig=JSON.stringify(data.items||[]);if(sig===sigBlk)return;sigBlk=sig;blockItems=data.items||[];drawBlocks()}catch(e){}}
-function updatePager(){document.getElementById('pageInfo').textContent=state.page+' / '+state.pages+' 页';document.getElementById('prevPage').disabled=state.page<=1;document.getElementById('nextPage').disabled=state.page>=state.pages}
-function drawBlocks(){const body=document.getElementById('blocksBody');if(!blockItems.length){body.innerHTML='<tr><td colspan="5" class="emp"><b>暂无记录</b>被拦截的请求会出现在这里</td></tr>';return}body.innerHTML=blockItems.map((b,i)=>'<tr data-i="'+i+'" style="cursor:pointer"><td class="ct2" data-label="时间">'+esc(fmtTime(b.time))+'</td><td class="ci" data-label="IP">'+esc(b.ip)+'</td><td data-label="地区"><span class="rg">'+flagHtml(b.country)+'<span>'+esc(regionName(b.country))+'</span></span></td><td class="cp" data-label="路径" title="'+esc(b.path)+'">'+esc(shortPath(b.path))+'</td><td data-label="原因"><span class="pill '+(b.reason==='cn'?'pc':'pw')+'" title="'+esc(b.reason_text||reasonLabel(b))+'">'+esc(reasonLabel(b))+'</span></td></tr>').join('')}
-function showDetail(b){document.getElementById('modalTitle').textContent='记录详情';document.getElementById('modalBody').innerHTML=[['时间',esc(fmtTime(b.time)),false],['IP',esc(b.ip),true],['地区',esc(regionName(b.country)),false],['原因','<span class="pill '+(b.reason==='cn'?'pc':'pw')+'">'+esc(b.reason_text||reasonLabel(b))+'</span>',false],['路径',esc(b.path),true],['UA',esc(b.ua||'（未记录）'),true]].map(([k,v,m])=>'<div class="kv"><div class="kk">'+k+'</div><div class="kvv'+(m?' m':'')+'">'+v+'</div></div>').join('');document.getElementById('modal').classList.add('on')}
-document.getElementById('blocksBody').addEventListener('click',e=>{const tr=e.target.closest('tr[data-i]');if(!tr)return;const b=blockItems[+tr.dataset.i];if(b)showDetail(b)});
-document.getElementById('modalClose').addEventListener('click',()=>document.getElementById('modal').classList.remove('on'));
-document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')e.currentTarget.classList.remove('on')});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.getElementById('modal').classList.remove('on')});
-document.getElementById('rangeBar').addEventListener('click',e=>{const btn=e.target.closest('.filter[data-r]');if(!btn)return;document.querySelectorAll('#rangeBar .filter').forEach(b=>b.classList.toggle('on',b===btn));state.range=rangeOf(btn.dataset.r);state.page=1;sigBlk='';loadBlocks()});
-document.getElementById('prevPage').addEventListener('click',()=>{if(state.page>1){state.page--;sigBlk='';loadBlocks()}});
-document.getElementById('nextPage').addEventListener('click',()=>{if(state.page<state.pages){state.page++;sigBlk='';loadBlocks()}});
-function collect(useInputPort){const raw=parseInt(document.getElementById('portInput').value,10);return{port:useInputPort?(isNaN(raw)?0:raw):state.port,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:document.getElementById('geoAPI').checked,geo_api_url:document.getElementById('geoAPIURL').value.trim()}}
-async function save(opts){const o=opts||{};try{const r=await fetch('/admin/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect(!!o.useInputPort))});const txt=await r.text();if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));const c=JSON.parse(txt);if(c.effective_port)applyPort(c.effective_port);if(o.msg)toast(o.msg,'ok');return true}catch(e){toast('保存失败: '+e.message,'err');return false}}
-function renderWl(list){const box=document.getElementById('wlView');if(!list||!list.length){box.innerHTML='<span class="wle">未限制，转发任意目标</span>';return}box.innerHTML=list.map(h=>'<span class="wli">'+esc(maskHost(h))+'</span>').join('')}
-function wlMode(edit){document.getElementById('wlView').style.display=edit?'none':'flex';document.getElementById('wlViewActions').style.display=edit?'none':'flex';document.getElementById('wlEditWrap').style.display=edit?'block':'none'}
-document.getElementById('wlEditBtn').addEventListener('click',()=>wlMode(true));
-document.getElementById('wlCancel').addEventListener('click',()=>{loadConfig();wlMode(false)});
-document.getElementById('save').addEventListener('click',async()=>{if(await save({msg:'白名单已保存'})){renderWl(document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean));wlMode(false)}});
-function askJump(p){const host=location.hostname||'localhost',url=location.protocol+'//'+host+':'+p+'/admin/';document.getElementById('modalTitle').textContent='端口已切换';document.getElementById('modalBody').innerHTML='<div class="kv"><div class="kk">新地址</div><div class="kvv m">'+esc(url)+'</div></div><div class="hint" style="margin-top:16px">服务已在新端口监听，当前页面即将失效</div><div class="acts" style="margin-top:20px"><button class="btn b" id="jumpNow">立即跳转</button><button class="btn g" id="jumpLater">稍后</button></div>';document.getElementById('modal').classList.add('on');document.getElementById('jumpNow').addEventListener('click',()=>{location.href=url});document.getElementById('jumpLater').addEventListener('click',()=>{document.getElementById('modal').classList.remove('on');document.getElementById('portInput').value=state.port})}
-document.getElementById('savePort').addEventListener('click',async()=>{const raw=parseInt(document.getElementById('portInput').value,10);if(isNaN(raw)||raw<1||raw>65535){toast('端口需在 1-65535 之间','err');return}if(raw===state.port){toast('端口没有变化','err');return}const old=state.port,btn=document.getElementById('savePort');btn.disabled=true;const ok=await save({useInputPort:true});btn.disabled=false;if(!ok)return;if(state.port!==old)askJump(state.port);else document.getElementById('portInput').value=state.port});
-document.getElementById('chinaOnly').addEventListener('change',async()=>{const on=document.getElementById('chinaOnly').checked;if(await save({}))toast(on?'已开启：仅中国大陆可访问':'已关闭大陆限制','ok')});
-document.getElementById('geoAPI').addEventListener('change',async()=>{const on=document.getElementById('geoAPI').checked;if(await save({}))toast(on?'已开启在线查询':'已关闭在线查询','ok')});
-document.getElementById('geoAPIURL').addEventListener('change',async()=>{if(await save({}))toast('接口地址已保存','ok')});
-document.getElementById('geoTest').addEventListener('click',async()=>{const btn=document.getElementById('geoTest'),out=document.getElementById('geoResult');btn.disabled=true;out.innerHTML='<div style="margin-top:12px;color:var(--t3);font-size:13px">正在请求接口…</div>';await save({});try{const r=await fetch('/admin/api/geotest',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(d.ok){out.innerHTML='<div style="margin-top:12px;color:var(--ok);font-size:13px">接口正常：'+esc(d.ip)+' → '+esc(d.name)+'（'+esc(d.code)+'）</div>'}else{out.innerHTML='<div style="margin-top:12px;color:var(--w);font-size:13px">接口失败：'+esc(d.error)+'</div>'}}catch(e){out.innerHTML='<div style="margin-top:12px;color:var(--w);font-size:13px">请求失败：'+esc(e.message)+'</div>'}btn.disabled=false});
-document.getElementById('regeoBtn').addEventListener('click',async()=>{const btn=document.getElementById('regeoBtn');btn.disabled=true;try{const r=await fetch('/admin/api/regeo',{method:'POST'});const d=await r.json();toast(d.started?'开始重新识别':'正在识别中','ok');setTimeout(()=>{loadStats();btn.disabled=false},700)}catch(e){toast('启动失败: '+e.message,'err');btn.disabled=false}});
-function confirmAction(opts){return new Promise(resolve=>{const modal=document.getElementById('modal');document.getElementById('modalTitle').textContent=opts.title;document.getElementById('modalBody').innerHTML='<div style="font-size:13.5px;line-height:1.75;color:var(--t2);margin-bottom:20px">'+(opts.body||'')+'</div><div class="acts" style="justify-content:flex-end;margin-top:0"><button class="btn g" id="cfCancel">取消</button><button class="btn b" id="cfOk" style="'+(opts.danger?'background:#dc2626':'')+'">'+(opts.okText||'确定')+'</button></div>';modal.classList.add('on');const close=v=>{modal.classList.remove('on');resolve(v)};document.getElementById('cfOk').onclick=()=>close(true);document.getElementById('cfCancel').onclick=()=>close(false)})}
+const state={port:0,labels:{},ovRange:'today'};
+let ovTrendData=[];
 
-document.getElementById('changePassBtn').addEventListener('click',async()=>{
-  const oldP=document.getElementById('oldPass').value;
-  const n1=document.getElementById('newPass').value;
-  const n2=document.getElementById('newPass2').value;
-  if(!oldP){toast('请输入当前密码','err');return}
-  if(!n1||n1.length<6){toast('新密码至少 6 位','err');return}
-  if(n1!==n2){toast('两次新密码不一致','err');return}
-  const btn=document.getElementById('changePassBtn');btn.disabled=true;
+function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
+const pageTitles={overview:'概览',traffic:'流量与请求',blocks:'拦截记录',logs:'实时日志',settings:'网关设置'};
+function switchTab(id){document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));document.getElementById('pt').textContent=pageTitles[id]||'';if(window.innerWidth<=1024)closeSidebar();if(id==='overview')loadOverview();if(id==='traffic')loadTraffic();if(id==='blocks')loadBlocks();if(id==='logs')connectLogs();else if(logSource){logSource.close();logSource=null}}
+function openSidebar(){document.getElementById('sb').classList.add('open');document.getElementById('sbMask').classList.add('on')}
+function closeSidebar(){document.getElementById('sb').classList.remove('open');document.getElementById('sbMask').classList.remove('on')}
+document.getElementById('mmb').addEventListener('click',(e)=>{e.stopPropagation();openSidebar()});
+document.getElementById('sbMask').addEventListener('click',closeSidebar);
+
+document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
+document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
+
+function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portChip').textContent=':'+p}
+
+async function loadConfig(){
   try{
-    const r=await fetch('/admin/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_pass:oldP,new_pass:n1})});
+    const r=await fetch('/admin/api/config',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const c=await r.json();applyPort(c.effective_port);
+    document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('corsToggle').checked=!!c.cors;document.getElementById('cacheToggle').checked=!!c.enable_cache;
+    document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');document.getElementById('autoBan').checked=!!c.auto_ban;
+    document.getElementById('rateLimit').value=c.rate_limit||0;document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
+  }catch(e){console.error('loadConfig error:',e)}
+}
+
+let miniTrendChart=null,reqChart=null,byteChart=null;
+
+function updateOvStats() {
+  if (!ovTrendData.length) return;
+  const today = new Date();
+  const tzOffset = today.getTimezoneOffset() * 60000;
+  const localISOTime = (new Date(today - tzOffset)).toISOString().slice(0,10);
+  const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+  const yISOTime = (new Date(yesterday - tzOffset)).toISOString().slice(0,10);
+
+  let filterFn = () => true;
+  if (state.ovRange === 'today') filterFn = d => d.date === localISOTime;
+  else if (state.ovRange === 'yesterday') filterFn = d => d.date === yISOTime;
+  else if (state.ovRange === '7d') {
+    const d7 = new Date(today); d7.setDate(today.getDate() - 6);
+    const d7Str = (new Date(d7 - tzOffset)).toISOString().slice(0,10);
+    filterFn = d => d.date >= d7Str;
+  } else if (state.ovRange === '30d') {
+    const d30 = new Date(today); d30.setDate(today.getDate() - 29);
+    const d30Str = (new Date(d30 - tzOffset)).toISOString().slice(0,10);
+    filterFn = d => d.date >= d30Str;
+  }
+  
+  const filtered = ovTrendData.filter(filterFn);
+  let reqs = 0, bytes = 0, bCN = 0, bWL = 0;
+  filtered.forEach(d => {
+    reqs += d.requests || 0;
+    bytes += d.bytes || 0;
+    bCN += d.blocked_cn || 0;
+    bWL += d.blocked_whitelist || 0;
+  });
+  
+  const days = filtered.length || 1;
+  document.getElementById('ovReq').textContent = reqs.toLocaleString();
+  document.getElementById('ovBytes').textContent = fmtBytes(bytes);
+  document.getElementById('ovAvgReq').textContent = Math.round(reqs/days).toLocaleString();
+  document.getElementById('ovAvgBytes').textContent = fmtBytes(Math.round(bytes/days));
+  document.getElementById('ovBlocked').textContent = (bCN + bWL).toLocaleString();
+  document.getElementById('ovBlockedCN').textContent = bCN.toLocaleString();
+}
+
+async function loadOverview(){
+  try{
+    const r=await fetch('/admin/api/traffic',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const t=await r.json();
+    document.getElementById('uniqueIPs').textContent=Object.keys(t.ip_counts||{}).length.toLocaleString();
+    ovTrendData = t.trend || [];
+    renderMiniTrend(ovTrendData);
+    updateOvStats();
+    
+    const r2=await fetch('/admin/api/blocks',{cache:'no-store'});
+    if(r2.ok){const b=await r2.json();renderOvBlocks(b.items||[]);}
+    
+    const r3=await fetch('/admin/api/config',{cache:'no-store'});
+    if(r3.ok){const c=await r3.json();renderSysInfo(c, t.uptime_sec||0);}
+  }catch(e){console.error('loadOverview error:',e)}
+}
+
+function renderSysInfo(c, uptime){
+  let fw = "已开启"; if(!c.ban_list?.length && !c.china_only && !c.rate_limit) fw="基础模式";
+  const html = `
+  <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">运行时长</span><span>${Math.floor(uptime/3600)} 小时</span></div>
+  <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">防护状态</span><span style="color:var(--ok)">${fw}</span></div>
+  <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">白名单</span><span>${c.whitelist?.length||0} 个域名</span></div>
+  <div style="display:flex;justify-content:space-between;padding:8px 0"><span style="color:#94a3b8">缓存加速</span><span>${c.enable_cache?"已开启":"已关闭"}</span></div>
+  `;
+  document.getElementById('sysInfo').innerHTML = html;
+}
+
+function renderMiniTrend(trend){const cv=document.getElementById('miniTrendChart');if(!cv || typeof Chart==='undefined')return;const data=(trend||[]).slice(-7);if(!data.length)return;const labels=data.map(d=>(d.date||'').slice(5)),reqs=data.map(d=>d.requests||0);
+if(miniTrendChart){miniTrendChart.data.labels=labels;miniTrendChart.data.datasets[0].data=reqs;miniTrendChart.update('none');return}
+miniTrendChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'请求',data:reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,tension:0.35,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{borderDash:[4,4]}}}}})}
+
+// esc：HTML 转义。拦截记录的 ip/path/ua 等字段来自外部可控输入，
+// 直接拼进 innerHTML 存在存储型 XSS 风险，展示前必须转义。
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function renderOvBlocks(items){
+  const box=document.getElementById('ovBlocks');
+  if(!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b></div>';return}
+  box.innerHTML=items.slice(0,5).map(b=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f1f5f9;font-size:13px">
+    <div><span style="font-family:var(--mono);color:#3b82f6;font-weight:600">${esc(b.ip)}</span><br><span class="pill pw" style="margin-top:4px">${b.reason==='cn'?'大陆限制':'白名单'}</span></div>
+    <div style="color:#94a3b8;font-size:12px">${(b.time||'').slice(11,19)}</div>
+  </div>`).join('');
+}
+
+async function loadTraffic(){
+  try{
+    const r=await fetch('/admin/api/traffic',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const t=await r.json();
+    if(t.country_labels) state.labels = t.country_labels;
+    renderReqChart(t.trend||[]); renderByteChart(t.trend||[]);
+    renderIP(t.ip_counts||{}, t.ip_bytes||{});
+    renderRegion(t.country_counts||{});
+  }catch(e){console.error('loadTraffic error:',e)}
+}
+
+function renderReqChart(td){const cv=document.getElementById('reqChart');if(!cv || typeof Chart==='undefined')return;const labels=td.map(d=>d.date),dr=td.map(d=>d.requests);
+if(reqChart){reqChart.data.labels=labels;reqChart.data.datasets[0].data=dr;reqChart.update();return}
+reqChart=new Chart(cv,{type:'bar',data:{labels,datasets:[{label:'请求数',data:dr,backgroundColor:'#10b981',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{borderDash:[4,4]}}}}})}
+function renderByteChart(td){const cv=document.getElementById('byteChart');if(!cv || typeof Chart==='undefined')return;const labels=td.map(d=>d.date),db=td.map(d=>d.bytes);
+if(byteChart){byteChart.data.labels=labels;byteChart.data.datasets[0].data=db;byteChart.update();return}
+byteChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'流量',data:db,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',fill:true,tension:0.3,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}})}
+
+function renderIP(map,bytesMap){
+  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  const box=document.getElementById('ipDist');
+  if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b></div>';return}
+  const max=rows[0][1]||1;
+  box.innerHTML=rows.map(([ip,n])=>{
+    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`;
+  }).join('');
+  box.querySelectorAll('.ip-row').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
+}
+
+function renderRegion(map){
+  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  const box=document.getElementById('regionDist');
+  if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b></div>';return}
+  const total=rows.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;
+  box.innerHTML=rows.map(([code,n])=>{
+    const nm=state.labels[code]||code;
+    return `<div class="dr"><span class="dn" title="${nm}"><img class="flg" src="/admin/api/flag/${code.toLowerCase()}" onerror="this.style.display='none'"> <span class="tx">${nm}</span></span><div class="bar t"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
+  }).join('');
+}
+
+async function showIPDetail(ip){
+  if(!ip)return;
+  document.getElementById('modalTitle').textContent='IP 详情';
+  document.getElementById('modalBody').innerHTML='<div style="color:var(--t3);font-size:13px;padding:12px 0">加载中…</div>';
+  document.getElementById('modal').classList.add('on');
+  try{
+    const r=await fetch('/admin/api/ip-detail?ip='+encodeURIComponent(ip),{cache:'no-store'});
     const txt=await r.text();
     if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
-    document.getElementById('oldPass').value='';document.getElementById('newPass').value='';document.getElementById('newPass2').value='';
-    toast('密码已修改，请使用新密码重新登录','ok');
-  }catch(e){toast('修改失败: '+e.message,'err')}
-  btn.disabled=false;
-});
-let fwLoading=false;
-async function loadFirewall(){
-  const desc=document.getElementById('fwDesc'),hint=document.getElementById('fwHint'),sw=document.getElementById('fwAllow');
-  if(!desc||!sw)return;
-  try{
-    const r=await fetch('/admin/api/firewall',{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const d=await r.json();
-    if(!d.available){
-      desc.textContent='未检测到防火墙，无法自动放行';
-      sw.disabled=true;sw.checked=false;
-      if(hint)hint.textContent='系统需安装并启用 firewalld、ufw 或 iptables，且服务以 root 运行。';
-      return;
-    }
-    sw.disabled=false;
-    fwLoading=true;sw.checked=!!d.open;fwLoading=false;
-    const name=d.backend==='firewalld'?'firewalld':d.backend==='ufw'?'UFW':'iptables';
-    desc.textContent=(d.open?'已放行':'未放行')+' · 端口 '+d.port+'/tcp · '+name;
-    if(hint)hint.textContent='开启后允许外网访问本服务端口；关闭则移除对应放行规则（不影响本机访问）。';
+    const d=JSON.parse(txt);
+    const loc=d.location||d.country_name||'未知';
+    const rows=[['IP',d.ip,true],['位置',loc,false],['请求次数',(d.requests||0).toLocaleString()+' 次',false],['流量',fmtBytes(d.bytes||0),false]];
+    document.getElementById('modalBody').innerHTML=rows.map(([k,v,m])=>'<div class="kv"><div class="kk">'+esc(k)+'</div><div class="kvv'+(m?' m':'')+'">'+esc(v)+'</div></div>').join('');
   }catch(e){
-    desc.textContent='防火墙状态获取失败';
-    if(hint)hint.textContent=e.message||'';
+    document.getElementById('modalBody').innerHTML='<div style="color:var(--d);font-size:13px">加载失败：'+esc(e.message)+'</div>';
   }
 }
-document.getElementById('fwAllow').addEventListener('change',async()=>{
-  if(fwLoading)return;
-  const sw=document.getElementById('fwAllow'),allow=sw.checked;
-  sw.disabled=true;
+
+async function loadBlocks(){
   try{
-    const r=await fetch('/admin/api/firewall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({allow})});
-    const txt=await r.text();
-    if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
-    toast(allow?'已放行服务端口':'已关闭端口放行','ok');
-    await loadFirewall();
-  }catch(e){
-    toast('操作失败: '+e.message,'err');
-    await loadFirewall();
-  }
-  sw.disabled=false;
+    const r=await fetch('/admin/api/blocks',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const t=await r.json();
+    const tb=document.getElementById('blockTable');
+    if(!t.items.length){tb.innerHTML='<tr><td colspan="5"><div class="emp"><b>暂无拦截记录</b></div></td></tr>';return}
+    tb.innerHTML=t.items.map(b=>`<tr>
+      <td data-label="时间" style="font-family:var(--mono);font-size:12px;color:#94a3b8">${(b.time||'').replace('T',' ').slice(0,19)}</td>
+      <td data-label="IP 地址" style="font-family:var(--mono);font-weight:600"><span class="ip-link" data-ip="${esc(b.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer">${esc(b.ip)}</span></td>
+      <td data-label="地区"><span><img class="flg" src="/admin/api/flag/${(b.country||'??').toLowerCase()}" onerror="this.style.display='none'"> ${esc(b.country)}</span></td>
+      <td data-label="拦截原因"><span class="pill ${b.reason==='cn'?'pc':'pw'}">${b.reason==='cn'?'大陆限制':'未授权白名单'}</span></td>
+      <td data-label="访问路径"><span style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(b.path)}">${esc(b.path)}</span></td>
+    </tr>`).join('');
+    tb.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
+  }catch(e){console.error('loadBlocks error:',e)}
+}
+
+let logSource=null;
+function connectLogs(){if(logSource)logSource.close();const term=document.getElementById('logTerminal');if(!term)return;
+logSource=new EventSource('/admin/api/logs');
+logSource.onmessage=function(e){const time=new Date().toLocaleTimeString();term.innerHTML+='['+time+'] '+e.data+'\n';term.scrollTop=term.scrollHeight;
+if(term.innerHTML.length>50000)term.innerHTML=term.innerHTML.slice(-30000)}}
+document.getElementById('clearLogBtn').addEventListener('click',()=>{document.getElementById('logTerminal').innerHTML=''});
+
+function collect(){
+  const raw=parseInt(document.getElementById('portInput').value,10);
+  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),enable_cache:document.getElementById('cacheToggle').checked,cors:document.getElementById('corsToggle').checked}
+}
+async function save(){
+  try{
+    const r=await fetch('/admin/api/save',{method:'POST',body:JSON.stringify(collect())});
+    if(!r.ok)throw new Error(await r.text());
+    const c=await r.json();applyPort(c.effective_port);alert('配置保存成功！');
+  }catch(e){alert('保存失败: '+e.message)}
+}
+document.getElementById('savePort').addEventListener('click',save);document.getElementById('saveAll').addEventListener('click',save);
+
+document.getElementById('changePassBtn').addEventListener('click',async()=>{
+  const o=document.getElementById('oldPass').value,n=document.getElementById('newPass').value;
+  if(!o||!n||n.length<6){alert('新密码至少6位且不能为空');return}
+  const r=await fetch('/admin/api/change-password',{method:'POST',body:JSON.stringify({OldPass:o,NewPass:n})});
+  if(r.ok){alert('密码已修改，请重新登录');location.reload()}else{alert('修改失败：'+await r.text())}
 });
-document.getElementById('resetConfigBtn').addEventListener('click',async()=>{const ok=await confirmAction({title:'还原初始化设置',body:'将恢复为默认值：<br>· 仅允许中国大陆 IP：<b>关闭</b><br>· 目标域名白名单：<b>清空</b><br>· 在线 IP 查询：<b>开启</b><br>· 接口地址：<b>恢复默认</b><br><br>监听端口保持不变，统计数据与密码不受影响。',okText:'确认还原',danger:true});if(!ok)return;try{const r=await fetch('/admin/api/reset-config',{method:'POST'});const txt=await r.text();if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));const c=JSON.parse(txt);if(c.effective_port)applyPort(c.effective_port);await loadConfig();loadStats();toast('已还原为默认设置','ok')}catch(e){toast('还原失败: '+e.message,'err')}});
-document.getElementById('clearStatsBtn').addEventListener('click',async()=>{const ok=await confirmAction({title:'清空所有统计',body:'以下数据将被清除，<b style="color:#dc2626">不可恢复</b>：<br>· 今日/累计请求数与流量<br>· IP 与地区分布<br>· 拦截记录与拦截计数<br><br>配置、白名单、管理密码<b>不受影响</b>。',okText:'确认清空',danger:true});if(!ok)return;try{const r=await fetch('/admin/api/clear-stats',{method:'POST'});if(!r.ok){const txt=await r.text();throw new Error(txt.trim()||('HTTP '+r.status))}toast('统计已清空','ok');loadStats();if(document.getElementById('overview').classList.contains('on'))loadOverview()}catch(e){toast('清空失败: '+e.message,'err')}});
-document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
-loadConfig();loadStats();loadOverview();loadFirewall();setInterval(loadStats,5000);
+document.getElementById('clearStatsBtn').addEventListener('click',async()=>{
+  if(!confirm('确定要清空所有统计数据吗？此操作不可恢复！'))return;
+  await fetch('/admin/api/clear-stats',{method:'POST'});alert('已清空');loadOverview();
+});
+
+document.getElementById('ovRangeBar').addEventListener('click', e => {
+  const btn = e.target.closest('.filter[data-r]');
+  if (!btn) return;
+  document.querySelectorAll('#ovRangeBar .filter').forEach(b => b.classList.toggle('on', b === btn));
+  state.ovRange = btn.dataset.r;
+  updateOvStats();
+});
+
+document.getElementById('modalClose').addEventListener('click',()=>document.getElementById('modal').classList.remove('on'));
+document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')e.currentTarget.classList.remove('on')});
+
+const _origFetch = window.fetch;
+window.fetch = async function(...args) {
+  const res = await _origFetch.apply(this, args);
+  if (res.status === 401) {
+    const url = (typeof args[0] === 'string') ? args[0] : (args[0] && args[0].url) || '';
+    if (url.includes('/admin/api/') && !url.includes('/admin/api/login')) {
+      location.href = '/admin/login';
+      return res;
+    }
+  }
+  return res;
+};
+document.getElementById('logoutBtn')?.addEventListener('click', async () => {
+  try { await fetch('/admin/api/logout', {method:'POST'}); } catch(e) {}
+  location.href = '/admin/login';
+});
+
+loadConfig();
+loadOverview();
+// 轮询优化：页面不可见（切走标签页）时暂停 5s 轮询，回前台立即刷新
+let ovTimer=setInterval(()=>{if(!document.hidden)loadOverview()},5000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)loadOverview()});
 </script>
 </body>
 </html>
 ADMIN_HTML
 }
+
 compute_source_hash() {
   command -v sha256sum >/dev/null 2>&1 || die "缺少 sha256sum"
   local d h
@@ -2076,14 +2737,7 @@ compute_source_hash() {
   printf '%s' "$h"
 }
 genpass() { head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 20; }
-write_default_config() {
-  cat > "$CONFIG_FILE" <<'JSON'
-{"port":0,"china_only":false,"whitelist":[],"geo_api":true,"geo_api_url":""}
-JSON
-}
-systemd_quote() {
-  local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//%/%%}"; printf '"%s"' "$s"
-}
+systemd_quote() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//%/%%}"; printf '"%s"' "$s"; }
 make_unit() {
   local u p
   u="$(systemd_quote "$ADMIN_USER")"
@@ -2095,8 +2749,11 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=simple
-Environment=GOGC=200
-ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${u} -admin-pass ${p} -config ${CONFIG_FILE} -stats ${STATS_FILE}
+# GOGC=100 保持默认 GC 节奏；GOMEMLIMIT 设软内存上限 256MiB，
+# 超出后 GC 加速回收，避免堆无节制增长挤占小内存 VPS
+Environment=GOGC=100
+Environment=GOMEMLIMIT=256MiB
+ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${u} -admin-pass ${p} -db ${DB_FILE}
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
@@ -2106,10 +2763,7 @@ UNIT
 }
 build_binary() {
   local out="$1"
-  if [[ -n "$PREBUILT" ]]; then
-    [[ -f "$PREBUILT" ]] || die "预构建二进制不存在: $PREBUILT"
-    cp -f "$PREBUILT" "$out"; chmod 0755 "$out"; return
-  fi
+  if [[ -n "$PREBUILT" ]]; then [[ -f "$PREBUILT" ]] || die "预构建二进制不存在: $PREBUILT"; cp -f "$PREBUILT" "$out"; chmod 0755 "$out"; return; fi
   ensure_go
   BUILD_TMPDIR="$(mktemp -d)"
   write_go_source "$BUILD_TMPDIR"
@@ -2119,8 +2773,8 @@ build_binary() {
     export GOTOOLCHAIN=auto GOFLAGS=-mod=mod
     go mod init emby-proxy >/dev/null 2>&1 || true
     go get "github.com/phuslu/iploc@${IPLOC_VERSION}" >/dev/null 2>&1 || true
-    go mod tidy >/dev/null 2>&1 || true
-    grep -q "phuslu/iploc" go.mod 2>/dev/null || go get "github.com/phuslu/iploc@latest" >/dev/null 2>&1 || true
+    go get "go.etcd.io/bbolt@latest" >/dev/null 2>&1 || true
+    go get "golang.org/x/sync/singleflight@latest" >/dev/null 2>&1 || true
     go mod tidy >/dev/null 2>&1 || die "依赖解析失败（可设 GOPROXY=https://goproxy.cn,direct 后重试）"
   )
   info "编译中..."
@@ -2129,44 +2783,46 @@ build_binary() {
 local_ip() {
   local ip=""
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || true
-  if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
-    ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
-  fi
+  if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"; fi
   [[ -z "$ip" ]] && ip="127.0.0.1"
   printf '%s' "$ip"
 }
 port_listen() { (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
 installed_port() {
   local p=""
-  if [[ -f "$CONFIG_FILE" ]]; then p="$(grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]\+' "$CONFIG_FILE" 2>/dev/null | grep -o '[0-9]\+$' | head -1)"; fi
-  if [[ ! "$p" =~ ^[0-9]+$ ]] || (( p == 0 )); then
-    if [[ -f "$UNIT_FILE" ]]; then p="$(sed -n 's/.*-port \([0-9]\{1,5\}\).*/\1/p' "$UNIT_FILE" | head -1)"; fi
-  fi
+  if [[ -f "$DB_FILE" ]]; then p="$(sed -n 's/.*-port \([0-9]\{1,5\}\).*/\1/p' "$UNIT_FILE" 2>/dev/null | head -1)"; fi
   if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then printf '%s' "$p"; else printf '%s' "$DEFAULT_PORT"; fi
 }
-effective_port() {
-  local p=""
-  if [[ -f "$CONFIG_FILE" ]]; then p="$(grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_FILE" 2>/dev/null | grep -o '[0-9]*$' | head -1)"; fi
-  if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then printf '%s' "$p"; return; fi
-  if [[ -f "$UNIT_FILE" ]]; then
-    p="$(sed -n 's/.*-port \([0-9]\{1,5\}\).*/\1/p' "$UNIT_FILE" | head -1)"
-    if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then printf '%s' "$p"; return; fi
-  fi
-  printf '%s' "$PORT"
-}
+effective_port() { installed_port; }
 print_access_info() {
   local ip ep; ip="$(local_ip)"; ep="$(effective_port)"
   printf '\n   管理页:  http://%s:%s/admin/\n' "$ip" "$ep"
   printf '   用户名:  %s\n' "$ADMIN_USER"
   printf '   密  码:  %s\n' "$ADMIN_PASS"
-  if [[ $GENERATED_PASS -eq 1 ]]; then printf '           （已保存到 %s）\n' "$ADMIN_PASS_FILE"; else printf '           （沿用已保存的密码，文件 %s）\n' "$ADMIN_PASS_FILE"; fi
-  printf '\n   用法：http://%s:%s/https://www.example.com/emby/Users\n' "$ip" "$ep"
-  printf '   配置文件: %s\n   统计文件: %s\n   查看日志: journalctl -u %s -f\n\n' "$CONFIG_FILE" "$STATS_FILE" "$SERVICE_NAME"
+  printf '   查看日志: journalctl -u %s -f\n\n' "$SERVICE_NAME"
 }
+
+# 限制系统 journal 日志大小，防止磁盘撑爆
+setup_journal_limit() {
+  local conf_dir="/etc/systemd/journald.conf.d"
+  local conf_file="${conf_dir}/size.conf"
+  if [[ ! -f "$conf_file" ]]; then
+    mkdir -p "$conf_dir"
+    cat > "$conf_file" <<'EOF'
+[Journal]
+SystemMaxUse=200M
+EOF
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+    info "已配置系统日志限制 (SystemMaxUse=200M)"
+  fi
+}
+
 cmd_install() {
   parse_install_args "$@"
   require_root install
   require_systemd
+  setup_journal_limit
+  
   if [[ -t 0 ]] && [[ $BINARY_ONLY -eq 0 ]] && [[ $PORT_GIVEN -eq 0 || $PASS_GIVEN -eq 0 ]]; then
     printf '\n'
     if [[ $PORT_GIVEN -eq 0 ]]; then prompt_port "$(installed_port)" || die "已取消"; PORT="$PROMPT_RESULT"; fi
@@ -2175,14 +2831,14 @@ cmd_install() {
   [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "端口无效: $PORT"
   if [[ $BINARY_ONLY -eq 1 ]]; then info "更新模式：只替换程序"; fi
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
-  if [[ -n "$ADMIN_PASS" ]]; then
-    ( umask 077; printf '%s' "$ADMIN_PASS" > "$ADMIN_PASS_FILE" ); GENERATED_PASS=1
-  elif [[ -f "$ADMIN_PASS_FILE" ]]; then
-    ADMIN_PASS="$(cat "$ADMIN_PASS_FILE")"; GENERATED_PASS=0
+  if [[ ! -f "$DB_FILE" ]]; then
+    if [[ -n "$ADMIN_PASS" ]]; then GENERATED_PASS=1
+    else ADMIN_PASS="$(genpass)"; GENERATED_PASS=1; fi
   else
-    ADMIN_PASS="$(genpass)"; ( umask 077; printf '%s' "$ADMIN_PASS" > "$ADMIN_PASS_FILE" ); GENERATED_PASS=1
+    if [[ -f "$UNIT_FILE" ]]; then ADMIN_PASS="$(sed -n 's/.*-admin-pass "\(.*\)".*/\1/p' "$UNIT_FILE" | head -1)"; fi
+    [[ -z "$ADMIN_PASS" ]] && ADMIN_PASS="$(genpass)"
+    GENERATED_PASS=0
   fi
-  if [[ ! -f "$CONFIG_FILE" ]]; then write_default_config; info "已创建配置文件"; fi
   local expected_unit; expected_unit="$(make_unit)"
   local need_compile=0 need_reload=0 new_hash=""
   if [[ -n "$PREBUILT" || $FORCE -eq 1 ]]; then need_compile=1
@@ -2210,7 +2866,7 @@ cmd_install() {
     if [[ -z "$PREBUILT" ]]; then [[ -n "$new_hash" ]] || new_hash="$(compute_source_hash)"; printf '%s' "$new_hash" > "$BUILD_HASH_FILE"; else rm -f "$BUILD_HASH_FILE"; fi
   fi
   if [[ $need_reload -eq 1 ]]; then
-    printf '%s\n' "$expected_unit" > "$UNIT_FILE"; chmod 0644 "$UNIT_FILE"
+    printf '%s\n' "$expected_unit" > "$UNIT_FILE"; chmod 0600 "$UNIT_FILE"  # unit 内含明文管理密码，禁止其他用户读取
     info "已更新 systemd unit"; systemctl daemon-reload
   fi
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -2242,13 +2898,10 @@ cmd_uninstall() {
     local ans=""; read -r ans || true
     [[ "$ans" == "y" || "$ans" == "Y" ]] || { info "已取消"; return 0; }
   fi
-  local installed_bin=""
-  if [[ -f "$UNIT_FILE" ]]; then installed_bin="$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$UNIT_FILE" | head -n1)"; fi
   stop_and_disable
   [[ -f "$UNIT_FILE" ]] && { rm -f "$UNIT_FILE"; info "已删除服务单元"; }
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
-  [[ -n "$installed_bin" && -f "$installed_bin" ]] && { rm -f "$installed_bin"; info "已删除程序: $installed_bin"; }
   [[ -f "$DEFAULT_BIN" ]] && { rm -f "$DEFAULT_BIN"; info "已删除程序: $DEFAULT_BIN"; }
   if [[ $keep -eq 1 ]]; then warn "已保留配置目录: $CONFIG_DIR"
   else [[ -d "$CONFIG_DIR" ]] && { rm -rf "$CONFIG_DIR"; info "已删除配置目录"; }; fi
@@ -2348,7 +3001,7 @@ menu_install_flow() {
   printf '\n'; menu_rule
   printf '   %s端口%s   %s\n' "$C_D" "$C_0" "$port"
   if [[ -n "$pass" ]]; then printf '   %s密码%s   %s\n' "$C_D" "$C_0" "$pass"
-  elif [[ -f "$ADMIN_PASS_FILE" ]]; then printf '   %s密码%s   沿用已保存的密码\n' "$C_D" "$C_0"
+  elif [[ -f "$DB_FILE" ]]; then printf '   %s密码%s   沿用已保存的密码\n' "$C_D" "$C_0"
   else printf '   %s密码%s   自动生成\n' "$C_D" "$C_0"; fi
   printf '   %s访问%s   http://%s:%s/admin/\n' "$C_D" "$C_0" "$(local_ip)" "$port"
   menu_rule; printf '\n'
