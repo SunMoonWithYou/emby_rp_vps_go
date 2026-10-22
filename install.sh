@@ -180,6 +180,8 @@ Emby 路径反代服务（单文件）
   · 统计                        异步 channel 聚合，按日分桶，定期落盘
   · 实时监控                    liveConn + WebSocket(/admin/api/live/ws) 推送活跃连接
   · 管理后台                    /admin/ 嵌入 admin.html，会话 Cookie + 验证码登录
+  · PWA 模式                    可选开启：manifest + Service Worker，后台可安装为独立应用、离线打开
+  · 品牌图标                    favicon / Logo / PWA 图标（192、512）启动预热，本地提供
 
 时区
   统计分日/分时与对外时间字段统一按 Asia/Shanghai（北京时间）。
@@ -198,6 +200,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
+	"compress/gzip"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -215,6 +218,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -290,11 +294,16 @@ const pageCSS = `
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--r:16px}
 body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:40px 36px;max-width:520px;width:100%;box-shadow:0 4px 24px -4px rgba(15,23,42,.06);text-align:center}
-.icon{width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:28px}
+/* 品牌区：与登录页 brand 结构一致（Logo + 名称 + 副标题） */
+.brand{text-align:center;margin-bottom:22px}
+.brand-logo{width:56px;height:56px;border-radius:14px;display:block;margin:0 auto 14px}
+.brand h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
+.brand p{font-size:13px;color:var(--t3);margin-top:4px}
+.icon{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px}
 .icon.blue{background:var(--ps);color:var(--p)}
 .icon.red{background:#fef2f2;color:var(--d)}
 .icon.amber{background:#fffbeb;color:var(--w)}
-h1{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:10px;color:var(--t)}
+h2{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:10px;color:var(--t)}
 .desc{color:var(--t2);font-size:14.5px;line-height:1.7;margin-bottom:28px}
 .ex{background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:16px 18px;text-align:left;margin-bottom:24px;font-size:13.5px}
 .ex-t{font-size:12px;color:var(--t3);margin-bottom:8px;font-weight:600}
@@ -306,15 +315,28 @@ h1{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:10px;color:
 .btn.g:hover{background:#f8fafc;color:var(--t)}
 .acts{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
 .foot{margin-top:28px;font-size:12.5px;color:var(--t3)}
-.brand{font-weight:600;color:var(--t2)}
-@media(max-width:480px){.card{padding:28px 20px}h1{font-size:20px}}
+@media(max-width:480px){.card{padding:28px 20px}h2{font-size:20px}}
 `
 
+// writePage 统一风格的公共页面（首页/错误页）：
+// 品牌区（Logo + Emby Proxy + 副标题）与登录页结构一致；
+// icon 非空时展示状态图标（错误页），title 非空时展示页面标题。
 func writePage(w http.ResponseWriter, status int, iconClass, icon, title, desc, extraHTML string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>` + title + ` · Emby Proxy</title><style>` + pageCSS + `</style></head><body><div class="card"><div class="icon ` + iconClass + `">` + icon + `</div><h1>` + title + `</h1><div class="desc">` + desc + `</div>` + extraHTML + `<div class="foot"><span class="brand">Emby Proxy</span> · 路径反代</div></div></body></html>`
+	statusHTML, titleHTML := "", ""
+	if icon != "" {
+		statusHTML = `<div class="icon ` + iconClass + `">` + icon + `</div>`
+	}
+	if title != "" {
+		titleHTML = `<h2>` + title + `</h2>`
+	}
+	pageTitle := title
+	if pageTitle == "" {
+		pageTitle = "首页"
+	}
+	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><link rel="icon" href="/favicon.ico` + iconVer + `"><title>` + pageTitle + ` · Emby Proxy</title><style>` + pageCSS + `</style></head><body><div class="card"><div class="brand"><img class="brand-logo" src="/admin/logo.png" alt="Emby Proxy"><h1>Emby Proxy</h1><p>路径反代</p></div>` + statusHTML + titleHTML + `<div class="desc">` + desc + `</div>` + extraHTML + `<div class="foot">Emby Proxy · 路径反代</div></div></body></html>`
 	_, _ = w.Write([]byte(html))
 }
 
@@ -323,7 +345,7 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 <div class="ex"><div class="ex-t">访问格式</div><code>/https://域名:端口/路径</code></div>
 <div class="ex" style="margin-bottom:28px"><div class="ex-t">示例</div><code>/https://emby.example.com:8096/web/index.html</code></div>
 <div class="acts"><a class="btn b" href="/admin/">管理后台</a></div>`
-	writePage(w, http.StatusOK, "blue", "⚡", "Emby 路径反代",
+	writePage(w, http.StatusOK, "", "", "",
 		"按路径将请求转发到指定上游，可配置域名白名单、地区限制、限流与缓存。", extra)
 }
 
@@ -412,6 +434,7 @@ type Config struct {
 	AllowedUAs  []string `json:"allowed_uas"`  // UA 关键字白名单，空=不限制
 	EnableCache bool     `json:"enable_cache"` // 缓存 /Images/ 小图
 	CORS        bool     `json:"cors"`         // 是否添加宽松 CORS 头
+	PWA         bool     `json:"pwa"`          // 管理后台 PWA 模式（可安装到桌面、全屏运行、离线壳）
 }
 
 // rateLimitEntry：每 IP 限流窗口（Count/WindowStart 须 atomic 访问）。
@@ -437,18 +460,72 @@ func beijingHour(t time.Time) string { return t.In(beijingLoc).Format("15") }
 func beijingRFC3339(t time.Time) string { return t.In(beijingLoc).Format(time.RFC3339) }
 
 var (
-	db          *bolt.DB
-	dbPath      string
-	faviconData atomic.Pointer[[]byte] // 启动时后台预热，处理器只读，避免首次请求阻塞
-	cfgPtr      atomic.Pointer[Config]
-	proxyTr     = &switchTransport{}
-	listenMu    sync.Mutex
-	curLn       net.Listener
-	curPort     int
-	globalSrv   *http.Server
+	db         *bolt.DB
+	dbPath     string
+	faviconData atomic.Pointer[cachedIcon] // 启动时后台预热，处理器只读，避免首次请求阻塞
+	logoData    atomic.Pointer[cachedIcon] // 品牌 Logo（登录页/侧边栏）
+	icon192Data atomic.Pointer[cachedIcon] // PWA 192x192 图标
+	icon512Data atomic.Pointer[cachedIcon] // PWA 512x512 图标
+	cfgPtr     atomic.Pointer[Config]
+	proxyTr    = &switchTransport{}
+	listenMu   sync.Mutex
+	curLn      net.Listener
+	curPort    int
+	globalSrv  *http.Server
 
 	ipLimiters sync.Map
 )
+
+// ---------- 品牌图标资源（启动时预热，本地缓存后由 /admin/* 提供）----------
+const (
+	iconFaviconURL = "https://i.ibb.co/H9QXXb8/emby-rp-icon.jpg"   // 网页 favicon（32x32）
+	iconLogoURL    = "https://i.ibb.co/KxByc0q8/emby-rp-logo.png"  // 品牌 Logo（512x512）
+	icon192URL     = "https://i.ibb.co/84fwCqPj/emby-rp-logo-192.png" // PWA 192x192
+	icon512URL     = "https://i.ibb.co/RkTFtq4n/emby-rp-logo-512.png" // PWA 512x512
+)
+
+// cachedIcon 带正确 Content-Type 的图标缓存（favicon 为 jpeg，其余为 png）
+type cachedIcon struct {
+	data  []byte
+	ctype string
+}
+
+// fetchIcon 拉取远端图标；失败返回 nil（调用方回退 302 源站）
+func fetchIcon(url string) *cachedIcon {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		if strings.HasSuffix(strings.ToLower(url), ".jpg") || strings.HasSuffix(strings.ToLower(url), ".jpeg") {
+			ct = "image/jpeg"
+		} else {
+			ct = "image/png"
+		}
+	}
+	return &cachedIcon{data: data, ctype: ct}
+}
+
+// serveCachedIcon 输出预热缓存；未预热完成则 302 到源站，不阻塞请求
+func serveCachedIcon(w http.ResponseWriter, r *http.Request, p *atomic.Pointer[cachedIcon], fallbackURL string) {
+	if ic := p.Load(); ic != nil {
+		w.Header().Set("Content-Type", ic.ctype)
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, _ = w.Write(ic.data)
+		return
+	}
+	http.Redirect(w, r, fallbackURL, http.StatusFound)
+}
 
 // ---------- 图片缓存（仅 GET 且路径含 /Images/ 的小响应）----------
 // 双上限：条数 + 总字节；单条过大直接不入队。缓存键为完整请求 URL。
@@ -713,6 +790,9 @@ type DayStat struct {
 	Bytes     int64            `json:"bytes"`
 	BlockedCN int64            `json:"blocked_cn"`
 	BlockedWL int64            `json:"blocked_wl"`
+	BlockedBan int64            `json:"blocked_ban"`  // IP 黑名单拦截
+	BlockedRate int64           `json:"blocked_rate"` // 触发限流
+	BlockedUA int64            `json:"blocked_ua"`   // UA 不在白名单
 	Countries map[string]int64 `json:"countries,omitempty"` // 国家码 -> 请求数
 	IPs       map[string]int64 `json:"ips,omitempty"`       // IP -> 请求数
 	IPBytes   map[string]int64 `json:"ip_bytes,omitempty"`  // IP -> 流量
@@ -789,6 +869,9 @@ type Stats struct {
 	TotalBytes       int64               `json:"total_bytes"`
 	BlockedCN        int64               `json:"blocked_cn"`
 	BlockedWhitelist int64               `json:"blocked_whitelist"`
+	BlockedBan       int64               `json:"blocked_ban"`
+	BlockedRate      int64               `json:"blocked_rate"`
+	BlockedUA        int64               `json:"blocked_ua"`
 	LastProxyAt      string              `json:"last_proxy_at"`
 	CountryCounts    map[string]int64    `json:"country_counts"`
 	IPCounts         map[string]int64    `json:"ip_counts"`
@@ -940,6 +1023,9 @@ type statsMetaDisk struct {
 	TotalBytes       int64  `json:"total_bytes"`
 	BlockedCN        int64  `json:"blocked_cn"`
 	BlockedWhitelist int64  `json:"blocked_whitelist"`
+	BlockedBan       int64  `json:"blocked_ban"`
+	BlockedRate      int64  `json:"blocked_rate"`
+	BlockedUA        int64  `json:"blocked_ua"`
 	LastProxyAt      string `json:"last_proxy_at"`
 }
 
@@ -994,8 +1080,11 @@ func loadStats() {
 					stats.TodayBytes = m.TodayBytes
 					stats.TotalRequests = m.TotalRequests
 					stats.TotalBytes = m.TotalBytes
-					stats.BlockedCN = m.BlockedCN
-					stats.BlockedWhitelist = m.BlockedWhitelist
+				stats.BlockedCN = m.BlockedCN
+				stats.BlockedWhitelist = m.BlockedWhitelist
+				stats.BlockedBan = m.BlockedBan
+				stats.BlockedRate = m.BlockedRate
+				stats.BlockedUA = m.BlockedUA
 					stats.LastProxyAt = m.LastProxyAt
 				}
 			}
@@ -1070,8 +1159,9 @@ func loadStats() {
 	}
 	if migrated {
 		statsMu.Lock()
-		saveStatsLocked()
+		snap := marshalStatsLocked()
 		statsMu.Unlock()
+		persistStats(snap)
 		_ = db.Update(func(tx *bolt.Tx) error {
 			_ = tx.DeleteBucket([]byte("stats"))
 			return nil
@@ -1079,10 +1169,18 @@ func loadStats() {
 	}
 }
 
-func saveStatsLocked() {
-	if db == nil {
-		return
-	}
+// statsSnapshot 统计落盘快照：锁内序列化（纯内存、快）→ 锁外写盘（磁盘 IO）。
+// 原实现 db.Update 全程持 statsMu，慢盘时统计 worker 与 recordBlocked 全部阻塞，
+// 极端情况下 statChan 塞满导致丢实时数据。
+type statsSnapshot struct {
+	meta       []byte
+	blocks     []byte
+	dailyItems []struct{ key string; data []byte }
+	dailyKeys  map[string]struct{}
+}
+
+// marshalStatsLocked 持锁序列化统计快照（调用方必须已持有 statsMu）
+func marshalStatsLocked() *statsSnapshot {
 	meta := statsMetaDisk{
 		TodayDate:        stats.TodayDate,
 		TodayRequests:    stats.TodayRequests,
@@ -1091,45 +1189,69 @@ func saveStatsLocked() {
 		TotalBytes:       stats.TotalBytes,
 		BlockedCN:        stats.BlockedCN,
 		BlockedWhitelist: stats.BlockedWhitelist,
+		BlockedBan:       stats.BlockedBan,
+		BlockedRate:      stats.BlockedRate,
+		BlockedUA:        stats.BlockedUA,
 		LastProxyAt:      stats.LastProxyAt,
 	}
 	metaBytes, _ := json.Marshal(meta)
 	blockBytes, _ := json.Marshal(stats.Blocks)
+	snap := &statsSnapshot{meta: metaBytes, blocks: blockBytes, dailyKeys: map[string]struct{}{}}
+	for date, d := range stats.Daily {
+		if d == nil {
+			continue
+		}
+		b, err := json.Marshal(d)
+		if err != nil {
+			continue
+		}
+		snap.dailyItems = append(snap.dailyItems, struct{ key string; data []byte }{key: date, data: b})
+		snap.dailyKeys[date] = struct{}{}
+	}
+	return snap
+}
+
+// persistStats 锁外写盘（磁盘 IO 不阻塞统计）
+func persistStats(snap *statsSnapshot) {
+	if db == nil || snap == nil {
+		return
+	}
 	_ = db.Update(func(tx *bolt.Tx) error {
 		mb, err := tx.CreateBucketIfNotExists([]byte("stats_meta"))
 		if err != nil {
 			return err
 		}
-		if err := mb.Put([]byte("data"), metaBytes); err != nil {
+		if err := mb.Put([]byte("data"), snap.meta); err != nil {
 			return err
 		}
 		dbkt, err := tx.CreateBucketIfNotExists([]byte("stats_daily"))
 		if err != nil {
 			return err
 		}
-		// 先清掉已过期键（与内存一致）
+		// 先清掉已过期键（与快照一致）
 		_ = dbkt.ForEach(func(k, _ []byte) error {
-			if _, ok := stats.Daily[string(k)]; !ok {
+			if _, ok := snap.dailyKeys[string(k)]; !ok {
 				_ = dbkt.Delete(k)
 			}
 			return nil
 		})
-		for date, d := range stats.Daily {
-			if d == nil {
-				continue
-			}
-			b, err := json.Marshal(d)
-			if err != nil {
-				continue
-			}
-			_ = dbkt.Put([]byte(date), b)
+		for _, it := range snap.dailyItems {
+			_ = dbkt.Put([]byte(it.key), it.data)
 		}
 		bb, err := tx.CreateBucketIfNotExists([]byte("stats_blocks"))
 		if err != nil {
 			return err
 		}
-		return bb.Put([]byte("data"), blockBytes)
+		return bb.Put([]byte("data"), snap.blocks)
 	})
+}
+
+// saveStatsOnce 常规落盘入口：锁内序列化快照 → 释放锁 → 锁外写盘
+func saveStatsOnce() {
+	statsMu.Lock()
+	snap := marshalStatsLocked()
+	statsMu.Unlock()
+	persistStats(snap)
 }
 func startStatsSaver() {
 	go func() {
@@ -1137,8 +1259,9 @@ func startStatsSaver() {
 		for range t.C {
 			statsMu.Lock()
 			pruneStatsLocked()
-			saveStatsLocked()
+			snap := marshalStatsLocked()
 			statsMu.Unlock()
+			persistStats(snap)
 			geoCacheSave()
 			geoPrune()
 
@@ -1505,15 +1628,26 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	statsMu.Lock()
 	defer statsMu.Unlock()
 	day := dayOf(beijingDate(time.Now()))
-	reasonText := "目标域名未在白名单中"
-	if reason == "cn" {
+	// 五类拦截原因全部计数并展示到拦截记录（对应"安全与访问控制"各开关）：
+	// cn=地区限制 whitelist=域名白名单 ban=IP黑名单 rate_limit=限流 ua=UA白名单
+	switch reason {
+	case "cn":
 		stats.BlockedCN++
 		day.BlockedCN++
-		reasonText = "仅允许中国大陆 IP 访问"
-	} else {
+	case "ban":
+		stats.BlockedBan++
+		day.BlockedBan++
+	case "rate_limit":
+		stats.BlockedRate++
+		day.BlockedRate++
+	case "ua":
+		stats.BlockedUA++
+		day.BlockedUA++
+	default:
 		stats.BlockedWhitelist++
 		day.BlockedWL++
 	}
+	reasonText := blockReasonText(reason)
 	if country == "" {
 		country = "??"
 	}
@@ -1521,6 +1655,22 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	stats.Blocks = append(stats.Blocks, ev)
 	if len(stats.Blocks) > maxBlockEvents {
 		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
+	}
+}
+
+// blockReasonText 拦截原因中文描述（后端落盘 ReasonText，前端按 reason 实时渲染）
+func blockReasonText(reason string) string {
+	switch reason {
+	case "cn":
+		return "仅允许中国大陆 IP 访问"
+	case "ban":
+		return "IP 在黑名单中"
+	case "rate_limit":
+		return "请求超过限流阈值"
+	case "ua":
+		return "User-Agent 不在允许列表"
+	default:
+		return "目标域名未在白名单中"
 	}
 }
 
@@ -2151,7 +2301,7 @@ body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-
 <body>
 <div class="card">
   <div class="brand">
-    <div class="brand-icon">⚡</div>
+    <div class="brand-icon"><img src="/admin/logo.png" alt="Emby Proxy" style="width:46px;height:46px;border-radius:11px"></div>
     <h1>Emby Proxy</h1>
     <p>管理后台</p>
   </div>
@@ -2207,7 +2357,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
     });
     const data = await r.json().catch(()=>({}));
     if (!r.ok) {
-      errBox.textContent = data.error || '登录失败，请重试';
+      errBox.textContent = data.error || '登录失败，请稍后重试';
       errBox.classList.add('on');
       document.getElementById('captcha').value = '';
       loadCaptcha();
@@ -2215,7 +2365,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
     }
     location.href = '/admin/';
   } catch(err) {
-    errBox.textContent = '网络异常，请稍后重试';
+    errBox.textContent = '网络异常，无法连接服务器，请检查网络后重试';
     errBox.classList.add('on');
     loadCaptcha();
   } finally {
@@ -2473,11 +2623,11 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			msg := "暂时无法连接上游服务，请稍后重试。"
+			msg := "无法连接到上游服务，可能是上游服务器暂时不可用或网络波动，请稍后重试。"
 			if err != nil {
-				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "&lt;"), ">", "&gt;") + "</span>"
+				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">技术详情：" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "&lt;"), ">", "&gt;") + "</span>"
 			}
-			serveError(w, http.StatusBadGateway, "上游不可用", msg)
+			serveError(w, http.StatusBadGateway, "上游服务连接失败", msg)
 		},
 	}
 }
@@ -2485,6 +2635,308 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 type adminConfigResp struct {
 	Config
 	EffectivePort int `json:"effective_port"`
+}
+
+// ---------- PWA：manifest 与 Service Worker ----------
+// iconVer 图标资源版本参数：URL 带版本可强制浏览器/系统刷新顽固的 favicon 缓存。
+// 更换图标时递增版本号即可。
+const iconVer = "?v=3"
+
+// pwaHeadExtra 返回注入到 <head> 的图标/PWA 标签；关闭 PWA 时仅注入基本图标。
+func pwaHeadExtra(pwaOn bool) string {
+	s := "<link rel=\"icon\" href=\"/favicon.ico" + iconVer + "\">\n" +
+		"<link rel=\"apple-touch-icon\" href=\"/admin/icon-192.png" + iconVer + "\">\n"
+	if pwaOn {
+		s += "<link rel=\"manifest\" href=\"/admin/manifest.webmanifest\">\n" +
+			"<meta name=\"theme-color\" content=\"#3b82f6\">\n" +
+			"<meta name=\"mobile-web-app-capable\" content=\"yes\">\n" +
+			"<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n" +
+			"<meta name=\"apple-mobile-web-app-status-bar-style\" content=\"default\">\n" +
+			"<meta name=\"apple-mobile-web-app-title\" content=\"Emby Proxy\">\n"
+	}
+	return s
+}
+
+// pwaBodyExtra 返回注入到 </body> 前的 SW 注册脚本；关闭 PWA 时为空。
+func pwaBodyExtra(pwaOn bool) string {
+	if !pwaOn {
+		return ""
+	}
+	return "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/admin/sw.js').catch(function(){})})}</script>"
+}
+
+// pwaManifestJSON 生成 Web App Manifest（start_url 指向秒开的静态启动页）。
+func pwaManifestJSON() []byte {
+	m := map[string]any{
+		"name":             "Emby Proxy 管理后台",
+		"short_name":       "Emby Proxy",
+		"description":      "Emby 路径反代管理控制台",
+		"start_url":        "/admin/splash",
+		"scope":            "/admin/",
+		"display":          "standalone",
+		"orientation":      "any",
+		"background_color": "#f8fafc",
+		"theme_color":      "#3b82f6",
+		"icons": []map[string]any{
+			{"src": "/admin/icon-192.png" + iconVer, "sizes": "192x192", "type": "image/png", "purpose": "any"},
+			{"src": "/admin/icon-512.png" + iconVer, "sizes": "512x512", "type": "image/png", "purpose": "any"},
+			{"src": "/admin/icon-512.png" + iconVer, "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+		},
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	return b
+}
+
+// splashHTML PWA 启动页：纯静态、极轻量（无外链脚本、无 API 阻塞渲染），
+// 由 SW 预缓存后秒开；页面显示后并行预热 Chart.js 与登录态检测，就绪即跳转。
+const splashHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="icon" href="/favicon.ico?v=3">
+<title>启动中 · Emby Proxy</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100dvh;background:#f8fafc;display:flex;align-items:center;justify-content:center;font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{text-align:center}
+.logo{width:72px;height:72px;border-radius:18px;display:block;margin:0 auto 18px;box-shadow:0 6px 20px -6px rgba(15,23,42,.15)}
+h1{font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-.3px}
+.sub{font-size:13px;color:#94a3b8;margin-top:4px}
+.spinner{width:30px;height:30px;margin:26px auto 0;border:3px solid #e2e8f0;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.tip{font-size:12px;color:#94a3b8;margin-top:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <img class="logo" src="/admin/logo.png" alt="Emby Proxy">
+  <h1>Emby Proxy</h1>
+  <div class="sub">管理控制台</div>
+  <div class="spinner"></div>
+  <div class="tip" id="tip">正在加载…</div>
+</div>
+<script>
+/* 启动流程：
+ * 1. 页面本身零网络依赖（Logo/HTML 均在 SW 预缓存），立即渲染；
+ * 2. 后台并行预热 Chart.js（SW cache-first，命中即完成）与登录态探测；
+ * 3. 全部就绪或超时（2.5s）后跳转：已登录 → /admin/，未登录 → /admin/login。
+ * 跳转用 replace，避免后退键回到启动页。 */
+(function () {
+  var t0 = Date.now();
+  var tip = document.getElementById('tip');
+  var CHART_URL = 'https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
+  function done() {
+    var wait = Math.max(0, 400 - (Date.now() - t0)); // 最短展示 400ms，避免闪烁
+    setTimeout(function () {
+      // 探测登录态：config 需要会话，401/302 → 登录页
+      fetch('/admin/api/config', { cache: 'no-store' }).then(function (r) {
+        location.replace(r.ok ? '/admin/' : '/admin/login');
+      }).catch(function () {
+        location.replace('/admin/');
+      });
+    }, wait);
+  }
+  // 预热 Chart.js：SW 命中缓存时立即完成；首次访问走网络，超时不阻塞跳转
+  var warm;
+  if (typeof fetch !== 'undefined') {
+    warm = fetch(CHART_URL, { mode: 'no-cors', cache: 'force-cache' }).catch(function () {});
+  } else {
+    warm = Promise.resolve();
+  }
+  var timeout = new Promise(function (res) { setTimeout(res, 2500); });
+  Promise.race([warm, timeout]).then(function () {
+    tip.textContent = '即将进入…';
+    done();
+  });
+})();
+</script>
+</body>
+</html>
+`
+
+// swSource 管理后台 Service Worker：
+//   · 预缓存应用壳（后台页 + 登录页 + 图标）
+//   · 导航请求 stale-while-revalidate：缓存即时返回（PWA 秒开），后台静默更新
+//   · Chart.js 等 CDN 脚本运行时缓存（cache-first），二次访问零网络等待
+//   · /admin/api/* 一律直连网络，绝不缓存（保证数据实时性）
+const swSource = `const CACHE = 'emby-proxy-admin-v4';
+const SHELL = ['/admin/splash', '/admin/', '/admin/login', '/admin/logo.png?v=3', '/admin/icon-192.png?v=3', '/admin/icon-512.png?v=3'];
+self.addEventListener('install', function (e) {
+  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }).then(function () { return self.skipWaiting(); }));
+});
+self.addEventListener('activate', function (e) {
+  e.waitUntil(caches.keys().then(function (ks) {
+    return Promise.all(ks.filter(function (k) { return k !== CACHE; }).map(function (k) { return caches.delete(k); }));
+  }).then(function () { return self.clients.claim(); }));
+});
+function cachePut(req, res) {
+  var cp = res.clone();
+  caches.open(CACHE).then(function (c) { c.put(req, cp); });
+}
+self.addEventListener('fetch', function (e) {
+  if (e.request.method !== 'GET') return;
+  var url;
+  try { url = new URL(e.request.url); } catch (err) { return; }
+  // Chart.js 等静态 CDN 资源：cache-first，命中即零网络等待
+  if (url.origin !== location.origin) {
+    if (url.hostname === 'cdn.bootcdn.net') {
+      e.respondWith(caches.match(e.request).then(function (hit) {
+        if (hit) return hit;
+        return fetch(e.request).then(function (res) { cachePut(e.request, res); return res; });
+      }));
+    }
+    return;
+  }
+  if (url.pathname.indexOf('/admin/api/') === 0) return;
+  if (url.pathname === '/admin/sw.js' || url.pathname === '/admin/manifest.webmanifest') return;
+  if (e.request.mode === 'navigate') {
+    // stale-while-revalidate：有缓存立即返回（秒开），同时后台拉最新版供下次使用；
+    // 无缓存时走网络并顺手缓存；离线且无缓存时回退应用壳
+    e.respondWith(caches.match(e.request).then(function (hit) {
+      if (hit) {
+        fetch(e.request).then(function (res) { if (res && res.ok) cachePut(e.request, res); }).catch(function () {});
+        return hit;
+      }
+      return fetch(e.request).then(function (res) {
+        if (res && res.ok) cachePut(e.request, res);
+        return res;
+      }).catch(function () {
+        return caches.match('/admin/').then(function (shell) {
+          return shell || new Response('当前离线，请连接网络后重试', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+        });
+      });
+    }));
+    return;
+  }
+  e.respondWith(caches.match(e.request).then(function (hit) {
+    if (hit) return hit;
+    return fetch(e.request).then(function (res) {
+      if (res.ok) cachePut(e.request, res);
+      return res;
+    });
+  }));
+});
+`
+
+// ---------- gzip 压缩中间件 ----------
+// 仅用于管理后台路由（HTML ~80KB / JSON 统计可达 MB 级，压缩后传输量降 70%+）。
+// 代理流量（视频流等）不经过本中间件；WS 升级与图片等不可压缩类型自动跳过。
+var gzipWriterPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+
+// gzipCompressible 是否为可压缩类型
+func gzipCompressible(ct string) bool {
+	ct = strings.ToLower(ct)
+	for _, p := range []string{"text/", "application/json", "application/javascript", "application/manifest", "image/svg"} {
+		if strings.HasPrefix(ct, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// gzipResponseWriter 惰性压缩：首个 Write/WriteHeader 时按 Content-Type 决定
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz      *gzip.Writer
+	decided bool // 已决定是否压缩
+	gzOn    bool // 实际启用压缩
+}
+
+func (g *gzipResponseWriter) WriteHeader(code int) {
+	if !g.decided {
+		g.decided = true
+		// 处理器已自行输出压缩内容（预压缩缓存）则直接透传，避免二次压缩
+		if gzipCompressible(g.Header().Get("Content-Type")) && g.Header().Get("Content-Encoding") == "" {
+			h := g.Header()
+			h.Set("Content-Encoding", "gzip")
+			h.Del("Content-Length")
+			h.Add("Vary", "Accept-Encoding")
+			g.gz.Reset(g.ResponseWriter)
+			g.gzOn = true
+		}
+	}
+	g.ResponseWriter.WriteHeader(code)
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	if !g.decided {
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.gzOn {
+		return g.gz.Write(b)
+	}
+	return g.ResponseWriter.Write(b)
+}
+
+// Flush 流式响应透传（压缩时先 flush gzip 缓冲）
+func (g *gzipResponseWriter) Flush() {
+	if g.gzOn {
+		_ = g.gz.Flush()
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack WebSocket 升级透传（升级后数据绕过 gzip 直写底层连接）
+func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := g.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer 不支持 Hijack")
+	}
+	g.decided = true
+	g.gzOn = false
+	return h.Hijack()
+}
+
+// gzipMiddleware 包装管理后台处理器：客户端支持且非升级请求时启用压缩
+func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || r.Header.Get("Upgrade") != "" {
+			next(w, r)
+			return
+		}
+		gz := gzipWriterPool.Get().(*gzip.Writer)
+		gw := &gzipResponseWriter{ResponseWriter: w, gz: gz}
+		next(gw, r)
+		if gw.gzOn {
+			_ = gz.Close() // 写入 gzip 尾部
+			gz.Reset(io.Discard)
+		}
+		gzipWriterPool.Put(gz)
+	}
+}
+
+// ---------- 预压缩 HTML 缓存 ----------
+// 后台/登录/启动页内容固定（仅随 PWA 开关产生 2 个变体），没必要每次请求都 gzip 78KB；
+// 首次请求时压缩并缓存，后续直接写字节，省去每请求 ~2-3ms CPU。
+var precompressedHTML sync.Map // key: 变体名 -> []byte（gzip 后）
+
+// serveHTMLPrecompressed 输出（预压缩缓存的）HTML：客户端支持 gzip 时命中缓存直写。
+func serveHTMLPrecompressed(w http.ResponseWriter, r *http.Request, variant, html, contentType, cacheControl string) {
+	w.Header().Set("Content-Type", contentType)
+	if cacheControl != "" {
+		w.Header().Set("Cache-Control", cacheControl)
+	}
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		var data []byte
+		if v, ok := precompressedHTML.Load(variant); ok {
+			data = v.([]byte)
+		} else {
+			var buf bytes.Buffer
+			gz := gzip.NewWriter(&buf)
+			_, _ = gz.Write([]byte(html))
+			_ = gz.Close()
+			data = buf.Bytes()
+			precompressedHTML.Store(variant, data)
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		_, _ = w.Write(data)
+		return
+	}
+	_, _ = w.Write([]byte(html))
 }
 
 // adminHandler 注册 /admin 下全部路由（登录页、API、静态后台页）。
@@ -2496,9 +2948,17 @@ func adminHandler() http.HandlerFunc {
 			http.Redirect(w, r, "/admin/", http.StatusFound)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte(loginHTML))
+		pwaOn := currentCfg().PWA
+		html := strings.Replace(string(loginHTML), "<head>", "<head>\n"+pwaHeadExtra(pwaOn), 1)
+		if extra := pwaBodyExtra(pwaOn); extra != "" {
+			html = strings.Replace(html, "</body>", extra+"</body>", 1)
+		}
+		// 按 PWA 开关两个变体做预压缩缓存（登录页内容固定，无需每次压缩）
+		variant := "login-pwa-off"
+		if pwaOn {
+			variant = "login-pwa-on"
+		}
+		serveHTMLPrecompressed(w, r, variant, html, "text/html; charset=utf-8", "no-store")
 	})
 	mux.HandleFunc("/admin/api/captcha", func(w http.ResponseWriter, r *http.Request) {
 		id, _, svg := generateCaptchaSVG()
@@ -2509,7 +2969,7 @@ func adminHandler() http.HandlerFunc {
 	})
 	mux.HandleFunc("/admin/api/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "请求方法不支持", http.StatusMethodNotAllowed)
+			http.Error(w, "请求方法不支持，请刷新页面后重新登录", http.StatusMethodNotAllowed)
 			return
 		}
 		var req struct {
@@ -2521,19 +2981,19 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"请求参数无效"}`))
+			_, _ = w.Write([]byte(`{"error":"提交的数据格式有误，请刷新页面后重新登录"}`))
 			return
 		}
 		if !verifyCaptcha(req.CaptchaID, req.Captcha) {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"error":"验证码错误或已过期，请刷新后重试"}`))
+			_, _ = w.Write([]byte(`{"error":"验证码不正确或已过期，点击图片可刷新验证码后重试"}`))
 			return
 		}
 		u, p := getAdminCred()
 		if subtle.ConstantTimeCompare([]byte(req.Username), []byte(u)) != 1 ||
 			subtle.ConstantTimeCompare([]byte(req.Password), []byte(p)) != 1 {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"error":"用户名或密码不正确"}`))
+			_, _ = w.Write([]byte(`{"error":"用户名或密码不正确，请注意大小写；忘记密码可在服务器上重置"}`))
 			return
 		}
 		tok := createSession()
@@ -2552,20 +3012,20 @@ func adminHandler() http.HandlerFunc {
 	})
 	mux.HandleFunc("/admin/api/save", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "不支持", http.StatusMethodNotAllowed)
+			http.Error(w, "请求方法不支持，请刷新页面后重试", http.StatusMethodNotAllowed)
 			return
 		}
 		// 复用 Config 结构体（与 saveReq 字段完全一致，去掉重复定义）
 		var req Config
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "参数错误", http.StatusBadRequest)
+			http.Error(w, "提交的配置格式有误，请检查各项输入后重新保存", http.StatusBadRequest)
 			return
 		}
 		req.GeoAPIURL = strings.TrimSpace(req.GeoAPIURL)
 		oldCfg := currentCfg()
 		newCfg := &req
 		if err := saveConfig(newCfg); err != nil {
-			http.Error(w, "保存失败", http.StatusInternalServerError)
+			http.Error(w, "配置保存失败，可能是磁盘写入异常，请稍后重试", http.StatusInternalServerError)
 			return
 		}
 		cfgPtr.Store(newCfg)
@@ -2575,7 +3035,7 @@ func adminHandler() http.HandlerFunc {
 				// 端口切换失败：回滚配置。Transport 与配置无关，无需重建。
 				cfgPtr.Store(oldCfg)
 				_ = saveConfig(oldCfg)
-				http.Error(w, "端口监听失败", http.StatusBadRequest)
+				http.Error(w, "新端口 "+strconv.Itoa(newCfg.Port)+" 监听失败，可能被其他程序占用或无权限；已自动恢复为原端口 "+strconv.Itoa(oldCfg.Port), http.StatusBadRequest)
 				return
 			}
 		}
@@ -2583,25 +3043,35 @@ func adminHandler() http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
 	})
 	mux.HandleFunc("/admin/api/traffic", func(w http.ResponseWriter, r *http.Request) {
+		// slim=1 轻量模式：概览页 5 秒轮询专用——trend 只含每日汇总（不带分时/主机/IP/国家明细），
+		// 避免每次轮询都序列化/传输全量历史明细（长周期下可达 MB 级）；流量页用完整模式。
+		slim := r.URL.Query().Get("slim") == "1"
 		w.Header().Set("Content-Type", "application/json")
 		statsMu.Lock()
-		ips := copyInt64Map(stats.IPCounts)
-		if ips == nil {
-			ips = map[string]int64{}
-		}
-		ipBytes := copyInt64Map(stats.IPBytes)
-		if ipBytes == nil {
-			ipBytes = map[string]int64{}
-		}
-		ctry := copyInt64Map(stats.CountryCounts)
-		if ctry == nil {
-			ctry = map[string]int64{}
+		var ips, ipBytes, ctry map[string]int64
+		var uniqueIPs int
+		if slim {
+			uniqueIPs = len(stats.IPCounts)
+		} else {
+			ips = copyInt64Map(stats.IPCounts)
+			if ips == nil {
+				ips = map[string]int64{}
+			}
+			ipBytes = copyInt64Map(stats.IPBytes)
+			if ipBytes == nil {
+				ipBytes = map[string]int64{}
+			}
+			ctry = copyInt64Map(stats.CountryCounts)
+			if ctry == nil {
+				ctry = map[string]int64{}
+			}
 		}
 
 		type TrendItem struct {
 			Date      string           `json:"date"`
 			Requests  int64            `json:"requests"`
 			Bytes     int64            `json:"bytes"`
+			Blocked   int64            `json:"blocked"` // 当日全部拦截（五种原因之和）
 			BlockedCN int64            `json:"blocked_cn"`
 			BlockedWL int64            `json:"blocked_whitelist"`
 			Hours     map[string]int64 `json:"hours,omitempty"`
@@ -2616,6 +3086,15 @@ func adminHandler() http.HandlerFunc {
 			if d == nil {
 				continue
 			}
+			if slim {
+				// 轻量模式：只带每日汇总数字，跳过全部明细复制（锁内 O(天) 而非 O(全明细)）
+				trend = append(trend, TrendItem{
+					Date: k, Requests: d.Requests, Bytes: d.Bytes,
+					Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
+					BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
+				})
+				continue
+			}
 			ensureDayMaps(d)
 			for hk, hv := range d.Hosts {
 				hostAll[hk] += hv
@@ -2628,12 +3107,13 @@ func adminHandler() http.HandlerFunc {
 			pruneTopN(ipsCopy, 100)
 			pruneTopN(ctryCopy, 50)
 			pruneTopN(hostsCopy, 50)
-			trend = append(trend, TrendItem{
-				Date: k, Requests: d.Requests, Bytes: d.Bytes,
-				BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
-				Hours: hoursCopy, HourBytes: hourBytesCopy, Hosts: hostsCopy,
-				IPs: ipsCopy, Countries: ctryCopy,
-			})
+		trend = append(trend, TrendItem{
+			Date: k, Requests: d.Requests, Bytes: d.Bytes,
+			Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
+			BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
+			Hours: hoursCopy, HourBytes: hourBytesCopy, Hosts: hostsCopy,
+			IPs: ipsCopy, Countries: ctryCopy,
+		})
 		}
 		sort.Slice(trend, func(i, j int) bool { return trend[i].Date < trend[j].Date })
 
@@ -2653,19 +3133,30 @@ func adminHandler() http.HandlerFunc {
 		}
 		reqs, byts := stats.TotalRequests, stats.TotalBytes
 		cn, wl := stats.BlockedCN, stats.BlockedWhitelist
+		ban, rate, ua := stats.BlockedBan, stats.BlockedRate, stats.BlockedUA
 		pruneTopN(hostAll, 50)
 		statsMu.Unlock()
 
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"total_requests": reqs, "total_bytes": byts,
 			"today_date": today, "requests": reqs, "bytes": byts,
 			"blocked_cn": cn, "blocked_whitelist": wl,
-			"ip_counts": ips, "ip_bytes": ipBytes, "country_counts": ctry, "country_labels": labels,
-			"host_counts": hostAll, // 全周期上游主机汇总，便于后续排行页
+			"blocked_ban": ban, "blocked_rate": rate, "blocked_ua": ua,
+			"blocked_total": cn + wl + ban + rate + ua,
 			"today_requests": todayReqs, "today_bytes": todayBytes, "trend": trend,
 			"uptime_sec":   int64(time.Since(startedAt).Seconds()),
 			"stat_dropped": statDropped.Load(),
-		})
+		}
+		if slim {
+			resp["unique_ips"] = uniqueIPs
+		} else {
+			resp["ip_counts"] = ips
+			resp["ip_bytes"] = ipBytes
+			resp["country_counts"] = ctry
+			resp["country_labels"] = labels
+			resp["host_counts"] = hostAll // 全周期上游主机汇总，便于后续排行页
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/admin/api/live", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2688,7 +3179,7 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if !liveKill(id) {
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"ok":false,"error":"连接不存在或已结束"}`))
+			_, _ = w.Write([]byte(`{"ok":false,"error":"该连接已结束或不存在，可能刚刚已被断开"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -2696,7 +3187,7 @@ func adminHandler() http.HandlerFunc {
 	// WebSocket 实时推送（约 500ms 一帧），失败时前端回退到 HTTP 轮询
 	mux.HandleFunc("/admin/api/live/ws", func(w http.ResponseWriter, r *http.Request) {
 		if !validSession(getSessionToken(r)) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			http.Error(w, "请先登录后再操作", http.StatusUnauthorized)
 			return
 		}
 		upgrader := websocket.Upgrader{
@@ -2753,13 +3244,25 @@ func adminHandler() http.HandlerFunc {
 		}
 	})
 	mux.HandleFunc("/admin/api/blocks", func(w http.ResponseWriter, r *http.Request) {
+		// limit 控制返回条数（最新 N 条）：概览轮询只需几条，避免每次全量序列化/传输
+		// 最多 5000 条历史；默认 1000，limit=0 表示全部
+		limit := 1000
+		if s := r.URL.Query().Get("limit"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+				limit = n
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		statsMu.Lock()
 		n := len(stats.Blocks)
+		total := n
+		if limit > 0 && n > limit {
+			n = limit
+		}
 		items := make([]map[string]any, n)
-		for i := range stats.Blocks {
+		for i := range n {
 			// 倒序：最新在前
-			src := stats.Blocks[n-1-i]
+			src := stats.Blocks[total-1-i]
 			items[i] = map[string]any{
 				"time": src.Time, "ip": src.IP, "country": src.Country,
 				"country_name": countryName(src.Country),
@@ -2767,12 +3270,12 @@ func adminHandler() http.HandlerFunc {
 			}
 		}
 		statsMu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"total": n, "items": items})
+		_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "returned": len(items), "items": items})
 	})
 	mux.HandleFunc("/admin/api/ip-detail", func(w http.ResponseWriter, r *http.Request) {
 		ip := strings.TrimSpace(r.URL.Query().Get("ip"))
 		if ip == "" || net.ParseIP(ip) == nil {
-			http.Error(w, "IP 无效", http.StatusBadRequest)
+			http.Error(w, "IP 地址格式无效，请输入合法的 IPv4/IPv6 地址", http.StatusBadRequest)
 			return
 		}
 		code, name := ipLabelSync(ip)
@@ -2820,12 +3323,12 @@ func adminHandler() http.HandlerFunc {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		// 新密码做基本强度校验（原实现允许空密码，会把后台门户大开）
 		if len(req.NewPass) < 6 {
-			http.Error(w, "新密码至少 6 位", http.StatusBadRequest)
+			http.Error(w, "新密码至少需要 6 位，请重新输入", http.StatusBadRequest)
 			return
 		}
 		_, pass := getAdminCred()
 		if subtle.ConstantTimeCompare([]byte(req.OldPass), []byte(pass)) != 1 {
-			http.Error(w, "当前密码不正确", http.StatusForbidden)
+			http.Error(w, "当前密码不正确，修改未生效，请核对后重试", http.StatusForbidden)
 			return
 		}
 		_ = saveAdminPassFile(req.NewPass)
@@ -2835,8 +3338,9 @@ func adminHandler() http.HandlerFunc {
 	mux.HandleFunc("/admin/api/clear-stats", func(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
 		stats = emptyStats()
-		saveStatsLocked()
+		snap := marshalStatsLocked()
 		statsMu.Unlock()
+		persistStats(snap)
 		// 物理清空分桶，避免残留日键
 		if db != nil {
 			_ = db.Update(func(tx *bolt.Tx) error {
@@ -2847,8 +3351,9 @@ func adminHandler() http.HandlerFunc {
 				return nil
 			})
 			statsMu.Lock()
-			saveStatsLocked()
+			snap := marshalStatsLocked()
 			statsMu.Unlock()
+			persistStats(snap)
 		}
 		w.Write([]byte(`{"ok":true}`))
 	})
@@ -2876,16 +3381,49 @@ func adminHandler() http.HandlerFunc {
 		}
 		http.Redirect(w, r, "https://flagcdn.com/w40/"+code+".png", http.StatusFound)
 	})
+	// ---------- PWA 静态资源（免鉴权：图标/清单/Worker 不含敏感信息，且安装时浏览器可能无 Cookie 拉取）----------
+	mux.HandleFunc("/admin/logo.png", func(w http.ResponseWriter, r *http.Request) {
+		serveCachedIcon(w, r, &logoData, iconLogoURL)
+	})
+	mux.HandleFunc("/admin/icon-192.png", func(w http.ResponseWriter, r *http.Request) {
+		serveCachedIcon(w, r, &icon192Data, icon192URL)
+	})
+	mux.HandleFunc("/admin/icon-512.png", func(w http.ResponseWriter, r *http.Request) {
+		serveCachedIcon(w, r, &icon512Data, icon512URL)
+	})
+	mux.HandleFunc("/admin/manifest.webmanifest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(pwaManifestJSON())
+	})
+	mux.HandleFunc("/admin/sw.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write([]byte(swSource))
+	})
+	mux.HandleFunc("/admin/splash", func(w http.ResponseWriter, r *http.Request) {
+		// 预压缩缓存直写；允许 SW 缓存实现秒开，版本随二进制更新
+		serveHTMLPrecompressed(w, r, "splash", splashHTML, "text/html; charset=utf-8", "")
+	})
 	mux.HandleFunc("/admin/api/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		html := strings.Replace(string(adminHTML), "<head>", "<head>\n<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/png\">\n", 1)
-		_, _ = w.Write([]byte(html))
+		pwaOn := currentCfg().PWA
+		html := strings.Replace(string(adminHTML), "<head>", "<head>\n"+pwaHeadExtra(pwaOn), 1)
+		if extra := pwaBodyExtra(pwaOn); extra != "" {
+			html = strings.Replace(html, "</body>", extra+"</body>", 1)
+		}
+		// 按 PWA 开关两个变体做预压缩缓存（78KB 页面无需每请求压缩）
+		variant := "admin-pwa-off"
+		if pwaOn {
+			variant = "admin-pwa-on"
+		}
+		serveHTMLPrecompressed(w, r, variant, html, "text/html; charset=utf-8", "no-cache")
 	})
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if path == "/admin/login" || path == "/admin/api/captcha" || path == "/admin/api/login" || path == "/admin/api/logout" {
+		if path == "/admin/login" || path == "/admin/api/captcha" || path == "/admin/api/login" || path == "/admin/api/logout" ||
+			path == "/admin/splash" || path == "/admin/logo.png" || path == "/admin/icon-192.png" || path == "/admin/icon-512.png" ||
+			path == "/admin/manifest.webmanifest" || path == "/admin/sw.js" {
 			mux.ServeHTTP(w, r)
 			return
 		}
@@ -2958,38 +3496,29 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	startLiveRateSampler()
 	startStatsSaver()
 	detectSelfPublicIP()
-	// favicon 改为启动时后台预热：
+	// 图标改为启动时后台预热（favicon/Logo/PWA 图标）：
 	// 原实现 faviconOnce.Do 在【第一个请求的处理器里】同步外网 GET（4s 超时），
 	// 会把第一个请求卡住数秒。现在启动即拉取，处理器直接读内存。
 	go func() {
-		resp, err := http.Get("https://i.ibb.co/99QbT1X3/icons8-64.png")
-		if err == nil && resp.StatusCode == 200 {
-			if data, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)); err == nil {
-				faviconData.Store(&data)
-			}
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
+		faviconData.Store(fetchIcon(iconFaviconURL))
 	}()
-	defer func() { statsMu.Lock(); saveStatsLocked(); statsMu.Unlock(); geoCacheSave() }()
+	go func() {
+		logoData.Store(fetchIcon(iconLogoURL))
+		icon192Data.Store(fetchIcon(icon192URL))
+		icon512Data.Store(fetchIcon(icon512URL))
+	}()
+	defer func() { saveStatsOnce(); geoCacheSave() }()
 
 	proxy := buildProxy(proxyTr)
 	// 代理主处理：静态资源 → ACL → 地区 → 解析目标 → 白名单 → 可选缓存 → 反代并记流量
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.png" || r.URL.Path == "/favicon.svg" {
 			// 读启动时预热的缓存；未预热完成则直接 302 到源站，不阻塞请求
-			if p := faviconData.Load(); p != nil {
-				w.Header().Set("Content-Type", "image/png")
-				w.Header().Set("Cache-Control", "public, max-age=86400")
-				_, _ = w.Write(*p)
-				return
-			}
-			http.Redirect(w, r, "https://i.ibb.co/99QbT1X3/icons8-64.png", http.StatusFound)
+			serveCachedIcon(w, r, &faviconData, iconFaviconURL)
 			return
 		}
 		if isBuiltinAssetPath(r.URL.Path) {
-			serveError(w, http.StatusNotFound, "页面不存在", "未找到该资源，请检查地址后重试。")
+			serveError(w, http.StatusNotFound, "页面不存在", "您访问的地址没有对应的页面，请检查链接是否完整、有无多余或缺失的字符。")
 			return
 		}
 		if r.URL.Path == "/" || r.URL.Path == "" {
@@ -2999,18 +3528,21 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		ip := getClientIP(r)
 		c := currentCfg()
 
-		// 黑名单 & 限流 & UA（ACL 已在保存配置时预编译）
+		// 黑名单 & 限流 & UA（ACL 已在保存配置时预编译）；拦截全部记入拦截记录
 		clientIP := net.ParseIP(ip)
 		if isBannedIP(ip, clientIP) {
-			serveError(w, http.StatusForbidden, "访问被拒绝", "当前 IP 已在黑名单中，无法继续访问。")
+			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), "ban", r.UserAgent())
+			serveError(w, http.StatusForbidden, "访问被拒绝", "您的 IP（"+ip+"）已被管理员加入黑名单。如果这是误封，请联系管理员解除。")
 			return
 		}
 		if !checkRateLimit(ip, c.RateLimit) {
-			serveError(w, http.StatusTooManyRequests, "请求过于频繁", "已超过限流阈值，请稍后再试。")
+			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), "rate_limit", r.UserAgent())
+			serveError(w, http.StatusTooManyRequests, "操作太频繁了", "您在短时间内发送了太多请求，已触发限流保护。请等待约 1 分钟后再试。")
 			return
 		}
 		if !uaAllowed(r.UserAgent()) {
-			serveError(w, http.StatusForbidden, "客户端受限", "当前 User-Agent 不在允许列表中。")
+			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), "ua", r.UserAgent())
+			serveError(w, http.StatusForbidden, "客户端不受支持", "您使用的应用（User-Agent）不在允许列表中。请使用 Emby 客户端等已授权应用访问，或联系管理员调整设置。")
 			return
 		}
 
@@ -3040,7 +3572,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 					rebuildACL(&nc)
 				}(ip)
 			}
-			serveError(w, http.StatusForbidden, "地区限制", "仅允许中国大陆 IP 访问。")
+			serveError(w, http.StatusForbidden, "地区访问受限", "本服务仅面向中国大陆网络开放，检测到您的 IP 来自其他地区，因此无法访问。")
 			return
 		}
 
@@ -3051,7 +3583,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		if !whitelistMatch(c.Whitelist, target.Host) {
 			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent())
-			serveError(w, http.StatusForbidden, "域名未授权", "目标域名不在白名单中，请联系管理员。")
+			serveError(w, http.StatusForbidden, "目标站点未授权", "您要访问的目标域名未在白名单中。请确认地址是否正确；若该站点应被允许，请联系管理员将其加入白名单。")
 			return
 		}
 
@@ -3102,13 +3634,15 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	})
 
 	adminSrv := adminHandler()
+	// 管理后台全部走 gzip（HTML/JSON 压缩 70%+，WS 与图片自动跳过）
+	adminGz := gzipMiddleware(adminSrv)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/admin" {
 			http.Redirect(w, r, "/admin/", http.StatusFound)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/admin/") {
-			adminSrv.ServeHTTP(w, r)
+			adminGz.ServeHTTP(w, r)
 			return
 		}
 		proxyHandler(w, r)
@@ -3154,7 +3688,7 @@ GO_SOURCE
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>管理后台 · Emby Proxy</title>
-<script src="https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script defer src="https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--mono:Consolas,monospace;--r:12px}
@@ -3245,6 +3779,13 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .hint{font-size:12.5px;color:var(--t3);margin-top:8px;line-height:1.6}
 .emp{padding:48px 20px;text-align:center;color:var(--t3);font-size:14px}
 .emp b{display:block;color:var(--t2);font-size:15px;margin-bottom:6px}
+/* 拦截原因标签：五类拦截（地区/白名单/黑名单/限流/UA）统一配色 */
+.pill{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:1.4;white-space:nowrap}
+.pill.pc{background:#fff7ed;color:#c2410c;border:1px solid #fed7aa}
+.pill.pw{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.pill.pb{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
+.pill.pl{background:#fdf4ff;color:#a21caf;border:1px solid #f5d0fe}
+.pill.pu{background:#ecfeff;color:#0e7490;border:1px solid #a5f3fc}
 .flg{width:22px;height:16px;object-fit:cover;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.08);background:#e2e8f0;margin-right:8px;vertical-align:middle}
 /* 分段器 */
 .flt{display:inline-flex;background:#f1f5f9;padding:4px;border-radius:12px;border:1px solid var(--bd);gap:4px;align-items:center;flex-wrap:wrap}
@@ -3377,7 +3918,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <button class="sb-mask" id="sbMask" aria-label="关闭菜单"></button>
 <aside class="sb" id="sb">
 <div class="sb-h" style="display:flex;align-items:center">
-  <div class="sb-brand-icon">⚡</div>
+  <div class="sb-brand-icon"><img src="/admin/logo.png" alt="Emby Proxy" style="width:30px;height:30px;border-radius:7px"></div>
   <div class="sb-brand"><div class="sb-t">Emby Proxy</div><div class="sb-sub">管理控制台</div></div>
 </div>
 <ul class="nav">
@@ -3411,7 +3952,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="sg">
 <div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">流量 <b id="ovBytes">0 B</b></div></div>
 <div class="stc g"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>平均每日请求</div><div class="sv" id="ovAvgReq">-</div><div class="ss">日均流量 <b id="ovAvgBytes">0 B</b></div></div>
-<div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">地区限制 <b id="ovBlockedCN">0</b></div></div>
+<div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">全部拦截类型</div></div>
 <div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
 </div>
 <div class="g3">
@@ -3498,8 +4039,8 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </section>
 <section id="blocks" class="pg">
 <div class="card">
-<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区或白名单策略被拒绝的请求</div></div></div>
-<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th></tr></thead><tbody id="blockTable"></tbody></table></div>
+<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区、白名单、限流或 UA 策略被拒绝的请求 · 每 5 秒自动刷新</div></div></div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th></tr></thead><tbody id="blockTable"></tbody></table></div>
 </div>
 </section>
 <section id="settings" class="pg">
@@ -3510,6 +4051,8 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
       <div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center"><input id="portInput" class="inp m" type="number" style="max-width:140px"><button class="btn b" id="savePort">保存并重启监听</button></div></div>
       <div class="row"><div><div class="rl">开启 CORS 跨域</div><div class="rd">缓解部分播放器跨域拉流失败</div></div><label class="sw"><input type="checkbox" id="corsToggle"><span class="tr2"></span></label></div>
       <div class="row"><div><div class="rl">缓存海报图片</div><div class="rd">缓存上游图片资源，减轻回源压力</div></div><label class="sw"><input type="checkbox" id="cacheToggle"><span class="tr2"></span></label></div>
+      <div class="row"><div><div class="rl">PWA 模式</div><div class="rd">后台可安装到手机/电脑桌面，全屏运行并支持离线打开；保存后刷新页面生效</div></div><label class="sw"><input type="checkbox" id="pwaToggle"><span class="tr2"></span></label></div>
+      <div class="row" id="pwaInstallRow" style="display:none"><div><div class="rl">安装到主屏幕</div><div class="rd">安装后从桌面图标秒开启动页进入后台</div></div><button type="button" class="btn b s" id="pwaInstallBtn">安装应用</button></div>
     </div>
     
     <div class="card" style="border-color:#fecaca;margin-bottom:0;">
@@ -3593,8 +4136,12 @@ function fmtBeijing(iso, mode){
 }
 function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
-function countryLabel(code){
-  if(!code) return '未知';
+/* 拦截原因统一映射：cn=地区限制 whitelist=域名白名单 ban=IP黑名单 rate_limit=限流 ua=UA白名单 */
+function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ban:'IP 黑名单',rate_limit:'触发限流',ua:'UA 不允许'}[r]||'其他拦截'}
+function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',rate_limit:'pl',ua:'pu'}[r]||'pw'}
+function reasonFull(r){return {cn:'地区限制：仅允许中国大陆 IP',whitelist:'域名未授权：目标域名不在白名单',ban:'IP 黑名单：命中黑名单规则',rate_limit:'触发限流：超过每分钟请求上限',ua:'UA 不允许：User-Agent 不在白名单'}[r]||'其他拦截'}
+
+function countryLabel(code){  if(!code) return '未知';
   const c = String(code).toUpperCase();
   if(state.labels && (state.labels[c]||state.labels[code])) return state.labels[c]||state.labels[code];
   const fallback = {LO:'本机',PV:'内网','??':'未知',CN:'中国',HK:'中国香港',TW:'中国台湾',MO:'中国澳门',US:'美国',JP:'日本',KR:'韩国',SG:'新加坡',GB:'英国',DE:'德国',FR:'法国',RU:'俄罗斯'};
@@ -3610,6 +4157,7 @@ let liveTimer=null;
 let liveTickTimer=null;
 let liveWS=null;
 let liveWSRetry=null;
+let blocksTimer=null; // 拦截记录页轮询：停留期间每 5s 自动刷新，切走即清除
 let liveMode='idle'; // ws | poll | idle
 const liveSession={map:new Map(), connPage:1, ipPage:1, pageSize:20};
 function resetLiveSession(){liveSession.map.clear();liveSession.connPage=1;liveSession.ipPage=1}
@@ -3752,9 +4300,14 @@ function switchTab(id){
   document.getElementById('pt').textContent=pageTitles[id]||'';
   if(window.innerWidth<=1024)closeSidebar();
   stopLiveTimers();
+  if(blocksTimer){clearInterval(blocksTimer);blocksTimer=null}
   if(id==='overview')loadOverview();
   if(id==='traffic')loadTraffic();
-  if(id==='blocks')loadBlocks();
+  if(id==='blocks'){
+    loadBlocks();
+    // 停留在拦截记录页期间自动轮询，新拦截事件无需手动刷新即实时上屏
+    blocksTimer=setInterval(()=>{if(!document.hidden)loadBlocks()},5000);
+  }
   if(id==='live'){
     resetLiveSession();
     liveTickTimer=setInterval(tickLiveDurations,500);
@@ -3787,7 +4340,7 @@ async function loadConfig(){
     const r=await fetch('/admin/api/config',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const c=await r.json();applyPort(c.effective_port);
-    document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('corsToggle').checked=!!c.cors;document.getElementById('cacheToggle').checked=!!c.enable_cache;
+    document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('corsToggle').checked=!!c.cors;document.getElementById('cacheToggle').checked=!!c.enable_cache;document.getElementById('pwaToggle').checked=!!c.pwa;state.pwaOn=!!c.pwa;
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');document.getElementById('autoBan').checked=!!c.auto_ban;
     document.getElementById('rateLimit').value=c.rate_limit||0;document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
   }catch(e){console.error('loadConfig error:',e)}
@@ -3814,12 +4367,12 @@ function updateOvStats() {
   else if (state.ovRange === '30d') filterFn = d => d.date >= d30Str;
   
   const filtered = ovTrendData.filter(filterFn);
-  let reqs = 0, bytes = 0, bCN = 0, bWL = 0;
+  let reqs = 0, bytes = 0, bTotal = 0;
   filtered.forEach(d => {
     reqs += d.requests || 0;
     bytes += d.bytes || 0;
-    bCN += d.blocked_cn || 0;
-    bWL += d.blocked_whitelist || 0;
+    // 优先用后端汇总字段（五种拦截之和）；旧数据无 blocked 字段时回退老两字段
+    bTotal += (d.blocked != null) ? d.blocked : ((d.blocked_cn||0)+(d.blocked_whitelist||0));
   });
   
   const days = filtered.length || 1;
@@ -3827,21 +4380,22 @@ function updateOvStats() {
   document.getElementById('ovBytes').textContent = fmtBytes(bytes);
   document.getElementById('ovAvgReq').textContent = Math.round(reqs/days).toLocaleString();
   document.getElementById('ovAvgBytes').textContent = fmtBytes(Math.round(bytes/days));
-  document.getElementById('ovBlocked').textContent = (bCN + bWL).toLocaleString();
-  document.getElementById('ovBlockedCN').textContent = bCN.toLocaleString();
+  document.getElementById('ovBlocked').textContent = bTotal.toLocaleString();
 }
 
 async function loadOverview(){
   try{
-    const r=await fetch('/admin/api/traffic',{cache:'no-store'});
+    // slim=1：trend 只含每日汇总，避免 5 秒轮询拉全量明细（分时/主机/IP/国家）
+    const r=await fetch('/admin/api/traffic?slim=1',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
-    document.getElementById('uniqueIPs').textContent=Object.keys(t.ip_counts||{}).length.toLocaleString();
+    document.getElementById('uniqueIPs').textContent=(t.unique_ips!=null?t.unique_ips:Object.keys(t.ip_counts||{}).length).toLocaleString();
     ovTrendData = t.trend || [];
     renderMiniTrend(ovTrendData);
     updateOvStats();
     
-    const r2=await fetch('/admin/api/blocks',{cache:'no-store'});
+    // 概览只需最新几条拦截，limit=5 大幅减少轮询传输
+    const r2=await fetch('/admin/api/blocks?limit=5',{cache:'no-store'});
     if(r2.ok){const b=await r2.json();renderOvBlocks(b.items||[]);}
     
     const r3=await fetch('/admin/api/config',{cache:'no-store'});
@@ -3862,7 +4416,7 @@ function renderSysInfo(c, uptime){
 
 function renderMiniTrend(trend){const cv=document.getElementById('miniTrendChart');if(!cv || typeof Chart==='undefined')return;const data=(trend||[]).slice(-7);if(!data.length)return;const labels=data.map(d=>(d.date||'').slice(5)),reqs=data.map(d=>d.requests||0);
 if(miniTrendChart){miniTrendChart.data.labels=labels;miniTrendChart.data.datasets[0].data=reqs;miniTrendChart.update('none');return}
-miniTrendChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'请求',data:reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,tension:0.35,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{borderDash:[4,4]}}}}})}
+miniTrendChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'请求',data:reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,tension:0.35,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{borderDash:[4,4]}}}}})}
 
 // esc：HTML 转义，防 XSS
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -3871,7 +4425,7 @@ function renderOvBlocks(items){
   const box=document.getElementById('ovBlocks');
   if(!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">近期没有拦截事件</span></div>';return}
   box.innerHTML=items.slice(0,5).map(b=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid #f1f5f9;font-size:13px">
-    <div style="min-width:0;flex:1"><span style="font-family:var(--mono);color:#3b82f6;font-weight:600;word-break:break-all">${esc(b.ip)}</span><br><span class="pill pw" style="margin-top:4px;display:inline-block">${b.reason==='cn'?'地区限制':'域名未授权'}</span></div>
+    <div style="min-width:0;flex:1"><span style="font-family:var(--mono);color:#3b82f6;font-weight:600;word-break:break-all">${esc(b.ip)}</span><br><span class="pill ${reasonClass(b.reason)}" style="margin-top:4px;display:inline-block">${esc(reasonLabel(b.reason))}</span></div>
     <div style="color:#94a3b8;font-size:12px;flex-shrink:0">${fmtBeijing(b.time,'time')}</div>
   </div>`).join('');
 }
@@ -3926,7 +4480,7 @@ function buildTrafficView(trend){
   let totalReq=0,totalBytes=0,blocked=0,rawDayCount=0,gran='hour';
   filtered.forEach(d=>{
     totalReq+=d.requests||0; totalBytes+=d.bytes||0;
-    blocked+=(d.blocked_cn||0)+(d.blocked_whitelist||0);
+    blocked+=(d.blocked!=null)?d.blocked:((d.blocked_cn||0)+(d.blocked_whitelist||0));
     Object.entries(d.ips||{}).forEach(([k,v])=>{ipMap[k]=(ipMap[k]||0)+v});
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
     Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
@@ -4055,7 +4609,7 @@ function renderReqChart(labels,data,gran){
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  const cfg={type:'bar',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:gran==='hour'?'rgba(16,185,129,0.75)':'rgba(16,185,129,0.65)',borderWidth:1,borderRadius:dense?2:4,maxBarThickness:dense?10:28}]},options:{responsive:true,maintainAspectRatio:false,animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
+  const cfg={type:'bar',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:gran==='hour'?'rgba(16,185,129,0.75)':'rgba(16,185,129,0.65)',borderWidth:1,borderRadius:dense?2:4,maxBarThickness:dense?10:28}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
 function renderByteChart(labels,data,gran){
@@ -4063,7 +4617,7 @@ function renderByteChart(labels,data,gran){
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  const cfg={type:'line',data:{labels:labs,datasets:[{label:'流量',data,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',fill:true,tension:0.3,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),borderWidth:2,pointHoverRadius:4}]},options:{responsive:true,maintainAspectRatio:false,animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
+  const cfg={type:'line',data:{labels:labs,datasets:[{label:'流量',data,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',fill:true,tension:0.3,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),borderWidth:2,pointHoverRadius:4}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
 function renderHostChart(hostTop){
@@ -4071,7 +4625,7 @@ function renderHostChart(hostTop){
   const labels=hostTop.map(([h])=>h.length>28?h.slice(0,26)+'…':h);
   const data=hostTop.map(([,n])=>n);
   if(!labels.length){labels.push('暂无数据');data.push(0)}
-  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(59,130,246,0.7)',borderRadius:4}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{font:{size:11}}}}}};
+  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(59,130,246,0.7)',borderRadius:4}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{font:{size:11}}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
 }
 function renderIP(map,bytesMap,totalUnique,topN){
@@ -4163,11 +4717,11 @@ async function closeLiveConn(id, ev){
   try{
     const r=await fetch('/admin/api/live/close?id='+encodeURIComponent(id),{method:'POST'});
     const d=await r.json().catch(()=>({}));
-    if(!r.ok){ alert(d.error||'断开失败'); return; }
+    if(!r.ok){ alert(d.error||'断开失败，该连接可能已结束'); return; }
     const prev=liveSession.map.get(id);
     if(prev) liveSession.map.set(id,{...prev,active:false,downRate:0,upRate:0,ended:fmtBeijing(new Date(),'full')});
     renderLiveTables();
-  }catch(e){ alert('断开失败：网络异常'); }
+  }catch(e){ alert('断开失败：网络异常，请稍后重试'); }
 }
 function livePagerHtml(prefix,page,total,pageSize){
   const pages=Math.max(1,Math.ceil(total/pageSize));
@@ -4258,18 +4812,23 @@ async function loadLive(){
 
 async function loadBlocks(){
   try{
-    const r=await fetch('/admin/api/blocks',{cache:'no-store'});
+    // 默认拉最新 500 条（服务端上限 5000；轮询模式下全量传输既慢又浪费）
+    const r=await fetch('/admin/api/blocks?limit=500',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
     const tb=document.getElementById('blockTable');
-    if(!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="5"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">尚未产生拦截事件</span></div></td></tr>';return}
-    tb.innerHTML=t.items.map(b=>`<tr>
+    if(!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="6"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">尚未产生拦截事件；触发黑名单、地区、白名单、限流或 UA 拦截后将在此显示</span></div></td></tr>';return}
+    tb.innerHTML=t.items.map(b=>{
+      const ua=String(b.ua||'').trim();
+      const uaShort=ua.length>60?ua.slice(0,58)+'…':ua;
+      return `<tr>
       <td data-label="时间"><span class="cell-v muted mono">${fmtBeijing(b.time,'full')}</span></td>
       <td data-label="IP 地址"><span class="cell-v mono ip-link" data-ip="${esc(b.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600">${esc(b.ip)}</span></td>
       <td data-label="地区"><span class="cell-v"><img class="flg" src="/admin/api/flag/${(b.country||'??').toLowerCase()}" onerror="this.style.display='none'" alt="">${esc(b.country_name||countryLabel(b.country||'??'))}</span></td>
-      <td data-label="拦截原因"><span class="cell-v"><span class="pill ${b.reason==='cn'?'pc':'pw'}">${b.reason==='cn'?'地区限制':'域名未授权'}</span></span></td>
+      <td data-label="拦截原因"><span class="cell-v"><span class="pill ${reasonClass(b.reason)}" title="${esc(b.reason_text||'')}">${esc(reasonLabel(b.reason))}</span></span></td>
       <td data-label="访问路径"><span class="cell-v" title="${esc(b.path)}">${esc(b.path)}</span></td>
-    </tr>`).join('');
+      <td data-label="User-Agent"><span class="cell-v mono" style="font-size:12px;color:var(--t2);word-break:break-all" title="${esc(ua)}">${ua?esc(uaShort):'<span style="color:var(--t3)">—</span>'}</span></td>
+    </tr>`}).join('');
     tb.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
   }catch(e){console.error('loadBlocks error:',e)}
 }
@@ -4277,22 +4836,38 @@ async function loadBlocks(){
 
 function collect(){
   const raw=parseInt(document.getElementById('portInput').value,10);
-  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),enable_cache:document.getElementById('cacheToggle').checked,cors:document.getElementById('corsToggle').checked}
+  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),enable_cache:document.getElementById('cacheToggle').checked,cors:document.getElementById('corsToggle').checked,pwa:document.getElementById('pwaToggle').checked}
 }
 async function save(){
   try{
     const r=await fetch('/admin/api/save',{method:'POST',body:JSON.stringify(collect())});
     if(!r.ok)throw new Error(await r.text());
-    const c=await r.json();applyPort(c.effective_port);alert('配置已保存');
+    const c=await r.json();applyPort(c.effective_port);
+    // 开启 PWA 模式时：提示是否把启动页安装到主屏幕/桌面（安装后桌面图标秒开）
+    const nowOn=document.getElementById('pwaToggle').checked;
+    if(nowOn && !state.pwaOn){
+      state.pwaOn=true;
+      if(confirm('PWA 模式已开启！\n\n是否把启动页安装到主屏幕/桌面？\n\n· 安装后桌面会出现 Emby Proxy 图标\n· 点击图标从快速启动页直接进入后台\n· 需刷新页面后弹出安装提示')){ 
+        sessionStorage.setItem('pwaInstallAsk','1');
+        location.reload();
+        return;
+      }
+    }else if(!nowOn && state.pwaOn){
+      state.pwaOn=false;
+      alert('PWA 模式已关闭，页面即将刷新生效');
+      location.reload();
+      return;
+    }
+    alert('配置已保存并即时生效');
   }catch(e){alert('保存失败：'+(e.message||'未知错误'))}
 }
 document.getElementById('savePort').addEventListener('click',save);document.getElementById('saveAll').addEventListener('click',save);
 
 document.getElementById('changePassBtn').addEventListener('click',async()=>{
   const o=document.getElementById('oldPass').value,n=document.getElementById('newPass').value;
-  if(!o||!n||n.length<6){alert('请填写当前密码，且新密码至少 6 位');return}
+  if(!o||!n||n.length<6){alert('请先填写当前密码，新密码至少 6 位');return}
   const r=await fetch('/admin/api/change-password',{method:'POST',body:JSON.stringify({OldPass:o,NewPass:n})});
-  if(r.ok){alert('密码已修改，请重新登录');location.reload()}else{alert('修改失败：'+(await r.text()||'未知错误'))}
+  if(r.ok){alert('密码修改成功，即将跳转到登录页，请用新密码重新登录');location.reload()}else{alert('密码修改失败：'+(await r.text()||'未知错误'))}
 });
 document.getElementById('clearStatsBtn').addEventListener('click',async()=>{
   if(!confirm('确定清空全部统计数据？此操作不可恢复。'))return;
@@ -4358,10 +4933,73 @@ document.getElementById('logoutBtn')?.addEventListener('click', async () => {
   location.href = '/admin/login';
 });
 
+/* ----- PWA 安装提示 -----
+ * 浏览器满足安装条件（PWA 开启 + SW 就绪）时触发 beforeinstallprompt；
+ * · 设置页出现“安装应用”按钮，随时可安装；
+ * · 若刚开启 PWA（sessionStorage 标记，刷新后），自动弹出系统安装对话框，
+ *   询问“是否把启动页添加到主屏幕/桌面”。 */
+let pwaInstallPrompt=null;
+function showInstallBtn(){
+  const row=document.getElementById('pwaInstallRow');
+  if(row) row.style.display='flex';
+}
+async function pwaInstall(){
+  if(!pwaInstallPrompt){
+    alert('当前浏览器暂未就绪或已安装。\n提示：可使用浏览器的“添加到主屏幕/安装应用”菜单功能手动安装。');
+    return;
+  }
+  pwaInstallPrompt.prompt();
+  try{
+    const choice=await pwaInstallPrompt.userChoice;
+    if(choice&&choice.outcome==='accepted'){
+      alert('安装成功！\n桌面/主屏幕已出现 Emby Proxy 图标，点击即可从快速启动页进入后台。');
+      document.getElementById('pwaInstallRow').style.display='none';
+    }
+  }catch(e){}
+  pwaInstallPrompt=null;
+}
+window.addEventListener('beforeinstallprompt',e=>{
+  e.preventDefault();
+  pwaInstallPrompt=e;
+  // PWA 开启状态才显示安装入口（关闭时浏览器也不会触发该事件，双保险）
+  if(document.getElementById('pwaToggle')&&document.getElementById('pwaToggle').checked) showInstallBtn();
+  // 刚开启 PWA 并刷新进来：自动弹出系统级“添加到主屏幕”提示
+  if(sessionStorage.getItem('pwaInstallAsk')==='1'){
+    sessionStorage.removeItem('pwaInstallAsk');
+    setTimeout(()=>{ if(pwaInstallPrompt) pwaInstall(); },600);
+  }
+});
+window.addEventListener('appinstalled',()=>{
+  pwaInstallPrompt=null;
+  const row=document.getElementById('pwaInstallRow');
+  if(row) row.style.display='none';
+});
+document.getElementById('pwaInstallBtn')?.addEventListener('click',pwaInstall);
+// 已作为独立应用运行时隐藏安装入口
+if(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches){
+  const row=document.getElementById('pwaInstallRow');
+  if(row) row.style.display='none';
+}
+
 loadConfig();
-loadOverview();
+// Chart.js 使用 defer 异步加载：先并行下载，等就绪后再拉概览（趋势图依赖）；
+// 首屏 HTML 解析不再被外部脚本阻塞，最快 10 秒后无论如何继续（图表等切页时再渲染）
+(function waitForChart(){
+  if(typeof Chart!=='undefined'){ loadOverview(); return; }
+  var n=0;
+  var t=setInterval(function(){
+    n++;
+    if(typeof Chart!=='undefined'||n>200){ clearInterval(t); loadOverview(); }
+  },50);
+})();
 let ovTimer=setInterval(()=>{if(!document.hidden)loadOverview()},5000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)loadOverview()});
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden){
+    loadOverview();
+    // 拦截记录页处于激活状态时，回到页面立即刷新一次
+    if(document.getElementById('blocks')?.classList.contains('on'))loadBlocks();
+  }
+});
 </script>
 </body>
 </html>
