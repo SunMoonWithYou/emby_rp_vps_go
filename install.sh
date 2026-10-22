@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Emby 路径反代 — 一键安装 / 管理脚本 
+# Emby 路径反代 — 一键安装 / 管理脚本
+# =============================================================================
+#
+# 功能概览
+#   · 内嵌完整 Go 源码（路径反代服务 + 管理后台 HTML）
+#   · 自动检测/安装 Go，编译为静态二进制并注册 systemd 服务
+#   · 子命令：menu | install | update | uninstall | status | start|stop|restart
+#
+# 数据目录（默认）
+#   /etc/emby-proxy/emby.db     bolt 库：配置、统计、认证、geo 缓存
+#   /usr/local/bin/emby-proxy   编译产物
+#   /etc/systemd/system/emby-proxy.service
+#
+# 常用
+#   sudo bash $0                # 交互菜单
+#   sudo bash $0 install        # 安装/重装
+#   sudo bash $0 update         # 仅重编译替换二进制
+#   sudo bash $0 uninstall -y   # 卸载
+#
 # =============================================================================
 set -euo pipefail
 
-# ---------- 默认路径与版本 ----------
+# ---------- 默认路径与版本（可通过 install 参数覆盖端口/路径等）----------
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
 DEFAULT_BIN="/usr/local/bin/emby-proxy"
@@ -142,10 +160,35 @@ ensure_go() {
   info "Go 就绪: $(go env GOVERSION)"
 }
 
+# 将内嵌的 main.go + admin.html 写出到临时目录，供 go build 使用
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
+
+/*
+Emby 路径反代服务（单文件）
+
+访问模型
+  客户端请求：  GET /https://emby.example.com:8096/web/index.html
+  本服务解析路径中的目标 URL，按白名单/地区/限流校验后反代到上游。
+
+主要模块
+  · parseTarget / buildProxy     路径解析与 httputil.ReverseProxy
+  · Config + bolt DB            持久化配置与统计
+  · 访问控制                    白名单、ChinaOnly、黑名单、UA、限流（ACL 预编译）
+  · 统计                        异步 channel 聚合，按日分桶，定期落盘
+  · 实时监控                    liveConn + WebSocket(/admin/api/live/ws) 推送活跃连接
+  · 管理后台                    /admin/ 嵌入 admin.html，会话 Cookie + 验证码登录
+
+时区
+  统计分日/分时与对外时间字段统一按 Asia/Shanghai（北京时间）。
+
+内存与资源
+  · 图片 LRU 缓存有条数与总字节上限
+  · 统计 map 定期 pruneTopN，防止无限增长
+  · GOMEMLIMIT 由 systemd unit 设为 256MiB 软限制
+*/
 
 import (
 	"bufio"
@@ -178,14 +221,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/phuslu/iploc"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sync/singleflight"
 )
 
 //go:embed admin.html
+// adminHTML 为管理后台单页（构建时由脚本写入同目录 admin.html 后 embed）
 var adminHTML []byte
 
+// 上下文键：在 ReverseProxy.Rewrite 中取回目标 URL / 上行字节计数 / 实时连接
 type targetCtxKey struct{}
 type upBytesCtxKey struct{}
 
@@ -238,7 +284,7 @@ func isBuiltinAssetPath(p string) bool {
 	return strings.HasPrefix(p, ".well-known/")
 }
 
-// ---------- 统一主题页面（首页 / 错误提示）----------
+// ---------- 对外非管理页：首页与错误页（与管理后台独立的轻量样式）----------
 const pageCSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--r:16px}
@@ -295,6 +341,8 @@ func serveError(w http.ResponseWriter, status int, title, message string) {
 	writePage(w, status, iconClass, icon, title, message, extra)
 }
 
+// parseTarget 从请求路径解析上游目标。
+// 支持：/https://host/path、/http://host/path，或省略协议时按端口推断 scheme。
 func parseTarget(r *http.Request) (*url.URL, error) {
 	raw := r.URL.EscapedPath()
 	if raw == "" || raw == "/" {
@@ -351,18 +399,19 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	return u, nil
 }
 
+// Config 网关运行时配置（JSON 存入 bolt bucket "config"）
 type Config struct {
-	Port        int      `json:"port"`
-	ChinaOnly   bool     `json:"china_only"`
-	Whitelist   []string `json:"whitelist"`
-	GeoAPI      bool     `json:"geo_api"`
-	GeoAPIURL   string   `json:"geo_api_url"`
-	BanList     []string `json:"ban_list"`
-	AutoBan     bool     `json:"auto_ban"`
-	RateLimit   int      `json:"rate_limit"`
-	AllowedUAs  []string `json:"allowed_uas"`
-	EnableCache bool     `json:"enable_cache"`
-	CORS        bool     `json:"cors"`
+	Port        int      `json:"port"`         // 监听端口；保存后可热切换
+	ChinaOnly   bool     `json:"china_only"`   // 仅允许中国大陆 IP（本地 iploc 判断）
+	Whitelist   []string `json:"whitelist"`    // 上游域名白名单，空=不限制；支持根域匹配
+	GeoAPI      bool     `json:"geo_api"`      // 管理端 IP 详情是否拉远程 geo
+	GeoAPIURL   string   `json:"geo_api_url"`  // 预留，当前使用内置 ip-api
+	BanList     []string `json:"ban_list"`     // IP 或 CIDR
+	AutoBan     bool     `json:"auto_ban"`     // 触发地区拦截时自动写入黑名单
+	RateLimit   int      `json:"rate_limit"`   // 每 IP 每分钟请求上限，0=关闭
+	AllowedUAs  []string `json:"allowed_uas"`  // UA 关键字白名单，空=不限制
+	EnableCache bool     `json:"enable_cache"` // 缓存 /Images/ 小图
+	CORS        bool     `json:"cors"`         // 是否添加宽松 CORS 头
 }
 
 // rateLimitEntry：每 IP 限流窗口（Count/WindowStart 须 atomic 访问）。
@@ -372,6 +421,21 @@ type rateLimitEntry struct {
 }
 
 var startedAt = time.Now()
+
+// 统一使用北京时间（Asia/Shanghai）做日期分桶与对外时间展示
+var beijingLoc = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}()
+
+func nowBeijing() time.Time { return time.Now().In(beijingLoc) }
+func beijingDate(t time.Time) string { return t.In(beijingLoc).Format("2006-01-02") }
+func beijingHour(t time.Time) string { return t.In(beijingLoc).Format("15") }
+func beijingRFC3339(t time.Time) string { return t.In(beijingLoc).Format(time.RFC3339) }
+
 var (
 	db          *bolt.DB
 	dbPath      string
@@ -386,7 +450,8 @@ var (
 	ipLimiters sync.Map
 )
 
-// 图片缓存：固定容量 LRU
+// ---------- 图片缓存（仅 GET 且路径含 /Images/ 的小响应）----------
+// 双上限：条数 + 总字节；单条过大直接不入队。缓存键为完整请求 URL。
 const (
 	imgCacheMaxCount = 500
 	imgCacheMaxBytes = 50 << 20 // 50MB
@@ -453,6 +518,79 @@ func currentCfg() *Config {
 	}
 	return &Config{}
 }
+
+// compiledACL 由 rebuildACL 在配置加载/保存时生成，供每个请求快速检查，
+// 避免在热路径上反复 net.ParseCIDR 与 strings.ToLower。
+type compiledACL struct {
+	exactBan map[string]struct{}
+	cidrs    []*net.IPNet
+	uaNeedles []string // 已小写；空 = 不限制
+}
+
+var aclPtr atomic.Pointer[compiledACL]
+
+func rebuildACL(c *Config) {
+	a := &compiledACL{exactBan: map[string]struct{}{}}
+	if c == nil {
+		aclPtr.Store(a)
+		return
+	}
+	for _, b := range c.BanList {
+		b = strings.TrimSpace(b)
+		if b == "" {
+			continue
+		}
+		if strings.Contains(b, "/") {
+			if _, ipnet, err := net.ParseCIDR(b); err == nil {
+				a.cidrs = append(a.cidrs, ipnet)
+			}
+			continue
+		}
+		a.exactBan[b] = struct{}{}
+	}
+	for _, u := range c.AllowedUAs {
+		u = strings.ToLower(strings.TrimSpace(u))
+		if u != "" {
+			a.uaNeedles = append(a.uaNeedles, u)
+		}
+	}
+	aclPtr.Store(a)
+}
+func currentACL() *compiledACL {
+	if p := aclPtr.Load(); p != nil {
+		return p
+	}
+	return &compiledACL{exactBan: map[string]struct{}{}}
+}
+func isBannedIP(ipStr string, clientIP net.IP) bool {
+	a := currentACL()
+	if _, ok := a.exactBan[ipStr]; ok {
+		return true
+	}
+	if clientIP == nil || len(a.cidrs) == 0 {
+		return false
+	}
+	for _, n := range a.cidrs {
+		if n.Contains(clientIP) {
+			return true
+		}
+	}
+	return false
+}
+func uaAllowed(ua string) bool {
+	a := currentACL()
+	if len(a.uaNeedles) == 0 {
+		return true
+	}
+	ua = strings.ToLower(ua)
+	for _, n := range a.uaNeedles {
+		if strings.Contains(ua, n) {
+			return true
+		}
+	}
+	return false
+}
+
 func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPort }
 
 func startListen(srv *http.Server, port int) error {
@@ -490,19 +628,24 @@ func loadConfig() {
 		})
 	}
 	cfgPtr.Store(c)
+	rebuildACL(c)
 }
 func saveConfig(c *Config) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
 	}
 	b, _ := json.Marshal(c)
-	return db.Update(func(tx *bolt.Tx) error {
+	err := db.Update(func(tx *bolt.Tx) error {
 		bk, err := tx.CreateBucketIfNotExists([]byte("config"))
 		if err != nil {
 			return err
 		}
 		return bk.Put([]byte("data"), b)
 	})
+	if err == nil {
+		rebuildACL(c)
+	}
+	return err
 }
 
 
@@ -532,6 +675,7 @@ func rootDomain(hostport string) string {
 	}
 	return strings.Join(parts[n-2:], ".")
 }
+// whitelistMatch 空列表表示不限制；否则匹配完整 host 或与规则相同的根域名。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
@@ -634,7 +778,9 @@ func dayOf(date string) *DayStat {
 	return d
 }
 
-// Stats：内存聚合视图（对应磁盘分桶）
+// ---------- 访问统计 ----------
+// 写入：recordRequestStart/recordBytes → statChan → startStatsWorker 单协程聚合
+// 落盘：startStatsSaver 每 5 分钟 prune + 写入 stats_meta / stats_daily / stats_blocks
 type Stats struct {
 	TodayDate        string              `json:"today_date"`
 	TodayRequests    int64               `json:"today_requests"`
@@ -716,13 +862,14 @@ func pruneStatsLocked() {
 	}
 }
 
+// startStatsWorker 单消费者聚合统计，避免多协程抢 statsMu；通道满则丢弃并计数。
 func startStatsWorker() {
 	go func() {
 		for ev := range statChan {
 			statsMu.Lock()
-			now := time.Now()
-			t := now.Format("2006-01-02")
-			hour := now.Format("15")
+			now := nowBeijing()
+			t := beijingDate(now)
+			hour := beijingHour(now)
 			if stats.TodayDate != t {
 				stats.TodayDate = t
 				stats.TodayRequests = 0
@@ -731,7 +878,7 @@ func startStatsWorker() {
 			if ev.IsStart {
 				stats.TotalRequests++
 				stats.TodayRequests++
-				stats.LastProxyAt = now.UTC().Format(time.RFC3339)
+				stats.LastProxyAt = beijingRFC3339(now)
 				c := ev.Country
 				if c == "" {
 					c = "??"
@@ -798,7 +945,7 @@ type statsMetaDisk struct {
 
 func emptyStats() Stats {
 	return Stats{
-		TodayDate:     time.Now().Format("2006-01-02"),
+		TodayDate:     beijingDate(time.Now()),
 		CountryCounts: map[string]int64{},
 		IPCounts:      map[string]int64{},
 		IPBytes:       map[string]int64{},
@@ -910,7 +1057,7 @@ func loadStats() {
 		rebuildAggregatesFromDaily()
 	}
 	if stats.TodayDate == "" {
-		stats.TodayDate = time.Now().Format("2006-01-02")
+		stats.TodayDate = beijingDate(time.Now())
 	}
 	// 今日计数与 daily 对齐（避免跨进程后今日字段漂移）
 	if d := stats.Daily[stats.TodayDate]; d != nil {
@@ -1008,6 +1155,7 @@ func startStatsSaver() {
 	}()
 }
 
+// getClientIP 取客户端 IP。仅当直连方为 loopback/私网时才信任 X-Forwarded-For / X-Real-IP。
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -1053,6 +1201,7 @@ func detectSelfPublicIP() {
 		}
 	}()
 }
+// countryOf 使用嵌入的 iploc 本地库，不发起网络请求；失败返回 "??"。
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -1355,7 +1504,7 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	}
 	statsMu.Lock()
 	defer statsMu.Unlock()
-	day := dayOf(time.Now().Format("2006-01-02"))
+	day := dayOf(beijingDate(time.Now()))
 	reasonText := "目标域名未在白名单中"
 	if reason == "cn" {
 		stats.BlockedCN++
@@ -1368,7 +1517,7 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	if country == "" {
 		country = "??"
 	}
-	ev := BlockEvent{Time: time.Now().UTC().Format(time.RFC3339), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
+	ev := BlockEvent{Time: beijingRFC3339(time.Now()), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
 	stats.Blocks = append(stats.Blocks, ev)
 	if len(stats.Blocks) > maxBlockEvents {
 		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
@@ -1509,6 +1658,7 @@ func geoFetch(ipStr string) (geoEntry, error) {
 	}
 	return geoEntry{}, last
 }
+// ipLabelSync 返回 (国家码, 中文名)。先查缓存/本地库，必要时 singleflight 拉 geo API。
 func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -1554,6 +1704,7 @@ func ipLabelSync(ipStr string) (string, string) {
 	return "??", "未知"
 }
 
+// checkRateLimit 每 IP 固定 1 分钟窗口；窗口起点与计数均用 atomic，避免热路径加锁。
 func checkRateLimit(ip string, limit int) bool {
 	if limit <= 0 {
 		return true
@@ -1573,6 +1724,10 @@ func checkRateLimit(ip string, limit int) bool {
 	return entry.Count.Add(1) <= int64(limit)
 }
 
+// ---------- 实时连接监控 ----------
+// 每个代理请求 liveStart → 结束后 liveEnd 写入环形历史。
+// WebSocket /admin/api/live/ws 高频推送 liveSnapshotActive（仅活跃）；
+// HTTP /admin/api/live 返回含历史的完整快照。管理端可 liveKill 取消 context。
 type liveCtxKey struct{}
 
 type liveConn struct {
@@ -1585,6 +1740,23 @@ type liveConn struct {
 	Start   time.Time
 	Up      atomic.Int64
 	Down    atomic.Int64
+	cancel  context.CancelFunc // 管理端可主动断开
+}
+
+func liveKill(id string) bool {
+	if id == "" {
+		return false
+	}
+	v, ok := liveConns.Load(id)
+	if !ok {
+		return false
+	}
+	c := v.(*liveConn)
+	if c.cancel != nil {
+		c.cancel()
+		return true
+	}
+	return false
 }
 
 var (
@@ -1661,8 +1833,8 @@ func liveEnd(c *liveConn) {
 		Host: c.Host, Method: c.Method, Path: c.Path,
 		Up: c.Up.Load(), Down: c.Down.Load(),
 		DurationMs: now.Sub(c.Start).Milliseconds(),
-		Start: c.Start.UTC().Format(time.RFC3339),
-		Active: false, Ended: now.UTC().Format(time.RFC3339),
+		Start: beijingRFC3339(c.Start),
+		Active: false, Ended: beijingRFC3339(now),
 	}
 	liveHistMu.Lock()
 	liveHist = append(liveHist, row)
@@ -1672,6 +1844,36 @@ func liveEnd(c *liveConn) {
 	liveHistMu.Unlock()
 	liveConns.Delete(c.ID)
 	liveActive.Add(-1)
+}
+
+// liveSnapshotActive 仅包含当前活跃连接，供 WebSocket 约 500ms 推送一次。
+// 前端本页会话自行累计已结束连接，服务端不必每次序列化 liveHist。
+func liveSnapshotActive() map[string]any {
+	var list []liveRow
+	now := time.Now()
+	liveConns.Range(func(_, v any) bool {
+		c := v.(*liveConn)
+		up, down := c.Up.Load(), c.Down.Load()
+		list = append(list, liveRow{
+			ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
+			Host: c.Host, Method: c.Method, Path: c.Path, Up: up, Down: down,
+			DurationMs: now.Sub(c.Start).Milliseconds(),
+			Start: beijingRFC3339(c.Start), Active: true,
+		})
+		return true
+	})
+	// 活跃连接通常很少，按下行排序即可
+	sort.Slice(list, func(i, j int) bool { return list[i].Down > list[j].Down })
+	return map[string]any{
+		"active":      liveActive.Load(),
+		"up_bps":      liveUpRate.Load(),
+		"down_bps":    liveDownRate.Load(),
+		"up_total":    liveUpSum.Load(),
+		"down_total":  liveDownSum.Load(),
+		"connections": list,
+		"history":     0,
+		"active_only": true,
+	}
 }
 
 func liveSnapshot() map[string]any {
@@ -1690,7 +1892,7 @@ func liveSnapshot() map[string]any {
 			ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
 			Host: c.Host, Method: c.Method, Path: c.Path, Up: up, Down: down,
 			DurationMs: now.Sub(c.Start).Milliseconds(),
-			Start: c.Start.UTC().Format(time.RFC3339), Active: true,
+			Start: beijingRFC3339(c.Start), Active: true,
 		})
 		a := ipAgg[c.IP]
 		a.Count++
@@ -1850,6 +2052,7 @@ func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
 }
 
+// generateCaptchaSVG 生成 4 位干扰验证码 SVG，答案存 captchas map，TTL 5 分钟。
 func generateCaptchaSVG() (id, answer, svg string) {
 	const digits = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 	rb := make([]byte, 8)
@@ -1896,6 +2099,8 @@ func verifyCaptcha(id, input string) bool {
 	return strings.EqualFold(strings.TrimSpace(input), e.Answer)
 }
 
+// ---------- 管理端认证 ----------
+// 会话：Cookie emby_admin_sid，内存 map，TTL 24h；登录需图形验证码。
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if validSession(getSessionToken(r)) {
@@ -2211,6 +2416,10 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	}
 }
 
+// buildProxy 构造反向代理：
+//   Rewrite        把路径中的目标写到 Out.URL，并统计上行 Body
+//   ModifyResponse 剥离 Set-Cookie Domain、把指回上游的 Location 改成相对路径
+//   ErrorHandler   上游失败时返回统一错误页
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport: tr, FlushInterval: 50 * time.Millisecond, BufferPool: proxyBufPool,
@@ -2278,6 +2487,7 @@ type adminConfigResp struct {
 	EffectivePort int `json:"effective_port"`
 }
 
+// adminHandler 注册 /admin 下全部路由（登录页、API、静态后台页）。
 func adminHandler() http.HandlerFunc {
 	mux := http.NewServeMux()
 
@@ -2359,6 +2569,7 @@ func adminHandler() http.HandlerFunc {
 			return
 		}
 		cfgPtr.Store(newCfg)
+		rebuildACL(newCfg)
 		if newCfg.Port > 0 && newCfg.Port != currentPort() && globalSrv != nil {
 			if err := startListen(globalSrv, newCfg.Port); err != nil {
 				// 端口切换失败：回滚配置。Transport 与配置无关，无需重建。
@@ -2430,7 +2641,7 @@ func adminHandler() http.HandlerFunc {
 		for code := range ctry {
 			labels[code] = countryName(code)
 		}
-		today := time.Now().Format("2006-01-02")
+		today := beijingDate(time.Now())
 		todayReqs, todayBytes := stats.TodayRequests, stats.TodayBytes
 		if d := stats.Daily[today]; d != nil {
 			if todayReqs == 0 {
@@ -2460,6 +2671,86 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(liveSnapshot())
+	})
+	mux.HandleFunc("/admin/api/live/close", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if id == "" {
+			var body struct {
+				ID string `json:"id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			id = strings.TrimSpace(body.ID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !liveKill(id) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"连接不存在或已结束"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	// WebSocket 实时推送（约 500ms 一帧），失败时前端回退到 HTTP 轮询
+	mux.HandleFunc("/admin/api/live/ws", func(w http.ResponseWriter, r *http.Request) {
+		if !validSession(getSessionToken(r)) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		upgrader := websocket.Upgrader{
+			// 管理页同源；允许反代后 Host 不一致时的同站场景
+			CheckOrigin:       func(r *http.Request) bool { return true },
+			EnableCompression: true,
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			return nil
+		})
+		// 读协程：消费客户端 ping/关闭，避免写阻塞
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		ticker := time.NewTicker(500 * time.Millisecond)
+		pingTicker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		defer pingTicker.Stop()
+		writeJSON := func() error {
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			// 仅推活跃连接，历史由前端本页会话自行累计
+			return conn.WriteJSON(liveSnapshotActive())
+		}
+		if err := writeJSON(); err != nil {
+			return
+		}
+		for {
+			select {
+			case <-done:
+				return
+			case <-pingTicker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-ticker.C:
+				if err := writeJSON(); err != nil {
+					return
+				}
+			}
+		}
 	})
 	mux.HandleFunc("/admin/api/blocks", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2602,6 +2893,8 @@ func adminHandler() http.HandlerFunc {
 	}
 }
 
+// runServer 进程入口（systemd：… run -port … -admin-pass …）：
+// 打开 DB → 迁移旧 JSON → 加载配置/统计 → 启动后台协程 → 监听并阻塞等信号。
 func runServer(port int, adminUser, adminPass, dbFile string) {
 	// Transport 与配置无关，只在启动时创建一次（见 newTransport 上方说明）
 	proxyTr.v.Store(newTransport())
@@ -2682,6 +2975,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	defer func() { statsMu.Lock(); saveStatsLocked(); statsMu.Unlock(); geoCacheSave() }()
 
 	proxy := buildProxy(proxyTr)
+	// 代理主处理：静态资源 → ACL → 地区 → 解析目标 → 白名单 → 可选缓存 → 反代并记流量
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.png" || r.URL.Path == "/favicon.svg" {
 			// 读启动时预热的缓存；未预热完成则直接 302 到源站，不阻塞请求
@@ -2705,26 +2999,9 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		ip := getClientIP(r)
 		c := currentCfg()
 
-		// 黑名单 & 限流 & UA
-		isBanned := false
+		// 黑名单 & 限流 & UA（ACL 已在保存配置时预编译）
 		clientIP := net.ParseIP(ip)
-		for _, b := range c.BanList {
-			b = strings.TrimSpace(b)
-			if b == "" {
-				continue
-			}
-			if b == ip {
-				isBanned = true
-				break
-			}
-			if strings.Contains(b, "/") {
-				if _, ipnet, err := net.ParseCIDR(b); err == nil && clientIP != nil && ipnet.Contains(clientIP) {
-					isBanned = true
-					break
-				}
-			}
-		}
-		if isBanned {
+		if isBannedIP(ip, clientIP) {
 			serveError(w, http.StatusForbidden, "访问被拒绝", "当前 IP 已在黑名单中，无法继续访问。")
 			return
 		}
@@ -2732,23 +3009,15 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			serveError(w, http.StatusTooManyRequests, "请求过于频繁", "已超过限流阈值，请稍后再试。")
 			return
 		}
-		if len(c.AllowedUAs) > 0 {
-			ua := strings.ToLower(r.UserAgent())
-			ok := false
-			for _, u := range c.AllowedUAs {
-				if u != "" && strings.Contains(ua, strings.ToLower(u)) {
-					ok = true
-					break
-				}
-			}
-			if !ok {
-				serveError(w, http.StatusForbidden, "客户端受限", "当前 User-Agent 不在允许列表中。")
-				return
-			}
+		if !uaAllowed(r.UserAgent()) {
+			serveError(w, http.StatusForbidden, "客户端受限", "当前 User-Agent 不在允许列表中。")
+			return
 		}
 
-		country, _ := ipLabelSync(ip)
+		// 地区：热路径优先本地库；仅在需要展示名或 ChinaOnly 不确定时再走 geo
+		country := countryOf(ip)
 		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
+			// 本地库已能判定非 CN 时不再同步拉 geo API
 			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent())
 			if c.AutoBan {
 				// AutoBan 修复：
@@ -2760,7 +3029,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 					for _, b := range old.BanList {
 						if strings.TrimSpace(b) == banIP {
 							return
-						} // 已存在，无需重复添加
+						}
 					}
 					nc := *old
 					nc.BanList = append(append([]string{}, old.BanList...), banIP)
@@ -2768,6 +3037,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 						return
 					}
 					cfgPtr.Store(&nc)
+					rebuildACL(&nc)
 				}(ip)
 			}
 			serveError(w, http.StatusForbidden, "地区限制", "仅允许中国大陆 IP 访问。")
@@ -2805,7 +3075,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 
 		recordRequestStart(ip, country, target.Host)
 
+		reqCtx, cancel := context.WithCancel(r.Context())
 		lc := liveStart(ip, country, target.Host, r.Method, r.URL.RequestURI())
+		lc.cancel = cancel
+		defer cancel()
 		defer liveEnd(lc)
 
 		sw := &statWriter{ResponseWriter: w, live: lc}
@@ -2816,7 +3089,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 
 		upBytes := new(int64)
-		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
+		ctx := context.WithValue(reqCtx, targetCtxKey{}, target)
 		ctx = context.WithValue(ctx, upBytesCtxKey{}, upBytes)
 		ctx = context.WithValue(ctx, liveCtxKey{}, lc)
 
@@ -2855,6 +3128,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	_ = srv.Close()
 }
 
+// main 二进制入口。安装脚本以「emby-proxy run -port … -admin-pass …」拉起。
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "run" {
@@ -2994,6 +3268,25 @@ th{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:12.5px;font-wei
 td{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:13.5px;color:var(--t2)}
 tbody tr:last-child td{border-bottom:0}
 tbody tr:hover td{background:#f8fafc}
+/* 实时监控 · 连接面板风格 */
+.live-conn-table{min-width:960px;font-size:13px}
+.live-conn-table th{padding:10px 12px;font-size:12px;font-weight:500;color:var(--t3)}
+.live-conn-table td{padding:10px 12px;font-size:13px;vertical-align:middle}
+.live-conn-table tbody tr.lv-active td{background:rgba(59,130,246,.03)}
+.live-conn-table .lv-host{font-family:var(--mono);font-weight:600;color:var(--t);word-break:break-all}
+.live-conn-table .lv-path{font-family:var(--mono);font-size:12px;color:var(--t3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:bottom}
+.live-conn-table .lv-rate{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.live-conn-table .lv-rate.on{color:var(--ok);font-weight:600}
+.live-conn-table .lv-bytes{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--t2)}
+.live-conn-table .lv-ago{color:var(--t3);white-space:nowrap;font-size:12.5px}
+.live-conn-table .lv-src{display:flex;flex-direction:column;gap:2px;min-width:0}
+.live-conn-table .lv-src .ip{font-family:var(--mono);color:var(--pd);font-weight:600}
+.live-conn-table .lv-src .rg{font-size:12px;color:var(--t3)}
+.lv-x{width:28px;height:28px;border:0;border-radius:8px;background:transparent;color:var(--t3);cursor:pointer;font-size:16px;line-height:1;display:inline-flex;align-items:center;justify-content:center;transition:.15s}
+.lv-x:hover{background:#fef2f2;color:var(--d)}
+.lv-x:disabled{opacity:.35;cursor:default;pointer-events:none}
+.lv-type{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:6px;background:#f1f5f9;font-size:12px;font-weight:500;color:var(--t2);white-space:nowrap}
+.lv-type.on{background:var(--ps);color:var(--pd)}
 .cell-v{display:inline}
 td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 /* 弹窗 */
@@ -3089,7 +3382,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </div>
 <ul class="nav">
 <li><button class="nav-i on" data-t="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>概览</button></li>
-<li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量与请求</button></li>
+<li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量请求</button></li>
 <li><button class="nav-i" data-t="live"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>实时监控</button></li>
 <li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
@@ -3177,13 +3470,24 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   <div class="stc r"><div class="sl">记录数</div><div class="sv" id="lvIPCount">0</div><div class="ss">本页累计连接</div></div>
 </div>
 <div class="card">
-  <div class="ch"><div><h2 class="ct">连接记录</h2><div class="cd">停留本页期间持续累加，结束后仍保留；活跃优先</div></div>
+  <div class="ch"><div><h2 class="ct">连接记录</h2><div class="cd">风格参考代理连接面板 · 离开本页即清空 · 可断开进行中的连接</div></div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span class="chip" id="lvRefreshHint" style="font-size:12px;color:var(--t3)">每 1.5 秒刷新</span>
+      <span class="chip" id="lvRefreshHint" style="font-size:12px;color:var(--t3)">连接中…</span>
       <button type="button" class="btn g s" id="lvClearBtn">清空本页记录</button>
     </div>
   </div>
-  <div class="table-wrap"><table><thead><tr><th>状态</th><th>IP</th><th>地区</th><th>上游</th><th>下行</th><th>上行</th><th>时长</th></tr></thead><tbody id="lvConnTable"></tbody></table></div>
+  <div class="table-wrap"><table class="live-conn-table"><thead><tr>
+    <th style="width:40px"></th>
+    <th>主机</th>
+    <th>类型</th>
+    <th>来源</th>
+    <th>路径</th>
+    <th>下载速度</th>
+    <th>上传速度</th>
+    <th>下载</th>
+    <th>上传</th>
+    <th>连接时间</th>
+  </tr></thead><tbody id="lvConnTable"></tbody></table></div>
   <div id="lvConnPager" style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap;font-size:13px;color:var(--t2)"></div>
 </div>
 <div class="card">
@@ -3237,10 +3541,57 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </div>
 <div class="mo" id="modal"><div class="mbox"><div class="mh"><h3 id="modalTitle">记录详情</h3><button class="mcl" id="modalClose">×</button></div><div class="mb" id="modalBody"></div></div></div>
 <script>
+/* ========== 管理后台前端逻辑 ==========
+ * 页面：overview / traffic / live / blocks / settings
+ * 实时监控：优先 WebSocket，失败回退轮询；离开页清空本页累计
+ * 时间：fmtBeijing → Asia/Shanghai；流量图大跨度按周/月聚合
+ */
 const state={port:0,labels:{},ovRange:'today',tfRange:'today',tfFrom:'',tfTo:''};
 let ovTrendData=[];
 
 function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
+/**
+ * 统一按北京时间展示。
+ * @param {string|Date} iso
+ * @param {'full'|'date'|'time'|'hm'} [mode]
+ */
+function fmtBeijing(iso, mode){
+  if(iso==null||iso==='') return '-';
+  let d;
+  if(iso instanceof Date) d=iso;
+  else {
+    const s=String(iso).trim();
+    if(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(s) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)){
+      const norm=s.replace('T',' ').replace(/\.\d+$/,'');
+      if(mode==='time') return norm.slice(11,19);
+      if(mode==='hm') return norm.slice(11,16);
+      if(mode==='date') return norm.slice(0,10);
+      return norm.slice(0,19);
+    }
+    d=new Date(s);
+  }
+  if(isNaN(d.getTime())){
+    const s=String(iso).replace('T',' ').replace('Z','');
+    if(mode==='time') return s.slice(11,19)||s;
+    if(mode==='hm') return s.slice(11,16)||s;
+    if(mode==='date') return s.slice(0,10)||s;
+    return s.slice(0,19)||s;
+  }
+  const parts=new Intl.DateTimeFormat('en-GB',{
+    timeZone:'Asia/Shanghai',
+    year:'numeric',month:'2-digit',day:'2-digit',
+    hour:'2-digit',minute:'2-digit',second:'2-digit',
+    hour12:false
+  }).formatToParts(d);
+  const g=t=>(parts.find(p=>p.type===t)||{}).value||'';
+  const date=`${g('year')}-${g('month')}-${g('day')}`;
+  const time=`${g('hour')}:${g('minute')}:${g('second')}`;
+  if(mode==='date') return date;
+  if(mode==='time') return time;
+  if(mode==='hm') return `${g('hour')}:${g('minute')}`;
+  return `${date} ${time}`;
+}
+function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
 function countryLabel(code){
   if(!code) return '未知';
@@ -3250,24 +3601,164 @@ function countryLabel(code){
   return fallback[c] || code;
 }
 
-const pageTitles={overview:'概览',traffic:'流量与请求',live:'实时监控',blocks:'拦截记录',settings:'网关设置'};
+const pageTitles={overview:'概览',traffic:'流量请求',live:'实时监控',blocks:'拦截记录',settings:'网关设置'};
+/* ----- 实时监控会话 -----
+ * liveSession.map：本页停留期间累计的连接（含已结束）
+ * liveMode：ws | poll | idle；离开页 stopLiveTimers + resetLiveSession
+ */
 let liveTimer=null;
+let liveTickTimer=null;
+let liveWS=null;
+let liveWSRetry=null;
+let liveMode='idle'; // ws | poll | idle
 const liveSession={map:new Map(), connPage:1, ipPage:1, pageSize:20};
 function resetLiveSession(){liveSession.map.clear();liveSession.connPage=1;liveSession.ipPage=1}
+function setLiveHint(t){ const el=document.getElementById('lvRefreshHint'); if(el) el.textContent=t; }
+function stopLiveTimers(){
+  if(liveTimer){clearInterval(liveTimer);liveTimer=null}
+  if(liveTickTimer){clearInterval(liveTickTimer);liveTickTimer=null}
+  if(liveWSRetry){clearTimeout(liveWSRetry);liveWSRetry=null}
+  if(liveWS){
+    try{ liveWS.onclose=null; liveWS.onerror=null; liveWS.onmessage=null; liveWS.close(); }catch(e){}
+    liveWS=null;
+  }
+  liveMode='idle';
+}
+/** 进行中连接本地推算时长：只改 DOM 文案，避免整表 innerHTML */
+function tickLiveDurations(){
+  if(document.hidden) return;
+  const now=Date.now();
+  liveSession.map.forEach((v)=>{
+    if(!v||!v.active||!v.start) return;
+    const t=new Date(v.start).getTime();
+    if(isNaN(t)) return;
+    v.duration_ms=Math.max(0, now-t);
+  });
+  // 连接时间列（相对时间）+ title 时长
+  document.querySelectorAll('#lvConnTable tr.live-row[data-live-id]').forEach(tr=>{
+    const id=tr.getAttribute('data-live-id');
+    const row=liveSession.map.get(id);
+    if(!row||!row.active) return;
+    const agoEl=tr.querySelector('.lv-ago');
+    if(agoEl){
+      const next=fmtAgo(row.start);
+      if(agoEl.textContent!==next) agoEl.textContent=next;
+      agoEl.title=fmtBeijing(row.start,'full')+' · 时长 '+fmtDur(row.duration_ms||0);
+    }
+  });
+}
+/** 合并一帧监控数据：活跃覆盖；已结束仅更新本页已见 id；并估算单连接速率 */
+function applyLiveData(d){
+  if(!d||typeof d!=='object') return;
+  document.getElementById('lvActive').textContent=(d.active||0).toLocaleString();
+  document.getElementById('lvDown').textContent=fmtRate(d.down_bps||0);
+  document.getElementById('lvUp').textContent=fmtRate(d.up_bps||0);
+  const now=Date.now();
+  (d.connections||[]).forEach(c=>{
+    if(!c||!c.id) return;
+    const prev=liveSession.map.get(c.id);
+    let downRate=0, upRate=0;
+    if(prev && prev._sampleAt && c.active){
+      const dt=(now-(prev._sampleAt||now))/1000;
+      if(dt>0.05){
+        downRate=Math.max(0, ((c.down||0)-(prev.down||0))/dt);
+        upRate=Math.max(0, ((c.up||0)-(prev.up||0))/dt);
+      }else{
+        downRate=prev.downRate||0;
+        upRate=prev.upRate||0;
+      }
+    }else if(prev && !c.active){
+      downRate=0; upRate=0;
+    }
+    if(c.active){
+      let dur=c.duration_ms||0;
+      if(c.start){
+        const t=new Date(c.start).getTime();
+        if(!isNaN(t)) dur=Math.max(dur, now-t);
+      }
+      liveSession.map.set(c.id,{...c, duration_ms:dur, downRate, upRate, _sampleAt:now});
+    }else if(prev){
+      liveSession.map.set(c.id,{
+        ...prev, ...c, active:false, downRate:0, upRate:0,
+        up:Math.max(prev.up||0,c.up||0),
+        down:Math.max(prev.down||0,c.down||0),
+        duration_ms:Math.max(prev.duration_ms||0,c.duration_ms||0),
+        _sampleAt:now
+      });
+    }
+  });
+  const serverIds=new Set((d.connections||[]).map(c=>c.id));
+  liveSession.map.forEach((v,id)=>{
+    if(v.active && !serverIds.has(id)){
+      liveSession.map.set(id,{...v,active:false,downRate:0,upRate:0,ended:v.ended||fmtBeijing(new Date(),'full')});
+    }
+  });
+  renderLiveTables();
+}
+function startLivePoll(){
+  if(liveMode==='poll' && liveTimer) return;
+  liveMode='poll';
+  setLiveHint('轮询 · 约 0.8 秒');
+  loadLive();
+  if(liveTimer) clearInterval(liveTimer);
+  liveTimer=setInterval(()=>{if(!document.hidden)loadLive()},800);
+}
+function connectLiveWS(){
+  if(!window.WebSocket){ startLivePoll(); return; }
+  // 已有连接在连或已打开则不重复
+  if(liveWS && (liveWS.readyState===WebSocket.CONNECTING || liveWS.readyState===WebSocket.OPEN)) return;
+  const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host + '/admin/api/live/ws';
+  setLiveHint('WebSocket 连接中…');
+  let ws;
+  try{ ws = new WebSocket(url); }catch(e){ startLivePoll(); return; }
+  liveWS = ws;
+  let opened=false;
+  ws.onopen = ()=>{
+    opened=true;
+    liveMode='ws';
+    setLiveHint('WebSocket · 实时');
+    // WS 模式下仍本地推算时长，秒数更顺滑
+    if(liveTimer){ clearInterval(liveTimer); liveTimer=null; }
+  };
+  ws.onmessage = (ev)=>{
+    try{
+      const d = JSON.parse(ev.data);
+      applyLiveData(d);
+    }catch(e){}
+  };
+  ws.onerror = ()=>{};
+  ws.onclose = ()=>{
+    liveWS=null;
+    if(liveMode==='idle') return; // 已离开监控页
+    // 断线：先试一次 HTTP，再退避重连 WS
+    setLiveHint('已断开，重连中…');
+    loadLive();
+    if(liveWSRetry) clearTimeout(liveWSRetry);
+    liveWSRetry=setTimeout(()=>{
+      if(liveMode==='idle') return;
+      connectLiveWS();
+    }, 1500);
+    // 重连前短暂轮询兜底
+    if(!liveTimer){
+      liveMode='poll';
+      liveTimer=setInterval(()=>{if(!document.hidden)loadLive()},800);
+    }
+  };
+}
 function switchTab(id){
   document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));
   document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));
   document.getElementById('pt').textContent=pageTitles[id]||'';
   if(window.innerWidth<=1024)closeSidebar();
-  if(liveTimer){clearInterval(liveTimer);liveTimer=null}
-  if(id!=='live'){/* 离开监控页时清空本页累计，避免无限增长 */}
+  stopLiveTimers();
   if(id==='overview')loadOverview();
   if(id==='traffic')loadTraffic();
   if(id==='blocks')loadBlocks();
   if(id==='live'){
-    if(!liveSession.map.size) resetLiveSession();
-    loadLive();
-    liveTimer=setInterval(()=>{if(!document.hidden)loadLive()},1500);
+    resetLiveSession();
+    liveTickTimer=setInterval(tickLiveDurations,500);
+    connectLiveWS();
   } else {
     resetLiveSession();
   }
@@ -3279,6 +3770,15 @@ document.getElementById('sbMask').addEventListener('click',closeSidebar);
 
 document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
 document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
+// 连接表事件委托：避免每次 render 重新绑大量监听
+document.getElementById('lvConnTable')?.addEventListener('click',e=>{
+  const closeBtn=e.target.closest('[data-close-id]');
+  if(closeBtn){ closeLiveConn(closeBtn.getAttribute('data-close-id'), e); return; }
+  const tr=e.target.closest('tr.live-row[data-live-id]');
+  if(!tr) return;
+  const row=liveSession.map.get(tr.getAttribute('data-live-id'));
+  if(row) showLiveDetail(row);
+});
 
 function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portChip').textContent=':'+p}
 
@@ -3298,24 +3798,20 @@ let trafficTrendData=[];
 
 function updateOvStats() {
   if (!ovTrendData.length) return;
-  const today = new Date();
-  const tzOffset = today.getTimezoneOffset() * 60000;
-  const localISOTime = (new Date(today - tzOffset)).toISOString().slice(0,10);
-  const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
-  const yISOTime = (new Date(yesterday - tzOffset)).toISOString().slice(0,10);
+  const localISOTime = nowBeijingDateStr();
+  const bjNow = new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Shanghai'}));
+  const y = new Date(bjNow); y.setDate(bjNow.getDate()-1);
+  const yISOTime = fmtBeijing(y,'date');
+  const d7 = new Date(bjNow); d7.setDate(bjNow.getDate()-6);
+  const d7Str = fmtBeijing(d7,'date');
+  const d30 = new Date(bjNow); d30.setDate(bjNow.getDate()-29);
+  const d30Str = fmtBeijing(d30,'date');
 
   let filterFn = () => true;
   if (state.ovRange === 'today') filterFn = d => d.date === localISOTime;
   else if (state.ovRange === 'yesterday') filterFn = d => d.date === yISOTime;
-  else if (state.ovRange === '7d') {
-    const d7 = new Date(today); d7.setDate(today.getDate() - 6);
-    const d7Str = (new Date(d7 - tzOffset)).toISOString().slice(0,10);
-    filterFn = d => d.date >= d7Str;
-  } else if (state.ovRange === '30d') {
-    const d30 = new Date(today); d30.setDate(today.getDate() - 29);
-    const d30Str = (new Date(d30 - tzOffset)).toISOString().slice(0,10);
-    filterFn = d => d.date >= d30Str;
-  }
+  else if (state.ovRange === '7d') filterFn = d => d.date >= d7Str;
+  else if (state.ovRange === '30d') filterFn = d => d.date >= d30Str;
   
   const filtered = ovTrendData.filter(filterFn);
   let reqs = 0, bytes = 0, bCN = 0, bWL = 0;
@@ -3376,17 +3872,16 @@ function renderOvBlocks(items){
   if(!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">近期没有拦截事件</span></div>';return}
   box.innerHTML=items.slice(0,5).map(b=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid #f1f5f9;font-size:13px">
     <div style="min-width:0;flex:1"><span style="font-family:var(--mono);color:#3b82f6;font-weight:600;word-break:break-all">${esc(b.ip)}</span><br><span class="pill pw" style="margin-top:4px;display:inline-block">${b.reason==='cn'?'地区限制':'域名未授权'}</span></div>
-    <div style="color:#94a3b8;font-size:12px;flex-shrink:0">${(b.time||'').slice(11,19)}</div>
+    <div style="color:#94a3b8;font-size:12px;flex-shrink:0">${fmtBeijing(b.time,'time')}</div>
   </div>`).join('');
 }
 
 function localDateStr(d){
-  const tz=d.getTimezoneOffset()*60000;
-  return (new Date(d-tz)).toISOString().slice(0,10);
+  return fmtBeijing(d instanceof Date ? d : new Date(d), 'date');
 }
 function dateRangeBounds(){
   const today=new Date();
-  const tStr=localDateStr(today);
+  const tStr=nowBeijingDateStr();
   let from=null,to=tStr;
   const r=state.tfRange;
   if(r==='today'){from=tStr}
@@ -3409,79 +3904,95 @@ function filterTrendByRange(trend){
     return true;
   }).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
 }
+function weekStartKey(dateStr){
+  const d=new Date(dateStr+'T00:00:00');
+  const day=d.getDay()||7;
+  d.setDate(d.getDate()-day+1);
+  return localDateStr(d);
+}
+function monthKey(dateStr){ return (dateStr||'').slice(0,7); }
+/** 按区间跨度选择图表粒度：日 → 周(>60) → 月(>180) */
+function pickGranularity(dayCount){
+  if(dayCount>180) return 'month';
+  if(dayCount>60) return 'week';
+  return 'day';
+}
 function buildTrafficView(trend){
   const filtered=filterTrendByRange(trend);
   const {from,to,today}=dateRangeBounds();
-  // 仅「今天」或自定义单日且等于今日 → 分时；其余一律按天
   const isToday = state.tfRange === 'today' || (state.tfRange === 'custom' && from && to && from === to && from === today);
   const labels=[],reqs=[],bytes=[];
   const ipMap={},ctryMap={},hostMap={};
-  let totalReq=0,totalBytes=0,blocked=0;
-
+  let totalReq=0,totalBytes=0,blocked=0,rawDayCount=0,gran='hour';
   filtered.forEach(d=>{
-    totalReq+=d.requests||0;
-    totalBytes+=d.bytes||0;
+    totalReq+=d.requests||0; totalBytes+=d.bytes||0;
     blocked+=(d.blocked_cn||0)+(d.blocked_whitelist||0);
     Object.entries(d.ips||{}).forEach(([k,v])=>{ipMap[k]=(ipMap[k]||0)+v});
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
     Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
   });
-
   if(isToday){
-    const day=filtered.find(d=>d.date===today)||filtered[0]||{hours:{},hour_bytes:{},requests:0,bytes:0};
-    const hours=day.hours||{};
-    const hourBytes=day.hour_bytes||{};
+    gran='hour';
+    const day=filtered.find(d=>d.date===today)||filtered[0]||{hours:{},hour_bytes:{}};
+    const hours=day.hours||{}, hourBytes=day.hour_bytes||{};
     for(let h=0;h<24;h++){
       const key=String(h).padStart(2,'0');
-      labels.push(key+':00');
-      reqs.push(hours[key]||0);
-      bytes.push(hourBytes[key]||0);
+      labels.push(key+':00'); reqs.push(hours[key]||0); bytes.push(hourBytes[key]||0);
     }
+    rawDayCount=1;
   }else{
-    // 非今天：严格按天展示，补齐区间内无数据的日期为 0
-    const byDate={};
-    filtered.forEach(d=>{byDate[d.date]=d});
+    const byDate={}; filtered.forEach(d=>{byDate[d.date]=d});
     let days=[];
     if(from&&to){
       const a=new Date(from+'T00:00:00'), b=new Date(to+'T00:00:00');
-      for(let t=new Date(a);t<=b;t.setDate(t.getDate()+1)){
-        days.push(localDateStr(new Date(t)));
-      }
+      for(let t=new Date(a);t<=b;t.setDate(t.getDate()+1)) days.push(localDateStr(new Date(t)));
+    }else days=Object.keys(byDate).sort();
+    rawDayCount=days.length||1;
+    gran=pickGranularity(rawDayCount);
+    if(gran==='day'){
+      days.forEach(date=>{ const d=byDate[date]||{}; labels.push(date); reqs.push(d.requests||0); bytes.push(d.bytes||0); });
     }else{
-      days=Object.keys(byDate).sort();
+      const buckets={}, order=[];
+      days.forEach(date=>{
+        const key=gran==='week'?weekStartKey(date):monthKey(date);
+        if(!buckets[key]){ buckets[key]={req:0,bytes:0}; order.push(key); }
+        const d=byDate[date]||{};
+        buckets[key].req+=(d.requests||0); buckets[key].bytes+=(d.bytes||0);
+      });
+      order.forEach(key=>{ labels.push(key); reqs.push(buckets[key].req); bytes.push(buckets[key].bytes); });
     }
-    days.forEach(date=>{
-      const d=byDate[date]||{};
-      labels.push(date);
-      reqs.push(d.requests||0);
-      bytes.push(d.bytes||0);
-    });
   }
-
   const hostTop=Object.entries(hostMap).sort((a,b)=>b[1]-a[1]).slice(0,12);
-  const dayCount = isToday ? 1 : (labels.length || 1);
-  return {isToday,labels,reqs,bytes,ipMap,ctryMap,hostTop,totalReq,totalBytes,blocked,dayCount};
+  const ipTopN=30, ctryTopN=25;
+  const ipEntries=Object.entries(ipMap).sort((a,b)=>b[1]-a[1]);
+  const ctryEntries=Object.entries(ctryMap).sort((a,b)=>b[1]-a[1]);
+  const ipMapTrim={}, ctryMapTrim={};
+  ipEntries.slice(0,ipTopN).forEach(([k,v])=>{ipMapTrim[k]=v});
+  ctryEntries.slice(0,ctryTopN).forEach(([k,v])=>{ctryMapTrim[k]=v});
+  return {isToday,gran,labels,reqs,bytes,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN};
 }
-
 function applyTrafficView(){
   const v=buildTrafficView(trafficTrendData);
   document.getElementById('tfReq').textContent=v.totalReq.toLocaleString();
   document.getElementById('tfBytes').textContent=fmtBytes(v.totalBytes);
-  document.getElementById('tfIPs').textContent=Object.keys(v.ipMap).length.toLocaleString();
+  document.getElementById('tfIPs').textContent=v.ipTotalUnique.toLocaleString();
   document.getElementById('tfBlocked').textContent=v.blocked.toLocaleString();
-  document.getElementById('tfReqHint').textContent=v.isToday?'今日分时段':('共 '+v.dayCount+' 天');
-  document.getElementById('tfBytesHint').textContent=v.isToday?'今日真实分时流量':('日均 '+fmtBytes(Math.round(v.totalBytes/v.dayCount)));
-  document.getElementById('tfReqTitle').textContent=v.isToday?'请求量趋势（分时）':'请求量趋势';
-  document.getElementById('tfReqDesc').textContent=v.isToday?'今天 00:00–23:00 各时段请求数':'筛选区间内每日请求次数';
-  document.getElementById('tfByteTitle').textContent=v.isToday?'流量消耗趋势（分时）':'流量消耗趋势';
-  document.getElementById('tfByteDesc').textContent=v.isToday?'今天 00:00–23:00 各时段真实流量':'筛选区间内每日上下行流量';
+  const granHint={hour:'今日分时段',day:'共 '+v.dayCount+' 天',week:'共 '+v.dayCount+' 天 · 按周汇总',month:'共 '+v.dayCount+' 天 · 按月汇总'};
+  document.getElementById('tfReqHint').textContent=granHint[v.gran]||('共 '+v.dayCount+' 天');
+  document.getElementById('tfBytesHint').textContent=v.isToday?'今日真实分时流量':('日均 '+fmtBytes(Math.round(v.totalBytes/(v.dayCount||1))));
+  const titleMap={hour:['请求量趋势（分时）','流量消耗趋势（分时）'],day:['请求量趋势','流量消耗趋势'],week:['请求量趋势（按周）','流量消耗趋势（按周）'],month:['请求量趋势（按月）','流量消耗趋势（按月）']};
+  const descMap={hour:['今天 00:00–23:00 各时段请求数（北京时间）','今天 00:00–23:00 各时段真实流量（北京时间）'],day:['筛选区间内每日请求次数（北京时间）','筛选区间内每日上下行流量（北京时间）'],week:['区间超过 60 天，已按周汇总','区间超过 60 天，已按周汇总流量'],month:['区间超过 180 天，已按月汇总','区间超过 180 天，已按月汇总流量']};
+  const tt=titleMap[v.gran]||titleMap.day, dd=descMap[v.gran]||descMap.day;
+  document.getElementById('tfReqTitle').textContent=tt[0];
+  document.getElementById('tfReqDesc').textContent=dd[0];
+  document.getElementById('tfByteTitle').textContent=tt[1];
+  document.getElementById('tfByteDesc').textContent=dd[1];
   document.getElementById('tfHostDesc').textContent=v.isToday?'今日访问量最高的上游主机':'当前范围内访问量最高的上游主机';
-
-  renderReqChart(v.labels,v.reqs,v.isToday);
-  renderByteChart(v.labels,v.bytes,v.isToday);
+  renderReqChart(v.labels,v.reqs,v.gran);
+  renderByteChart(v.labels,v.bytes,v.gran);
   renderHostChart(v.hostTop);
-  renderIP(v.ipMap,{});
-  renderRegion(v.ctryMap);
+  renderIP(v.ipMap,{},v.ipTotalUnique,v.ipTopN);
+  renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN);
 }
 
 async function loadTraffic(){
@@ -3518,22 +4029,41 @@ function upsertChart(prev,cv,cfg){
   }
   return new Chart(cv, cfg);
 }
-function fmtAxisLabel(lab,isHourly){
-  if(isHourly) return lab;
-  // 按天：2026-10-21 → 10-21
+function fmtAxisLabel(lab,gran){
+  if(gran==='hour') return lab;
+  if(gran==='month' && /^\d{4}-\d{2}$/.test(lab)) return lab.slice(5)+'月';
   if(/^\d{4}-\d{2}-\d{2}$/.test(lab)) return lab.slice(5);
   return lab;
 }
-function renderReqChart(labels,data,isToday){
+function tooltipTitle(labels,gran){
+  return (items)=>{
+    const raw=labels[items[0].dataIndex]||'';
+    if(gran==='week' && /^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw+' 起一周';
+    if(gran==='month' && /^\d{4}-\d{2}$/.test(raw)) return raw;
+    return raw;
+  };
+}
+function chartTickLimit(n,gran){
+  if(gran==='hour') return 12;
+  if(n<=14) return n;
+  if(gran==='month') return Math.min(18,n);
+  if(gran==='week') return Math.min(16,n);
+  return 14;
+}
+function renderReqChart(labels,data,gran){
   const cv=document.getElementById('reqChart');if(!cv||typeof Chart==='undefined')return;
-  const labs=labels.map(l=>fmtAxisLabel(l,isToday));
-  const cfg={type:isToday?'bar':'bar',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:isToday?'rgba(16,185,129,0.75)':'rgba(16,185,129,0.65)',borderWidth:1,fill:false,tension:0.3,pointRadius:0,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:(items)=>labels[items[0].dataIndex]||''}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:isToday?12:14}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
+  gran=gran||'day';
+  const labs=labels.map(l=>fmtAxisLabel(l,gran));
+  const dense=labels.length>40;
+  const cfg={type:'bar',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:gran==='hour'?'rgba(16,185,129,0.75)':'rgba(16,185,129,0.65)',borderWidth:1,borderRadius:dense?2:4,maxBarThickness:dense?10:28}]},options:{responsive:true,maintainAspectRatio:false,animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
-function renderByteChart(labels,data,isToday){
+function renderByteChart(labels,data,gran){
   const cv=document.getElementById('byteChart');if(!cv||typeof Chart==='undefined')return;
-  const labs=labels.map(l=>fmtAxisLabel(l,isToday));
-  const cfg={type:'line',data:{labels:labs,datasets:[{label:'流量',data,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',fill:true,tension:0.3,pointRadius:isToday?0:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:(items)=>labels[items[0].dataIndex]||'',label:c=>fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:isToday?12:14}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
+  gran=gran||'day';
+  const labs=labels.map(l=>fmtAxisLabel(l,gran));
+  const dense=labels.length>40;
+  const cfg={type:'line',data:{labels:labs,datasets:[{label:'流量',data,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',fill:true,tension:0.3,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),borderWidth:2,pointHoverRadius:4}]},options:{responsive:true,maintainAspectRatio:false,animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
 function renderHostChart(hostTop){
@@ -3544,27 +4074,31 @@ function renderHostChart(hostTop){
   const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(59,130,246,0.7)',borderRadius:4}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{font:{size:11}}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
 }
-
-function renderIP(map,bytesMap){
-  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);
+function renderIP(map,bytesMap,totalUnique,topN){
+  topN=topN||20;
+  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
   const box=document.getElementById('ipDist');
   if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有 IP 记录</span></div>';return}
   const max=rows[0][1]||1;
-  box.innerHTML=rows.map(([ip,n])=>{
-    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`;
-  }).join('');
+  const more=(totalUnique||rows.length)>rows.length;
+  let html=rows.map(([ip,n])=>`<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`).join('');
+  if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个 IP</div>`;
+  box.innerHTML=html;
   box.querySelectorAll('.ip-row').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
 }
-
-function renderRegion(map){
-  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,20);
+function renderRegion(map,totalUnique,topN){
+  topN=topN||20;
+  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
   const box=document.getElementById('regionDist');
   if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有地区记录</span></div>';return}
   const total=rows.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;
-  box.innerHTML=rows.map(([code,n])=>{
+  const more=(totalUnique||rows.length)>rows.length;
+  let html=rows.map(([code,n])=>{
     const nm=countryLabel(code);
     return `<div class="dr"><span class="dn" title="${nm}"><img class="flg" src="/admin/api/flag/${code.toLowerCase()}" onerror="this.style.display='none'"> <span class="tx">${nm}</span></span><div class="bar t"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
   }).join('');
+  if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个地区</div>`;
+  box.innerHTML=html;
 }
 
 async function showLiveDetail(c){
@@ -3580,9 +4114,9 @@ async function showLiveDetail(c){
     ['下行流量',fmtBytes(c.down||0),false],
     ['上行流量',fmtBytes(c.up||0),false],
     ['持续时长',fmtDur(c.duration_ms||0),false],
-    ['开始时间',(c.start||'').replace('T',' ').replace('Z',''),false],
+    ['开始时间',fmtBeijing(c.start,'full'),false],
   ];
-  if(c.ended) rows.push(['结束时间',(c.ended||'').replace('T',' ').replace('Z',''),false]);
+  if(c.ended) rows.push(['结束时间',fmtBeijing(c.ended,'full'),false]);
   let html=rows.map(([k,v,m])=>'<div class="kv"><div class="kk">'+esc(k)+'</div><div class="kvv'+(m?' m':'')+'">'+esc(v)+'</div></div>').join('');
   if(c.ip){
     html+='<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn b s" id="liveToIpBtn">查看 IP 详情</button></div>';
@@ -3610,7 +4144,31 @@ async function showIPDetail(ip){
 }
 
 function fmtRate(b){if(!b||b<0)return '0 B/s';if(b<1024)return b+' B/s';if(b<1048576)return (b/1024).toFixed(1)+' KB/s';if(b<1073741824)return (b/1048576).toFixed(1)+' MB/s';return (b/1073741824).toFixed(2)+' GB/s'}
-function fmtDur(ms){if(ms<1000)return ms+' ms';if(ms<60000)return (ms/1000).toFixed(1)+' s';return Math.floor(ms/60000)+'m '+Math.floor((ms%60000)/1000)+'s'}
+function fmtDur(ms){ms=Math.max(0,Math.floor(ms||0));if(ms<1000)return ms+'ms';const s=Math.floor(ms/1000);if(s<60)return s+'s';const m=Math.floor(s/60),rs=s%60;if(m<60)return m+'m '+String(rs).padStart(2,'0')+'s';const h=Math.floor(m/60),rm=m%60;return h+'h '+String(rm).padStart(2,'0')+'m '+String(rs).padStart(2,'0')+'s'}
+/** 相对时间：几秒前 / 2分钟前 / 1小时前 */
+function fmtAgo(iso){
+  if(!iso) return '-';
+  const t=new Date(iso).getTime();
+  if(isNaN(t)) return '-';
+  const sec=Math.max(0,Math.floor((Date.now()-t)/1000));
+  if(sec<5) return '几秒前';
+  if(sec<60) return sec+'秒前';
+  if(sec<3600) return Math.floor(sec/60)+'分钟前';
+  if(sec<86400) return Math.floor(sec/3600)+'小时前';
+  return Math.floor(sec/86400)+'天前';
+}
+async function closeLiveConn(id, ev){
+  if(ev){ ev.stopPropagation(); ev.preventDefault(); }
+  if(!id) return;
+  try{
+    const r=await fetch('/admin/api/live/close?id='+encodeURIComponent(id),{method:'POST'});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){ alert(d.error||'断开失败'); return; }
+    const prev=liveSession.map.get(id);
+    if(prev) liveSession.map.set(id,{...prev,active:false,downRate:0,upRate:0,ended:fmtBeijing(new Date(),'full')});
+    renderLiveTables();
+  }catch(e){ alert('断开失败：网络异常'); }
+}
 function livePagerHtml(prefix,page,total,pageSize){
   const pages=Math.max(1,Math.ceil(total/pageSize));
   const p=Math.min(Math.max(1,page),pages);
@@ -3621,10 +4179,13 @@ function livePagerHtml(prefix,page,total,pageSize){
     <button type="button" class="btn g s" data-live-page="${prefix}" data-to="${pages}" ${p>=pages?'disabled':''}>末页</button>
   </span>`;
 }
+/** 渲染连接表（代理面板风格列）与按 IP 汇总；点击事件由 #lvConnTable 委托 */
 function renderLiveTables(){
   const all=[...liveSession.map.values()];
   all.sort((a,b)=>{
     if(!!a.active!==!!b.active) return a.active?-1:1;
+    const ar=(a.downRate||0)+(a.upRate||0), br=(b.downRate||0)+(b.upRate||0);
+    if(ar!==br) return br-ar;
     return (b.down||0)-(a.down||0);
   });
   const ps=liveSession.pageSize;
@@ -3635,22 +4196,27 @@ function renderLiveTables(){
   const slice=all.slice(start,start+ps);
   const ct=document.getElementById('lvConnTable');
   if(!total){
-    ct.innerHTML='<tr class="emp-row"><td colspan="7"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">有代理请求后将在此累计展示</span></div></td></tr>';
+    ct.innerHTML='<tr class="emp-row"><td colspan="10"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">有代理请求后将在此累计展示</span></div></td></tr>';
   }else{
-    ct.innerHTML=slice.map(c=>`<tr class="live-row" data-live-id="${esc(c.id)}" style="cursor:pointer" title="点击查看详情">
-      <td data-label="状态"><span class="cell-v"><span class="pill ${c.active?'pc':'pw'}">${c.active?'进行中':'已结束'}</span></span></td>
-      <td data-label="IP"><span class="cell-v mono" style="color:var(--pd)">${esc(c.ip)}</span></td>
-      <td data-label="地区"><span class="cell-v">${esc(c.country_name||countryLabel(c.country))}</span></td>
-      <td data-label="上游"><span class="cell-v" title="${esc(c.path||'')}">${esc(c.host||'-')}</span></td>
-      <td data-label="下行"><span class="cell-v mono">${fmtBytes(c.down||0)}</span></td>
-      <td data-label="上行"><span class="cell-v mono">${fmtBytes(c.up||0)}</span></td>
-      <td data-label="时长"><span class="cell-v muted">${fmtDur(c.duration_ms||0)}</span></td>
-    </tr>`).join('');
-    ct.querySelectorAll('.live-row').forEach(el=>el.addEventListener('click',()=>{
-      const id=el.getAttribute('data-live-id');
-      const row=liveSession.map.get(id);
-      if(row) showLiveDetail(row);
-    }));
+    ct.innerHTML=slice.map(c=>{
+      const path=(c.path||'').replace(/^\/https?:\/\/[^/]+/i,'')||'/';
+      const pathShort=path.length>48?path.slice(0,46)+'…':path;
+      const dRate=c.active?(c.downRate||0):0;
+      const uRate=c.active?(c.upRate||0):0;
+      const agoTitle=esc(fmtBeijing(c.start,'full')+(c.ended?' ~ '+fmtBeijing(c.ended,'full'):'')+' · 时长 '+fmtDur(c.duration_ms||0));
+      return `<tr class="live-row ${c.active?'lv-active':''}" data-live-id="${esc(c.id)}" style="cursor:pointer" title="点击查看详情">
+      <td data-label="操作"><span class="cell-v">${c.active?`<button type="button" class="lv-x" data-close-id="${esc(c.id)}" title="断开连接">×</button>`:'<button type="button" class="lv-x" disabled title="已结束">×</button>'}</span></td>
+      <td data-label="主机"><span class="cell-v lv-host">${esc(c.host||'-')}</span></td>
+      <td data-label="类型"><span class="cell-v"><span class="lv-type ${c.active?'on':''}">${esc(c.method||'GET')}${c.active?' · 进行中':' · 已结束'}</span></span></td>
+      <td data-label="来源"><span class="cell-v"><span class="lv-src"><span class="ip">${esc(c.ip||'-')}</span><span class="rg">${esc(c.country_name||countryLabel(c.country))}</span></span></span></td>
+      <td data-label="路径"><span class="cell-v"><span class="lv-path" title="${esc(c.path||path)}">${esc(pathShort)}</span></span></td>
+      <td data-label="下载速度"><span class="cell-v lv-rate ${dRate>0?'on':''}">${fmtRate(dRate)}</span></td>
+      <td data-label="上传速度"><span class="cell-v lv-rate ${uRate>0?'on':''}">${fmtRate(uRate)}</span></td>
+      <td data-label="下载"><span class="cell-v lv-bytes">${fmtBytes(c.down||0)}</span></td>
+      <td data-label="上传"><span class="cell-v lv-bytes">${fmtBytes(c.up||0)}</span></td>
+      <td data-label="连接时间"><span class="cell-v lv-ago" title="${agoTitle}">${fmtAgo(c.start)}</span></td>
+    </tr>`;
+    }).join('');
   }
   document.getElementById('lvConnPager').innerHTML=livePagerHtml('conn',liveSession.connPage,total,ps);
   document.getElementById('lvIPCount').textContent=total.toLocaleString();
@@ -3686,36 +4252,7 @@ async function loadLive(){
   try{
     const r=await fetch('/admin/api/live',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
-    const d=await r.json();
-    document.getElementById('lvActive').textContent=(d.active||0).toLocaleString();
-    document.getElementById('lvDown').textContent=fmtRate(d.down_bps||0);
-    document.getElementById('lvUp').textContent=fmtRate(d.up_bps||0);
-    (d.connections||[]).forEach(c=>{
-      if(!c||!c.id) return;
-      const prev=liveSession.map.get(c.id);
-      // 活跃记录始终覆盖；已结束若本地已有则保留较大流量值
-      if(c.active || !prev){
-        liveSession.map.set(c.id,{...c});
-      }else if(prev.active){
-        liveSession.map.set(c.id,{...c,active:false});
-      }else{
-        liveSession.map.set(c.id,{
-          ...prev,
-          up:Math.max(prev.up||0,c.up||0),
-          down:Math.max(prev.down||0,c.down||0),
-          duration_ms:Math.max(prev.duration_ms||0,c.duration_ms||0),
-          active:false
-        });
-      }
-    });
-    // 服务端已不在列表中的本地活跃项 → 标记结束（不断累积删除）
-    const serverIds=new Set((d.connections||[]).map(c=>c.id));
-    liveSession.map.forEach((v,id)=>{
-      if(v.active && !serverIds.has(id)){
-        liveSession.map.set(id,{...v,active:false});
-      }
-    });
-    renderLiveTables();
+    applyLiveData(await r.json());
   }catch(e){console.error('loadLive',e)}
 }
 
@@ -3727,7 +4264,7 @@ async function loadBlocks(){
     const tb=document.getElementById('blockTable');
     if(!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="5"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">尚未产生拦截事件</span></div></td></tr>';return}
     tb.innerHTML=t.items.map(b=>`<tr>
-      <td data-label="时间"><span class="cell-v muted mono">${(b.time||'').replace('T',' ').slice(0,19)}</span></td>
+      <td data-label="时间"><span class="cell-v muted mono">${fmtBeijing(b.time,'full')}</span></td>
       <td data-label="IP 地址"><span class="cell-v mono ip-link" data-ip="${esc(b.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600">${esc(b.ip)}</span></td>
       <td data-label="地区"><span class="cell-v"><img class="flg" src="/admin/api/flag/${(b.country||'??').toLowerCase()}" onerror="this.style.display='none'" alt="">${esc(b.country_name||countryLabel(b.country||'??'))}</span></td>
       <td data-label="拦截原因"><span class="cell-v"><span class="pill ${b.reason==='cn'?'pc':'pw'}">${b.reason==='cn'?'地区限制':'域名未授权'}</span></span></td>
@@ -3865,6 +4402,7 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 UNIT
 }
+# 编译二进制：可选用 --prebuilt；否则写源码、go mod、CGO_ENABLED=0 静态链接
 build_binary() {
   local out="$1"
   if [[ -n "$PREBUILT" ]]; then [[ -f "$PREBUILT" ]] || die "预构建二进制不存在: $PREBUILT"; cp -f "$PREBUILT" "$out"; chmod 0755 "$out"; return; fi
@@ -3879,6 +4417,7 @@ build_binary() {
     go get "github.com/phuslu/iploc@${IPLOC_VERSION}" >/dev/null 2>&1 || true
     go get "go.etcd.io/bbolt@latest" >/dev/null 2>&1 || true
     go get "golang.org/x/sync/singleflight@v0.10.0" >/dev/null 2>&1 || true
+    go get "github.com/gorilla/websocket@v1.5.3" >/dev/null 2>&1 || true
     go mod tidy >/dev/null 2>&1 || die "依赖解析失败（可设 GOPROXY=https://goproxy.cn,direct 后重试）"
   )
   info "编译中..."
@@ -3921,6 +4460,8 @@ EOF
   fi
 }
 
+# 安装/重装：编译（若源码或 unit 有变）→ 写 systemd unit → enable --now
+# 支持：--port --admin-pass --bin --prebuilt --force --code-only
 cmd_install() {
   parse_install_args "$@"
   require_root install
@@ -4012,6 +4553,7 @@ cmd_uninstall() {
   rm -f "${DEFAULT_BIN}.tmp."* 2>/dev/null || true
   info "卸载完成"
 }
+# 更新：强制重编译并只替换程序（保留配置与 unit 中的端口/密码）
 cmd_update() {
   require_root update
   require_systemd
@@ -4136,6 +4678,7 @@ cmd_menu() {
     esac
   done
 }
+# 入口：无参数默认进入交互菜单
 main() {
   local sub="${1:-menu}"
   if [[ $# -gt 0 ]]; then shift; fi
