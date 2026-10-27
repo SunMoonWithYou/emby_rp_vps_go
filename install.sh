@@ -228,6 +228,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/phuslu/iploc"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -752,7 +753,7 @@ func rootDomain(hostport string) string {
 	}
 	return strings.Join(parts[n-2:], ".")
 }
-// whitelistMatch 空列表表示不限制；否则匹配完整 host 或与规则相同的根域名。
+// whitelistMatch 空列表表示不限制；支持完整 host、根域、以及 *.example.com 通配。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
@@ -761,7 +762,18 @@ func whitelistMatch(list []string, targetHost string) bool {
 	targetRoot := rootDomain(target)
 	for _, w := range list {
 		w = strings.TrimSpace(w)
+		// 允许行内注释
+		if i := strings.IndexAny(w, "#;"); i >= 0 {
+			w = strings.TrimSpace(w[:i])
+		}
 		if w == "" {
+			continue
+		}
+		if strings.HasPrefix(w, "*.") {
+			suf := strings.ToLower(strings.TrimPrefix(w, "*."))
+			if target == suf || strings.HasSuffix(target, "."+suf) {
+				return true
+			}
 			continue
 		}
 		if strings.EqualFold(normalizeHost(w), target) {
@@ -786,19 +798,25 @@ type BlockEvent struct {
 
 // DayStat：按天统计
 type DayStat struct {
-	Requests  int64            `json:"requests"`
-	Bytes     int64            `json:"bytes"`
-	BlockedCN int64            `json:"blocked_cn"`
-	BlockedWL int64            `json:"blocked_wl"`
-	BlockedBan int64            `json:"blocked_ban"`  // IP 黑名单拦截
-	BlockedRate int64           `json:"blocked_rate"` // 触发限流
-	BlockedUA int64            `json:"blocked_ua"`   // UA 不在白名单
-	Countries map[string]int64 `json:"countries,omitempty"` // 国家码 -> 请求数
-	IPs       map[string]int64 `json:"ips,omitempty"`       // IP -> 请求数
-	IPBytes   map[string]int64 `json:"ip_bytes,omitempty"`  // IP -> 流量
-	Hours     map[string]int64 `json:"hours,omitempty"`      // "00"-"23" -> 请求数
-	HourBytes map[string]int64 `json:"hour_bytes,omitempty"` // "00"-"23" -> 真实流量字节
-	Hosts     map[string]int64 `json:"hosts,omitempty"`      // 上游主机 -> 请求数
+	Requests   int64            `json:"requests"`
+	Bytes      int64            `json:"bytes"`       // 上下行合计（兼容旧字段）
+	UpBytes    int64            `json:"up_bytes"`    // 上行（客户端→代理）
+	DownBytes  int64            `json:"down_bytes"`  // 下行（代理→客户端）
+	BlockedCN  int64            `json:"blocked_cn"`
+	BlockedWL  int64            `json:"blocked_wl"`
+	BlockedBan int64            `json:"blocked_ban"`
+	BlockedRate int64           `json:"blocked_rate"`
+	BlockedUA  int64            `json:"blocked_ua"`
+	Countries  map[string]int64 `json:"countries,omitempty"`
+	IPs        map[string]int64 `json:"ips,omitempty"`
+	IPBytes    map[string]int64 `json:"ip_bytes,omitempty"`
+	IPUpBytes  map[string]int64 `json:"ip_up_bytes,omitempty"`
+	IPDownBytes map[string]int64 `json:"ip_down_bytes,omitempty"`
+	Hours      map[string]int64 `json:"hours,omitempty"`
+	HourBytes  map[string]int64 `json:"hour_bytes,omitempty"`
+	HourUpBytes map[string]int64 `json:"hour_up_bytes,omitempty"`
+	HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"`
+	Hosts      map[string]int64 `json:"hosts,omitempty"`
 }
 
 func newDayStat() *DayStat {
@@ -806,8 +824,12 @@ func newDayStat() *DayStat {
 		Countries: map[string]int64{},
 		IPs:       map[string]int64{},
 		IPBytes:   map[string]int64{},
+		IPUpBytes: map[string]int64{},
+		IPDownBytes: map[string]int64{},
 		Hours:     map[string]int64{},
 		HourBytes: map[string]int64{},
+		HourUpBytes: map[string]int64{},
+		HourDownBytes: map[string]int64{},
 		Hosts:     map[string]int64{},
 	}
 }
@@ -822,11 +844,23 @@ func ensureDayMaps(d *DayStat) {
 	if d.IPBytes == nil {
 		d.IPBytes = map[string]int64{}
 	}
+	if d.IPUpBytes == nil {
+		d.IPUpBytes = map[string]int64{}
+	}
+	if d.IPDownBytes == nil {
+		d.IPDownBytes = map[string]int64{}
+	}
 	if d.Hours == nil {
 		d.Hours = map[string]int64{}
 	}
 	if d.HourBytes == nil {
 		d.HourBytes = map[string]int64{}
+	}
+	if d.HourUpBytes == nil {
+		d.HourUpBytes = map[string]int64{}
+	}
+	if d.HourDownBytes == nil {
+		d.HourDownBytes = map[string]int64{}
 	}
 	if d.Hosts == nil {
 		d.Hosts = map[string]int64{}
@@ -865,8 +899,12 @@ type Stats struct {
 	TodayDate        string              `json:"today_date"`
 	TodayRequests    int64               `json:"today_requests"`
 	TodayBytes       int64               `json:"today_bytes"`
+	TodayUpBytes     int64               `json:"today_up_bytes"`
+	TodayDownBytes   int64               `json:"today_down_bytes"`
 	TotalRequests    int64               `json:"total_requests"`
 	TotalBytes       int64               `json:"total_bytes"`
+	TotalUpBytes     int64               `json:"total_up_bytes"`
+	TotalDownBytes   int64               `json:"total_down_bytes"`
 	BlockedCN        int64               `json:"blocked_cn"`
 	BlockedWhitelist int64               `json:"blocked_whitelist"`
 	BlockedBan       int64               `json:"blocked_ban"`
@@ -876,8 +914,19 @@ type Stats struct {
 	CountryCounts    map[string]int64    `json:"country_counts"`
 	IPCounts         map[string]int64    `json:"ip_counts"`
 	IPBytes          map[string]int64    `json:"ip_bytes"`
+	IPUpBytes        map[string]int64    `json:"ip_up_bytes"`
+	IPDownBytes      map[string]int64    `json:"ip_down_bytes"`
 	Daily            map[string]*DayStat `json:"daily,omitempty"`
 	Blocks           []BlockEvent        `json:"blocks"`
+	Audit            []AuditEvent        `json:"audit,omitempty"`
+}
+
+// AuditEvent 管理操作审计
+type AuditEvent struct {
+	Time   string `json:"time"`
+	IP     string `json:"ip"`
+	Action string `json:"action"`
+	Detail string `json:"detail"`
 }
 
 var (
@@ -886,11 +935,13 @@ var (
 )
 
 type statEvent struct {
-	IP      string
-	Country string
-	Host    string // 上游目标主机，写入 DayStat.Hosts
-	Bytes   int64
-	IsStart bool
+	IP       string
+	Country  string
+	Host     string
+	Bytes    int64
+	UpBytes  int64
+	DownBytes int64
+	IsStart  bool
 }
 
 var statChan = make(chan statEvent, 10000)
@@ -930,6 +981,8 @@ func pruneTopN[K comparable](m map[K]int64, n int) {
 func pruneStatsLocked() {
 	pruneTopN(stats.IPCounts, 1000)
 	pruneTopN(stats.IPBytes, 1000)
+	pruneTopN(stats.IPUpBytes, 1000)
+	pruneTopN(stats.IPDownBytes, 1000)
 	cutoff := time.Now().AddDate(-1, 0, 0).Format("2006-01-02")
 	for k := range stats.Daily {
 		if k < cutoff {
@@ -940,8 +993,13 @@ func pruneStatsLocked() {
 		ensureDayMaps(day)
 		pruneTopN(day.IPs, 500)
 		pruneTopN(day.IPBytes, 500)
+		pruneTopN(day.IPUpBytes, 500)
+		pruneTopN(day.IPDownBytes, 500)
 		pruneTopN(day.Hosts, 300)
 		pruneTopN(day.Countries, 200)
+	}
+	if len(stats.Audit) > maxAuditEvents {
+		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
 	}
 }
 
@@ -957,6 +1015,8 @@ func startStatsWorker() {
 				stats.TodayDate = t
 				stats.TodayRequests = 0
 				stats.TodayBytes = 0
+				stats.TodayUpBytes = 0
+				stats.TodayDownBytes = 0
 			}
 			if ev.IsStart {
 				stats.TotalRequests++
@@ -980,15 +1040,36 @@ func startStatsWorker() {
 				if ev.Host != "" {
 					d.Hosts[ev.Host]++
 				}
-			} else if ev.Bytes > 0 {
-				stats.TotalBytes += ev.Bytes
-				stats.TodayBytes += ev.Bytes
+			} else if ev.Bytes > 0 || ev.UpBytes > 0 || ev.DownBytes > 0 {
+				up, down := ev.UpBytes, ev.DownBytes
+				if up == 0 && down == 0 {
+					// 兼容旧调用：只传合计
+					down = ev.Bytes
+				}
+				total := up + down
+				if total == 0 {
+					total = ev.Bytes
+				}
+				stats.TotalBytes += total
+				stats.TodayBytes += total
+				stats.TotalUpBytes += up
+				stats.TotalDownBytes += down
+				stats.TodayUpBytes += up
+				stats.TodayDownBytes += down
 				d := dayOf(t)
-				d.Bytes += ev.Bytes
-				d.HourBytes[hour] += ev.Bytes
+				d.Bytes += total
+				d.UpBytes += up
+				d.DownBytes += down
+				d.HourBytes[hour] += total
+				d.HourUpBytes[hour] += up
+				d.HourDownBytes[hour] += down
 				if ev.IP != "" {
-					stats.IPBytes[ev.IP] += ev.Bytes
-					d.IPBytes[ev.IP] += ev.Bytes
+					stats.IPBytes[ev.IP] += total
+					stats.IPUpBytes[ev.IP] += up
+					stats.IPDownBytes[ev.IP] += down
+					d.IPBytes[ev.IP] += total
+					d.IPUpBytes[ev.IP] += up
+					d.IPDownBytes[ev.IP] += down
 				}
 			}
 			statsMu.Unlock()
@@ -1003,13 +1084,14 @@ func recordRequestStart(ip, country, host string) {
 		statDropped.Add(1) // 通道满：丢弃但不阻塞请求
 	}
 }
-func recordBytes(ip string, bytes int64) {
-	if bytes > 0 {
-		select {
-		case statChan <- statEvent{IP: ip, Bytes: bytes, IsStart: false}:
-		default:
-			statDropped.Add(1)
-		}
+func recordBytes(ip string, up, down int64) {
+	if up <= 0 && down <= 0 {
+		return
+	}
+	select {
+	case statChan <- statEvent{IP: ip, Bytes: up + down, UpBytes: up, DownBytes: down, IsStart: false}:
+	default:
+		statDropped.Add(1)
 	}
 }
 
@@ -1019,8 +1101,12 @@ type statsMetaDisk struct {
 	TodayDate        string `json:"today_date"`
 	TodayRequests    int64  `json:"today_requests"`
 	TodayBytes       int64  `json:"today_bytes"`
+	TodayUpBytes     int64  `json:"today_up_bytes"`
+	TodayDownBytes   int64  `json:"today_down_bytes"`
 	TotalRequests    int64  `json:"total_requests"`
 	TotalBytes       int64  `json:"total_bytes"`
+	TotalUpBytes     int64  `json:"total_up_bytes"`
+	TotalDownBytes   int64  `json:"total_down_bytes"`
 	BlockedCN        int64  `json:"blocked_cn"`
 	BlockedWhitelist int64  `json:"blocked_whitelist"`
 	BlockedBan       int64  `json:"blocked_ban"`
@@ -1035,8 +1121,11 @@ func emptyStats() Stats {
 		CountryCounts: map[string]int64{},
 		IPCounts:      map[string]int64{},
 		IPBytes:       map[string]int64{},
+		IPUpBytes:     map[string]int64{},
+		IPDownBytes:   map[string]int64{},
 		Daily:         map[string]*DayStat{},
 		Blocks:        []BlockEvent{},
+		Audit:         []AuditEvent{},
 	}
 }
 
@@ -1044,6 +1133,8 @@ func rebuildAggregatesFromDaily() {
 	stats.CountryCounts = map[string]int64{}
 	stats.IPCounts = map[string]int64{}
 	stats.IPBytes = map[string]int64{}
+	stats.IPUpBytes = map[string]int64{}
+	stats.IPDownBytes = map[string]int64{}
 	for _, d := range stats.Daily {
 		if d == nil {
 			continue
@@ -1058,9 +1149,17 @@ func rebuildAggregatesFromDaily() {
 		for k, v := range d.IPBytes {
 			stats.IPBytes[k] += v
 		}
+		for k, v := range d.IPUpBytes {
+			stats.IPUpBytes[k] += v
+		}
+		for k, v := range d.IPDownBytes {
+			stats.IPDownBytes[k] += v
+		}
 	}
 	pruneTopN(stats.IPCounts, 1000)
 	pruneTopN(stats.IPBytes, 1000)
+	pruneTopN(stats.IPUpBytes, 1000)
+	pruneTopN(stats.IPDownBytes, 1000)
 }
 
 func loadStats() {
@@ -1078,13 +1177,17 @@ func loadStats() {
 					stats.TodayDate = m.TodayDate
 					stats.TodayRequests = m.TodayRequests
 					stats.TodayBytes = m.TodayBytes
+					stats.TodayUpBytes = m.TodayUpBytes
+					stats.TodayDownBytes = m.TodayDownBytes
 					stats.TotalRequests = m.TotalRequests
 					stats.TotalBytes = m.TotalBytes
-				stats.BlockedCN = m.BlockedCN
-				stats.BlockedWhitelist = m.BlockedWhitelist
-				stats.BlockedBan = m.BlockedBan
-				stats.BlockedRate = m.BlockedRate
-				stats.BlockedUA = m.BlockedUA
+					stats.TotalUpBytes = m.TotalUpBytes
+					stats.TotalDownBytes = m.TotalDownBytes
+					stats.BlockedCN = m.BlockedCN
+					stats.BlockedWhitelist = m.BlockedWhitelist
+					stats.BlockedBan = m.BlockedBan
+					stats.BlockedRate = m.BlockedRate
+					stats.BlockedUA = m.BlockedUA
 					stats.LastProxyAt = m.LastProxyAt
 				}
 			}
@@ -1132,11 +1235,20 @@ func loadStats() {
 	if stats.IPBytes == nil {
 		stats.IPBytes = map[string]int64{}
 	}
+	if stats.IPUpBytes == nil {
+		stats.IPUpBytes = map[string]int64{}
+	}
+	if stats.IPDownBytes == nil {
+		stats.IPDownBytes = map[string]int64{}
+	}
 	if stats.Daily == nil {
 		stats.Daily = map[string]*DayStat{}
 	}
 	if stats.Blocks == nil {
 		stats.Blocks = []BlockEvent{}
+	}
+	if stats.Audit == nil {
+		stats.Audit = []AuditEvent{}
 	}
 	for _, d := range stats.Daily {
 		ensureDayMaps(d)
@@ -1185,8 +1297,12 @@ func marshalStatsLocked() *statsSnapshot {
 		TodayDate:        stats.TodayDate,
 		TodayRequests:    stats.TodayRequests,
 		TodayBytes:       stats.TodayBytes,
+		TodayUpBytes:     stats.TodayUpBytes,
+		TodayDownBytes:   stats.TodayDownBytes,
 		TotalRequests:    stats.TotalRequests,
 		TotalBytes:       stats.TotalBytes,
+		TotalUpBytes:     stats.TotalUpBytes,
+		TotalDownBytes:   stats.TotalDownBytes,
 		BlockedCN:        stats.BlockedCN,
 		BlockedWhitelist: stats.BlockedWhitelist,
 		BlockedBan:       stats.BlockedBan,
@@ -1643,6 +1759,8 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	case "ua":
 		stats.BlockedUA++
 		day.BlockedUA++
+	case "login_fail":
+		// 登录失败单独记入拦截列表，不计入白名单类计数
 	default:
 		stats.BlockedWhitelist++
 		day.BlockedWL++
@@ -1669,12 +1787,15 @@ func blockReasonText(reason string) string {
 		return "请求超过限流阈值"
 	case "ua":
 		return "User-Agent 不在允许列表"
+	case "login_fail":
+		return "管理后台登录失败（用户名/密码或验证码错误）"
 	default:
 		return "目标域名未在白名单中"
 	}
 }
 
 const maxBlockEvents = 5000
+const maxAuditEvents = 1000
 
 type geoEntry struct {
 	Code   string  `json:"code"`
@@ -2108,15 +2229,48 @@ var (
 	adminCredPtr atomic.Pointer[adminCred]
 )
 
-type adminCred struct{ User, Pass string }
+type adminCred struct {
+	User     string
+	PassHash string // bcrypt hash；兼容迁移期可能短暂存明文再被覆盖
+}
 
-func setAdminCred(u, p string) { adminCredPtr.Store(&adminCred{u, p}) }
-func getAdminCred() (string, string) {
+func setAdminCred(u, hash string) { adminCredPtr.Store(&adminCred{User: u, PassHash: hash}) }
+func getAdminUser() string {
 	c := adminCredPtr.Load()
 	if c == nil {
-		return "", ""
+		return "admin"
 	}
-	return c.User, c.Pass
+	return c.User
+}
+func getAdminHash() string {
+	c := adminCredPtr.Load()
+	if c == nil {
+		return ""
+	}
+	return c.PassHash
+}
+
+func hashPassword(plain string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func verifyPassword(hash, plain string) bool {
+	if hash == "" || plain == "" {
+		return false
+	}
+	// 兼容旧版明文：若不是 bcrypt 格式则做常量时间比较并提示升级
+	if !strings.HasPrefix(hash, "$2a$") && !strings.HasPrefix(hash, "$2b$") && !strings.HasPrefix(hash, "$2y$") {
+		return subtle.ConstantTimeCompare([]byte(hash), []byte(plain)) == 1
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
+}
+
+func isBcryptHash(s string) bool {
+	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }
 
 const (
@@ -2177,11 +2331,26 @@ func validSession(tok string) bool {
 		return false
 	}
 	e := v.(sessionEntry)
-	if time.Now().After(e.Expires) {
+	now := time.Now()
+	if now.After(e.Expires) {
 		sessions.Delete(tok)
 		return false
 	}
+	// 滑动续期：剩余不足一半 TTL 时自动延长
+	if e.Expires.Sub(now) < sessionTTL/2 {
+		sessions.Store(tok, sessionEntry{Expires: now.Add(sessionTTL)})
+	}
 	return true
+}
+
+// destroyOtherSessions 踢出除当前外的所有会话
+func destroyOtherSessions(keep string) {
+	sessions.Range(func(k, _ interface{}) bool {
+		if ks, ok := k.(string); ok && ks != keep {
+			sessions.Delete(k)
+		}
+		return true
+	})
 }
 func destroySession(tok string) {
 	if tok != "" {
@@ -2195,8 +2364,26 @@ func getSessionToken(r *http.Request) string {
 	}
 	return c.Value
 }
-func setSessionCookie(w http.ResponseWriter, tok string) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: tok, Path: "/admin", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int(sessionTTL.Seconds())})
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return true
+	}
+	return false
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
+	c := &http.Cookie{
+		Name: sessionCookie, Value: tok, Path: "/admin",
+		HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		MaxAge: int(sessionTTL.Seconds()),
+	}
+	if requestIsHTTPS(r) {
+		c.Secure = true
+	}
+	http.SetCookie(w, c)
 }
 func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
@@ -2377,7 +2564,7 @@ loadCaptcha();
 </body>
 </html>`
 
-func saveAdminPassFile(pass string) error {
+func saveAdminPassHash(hash string) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
 	}
@@ -2386,8 +2573,150 @@ func saveAdminPassFile(pass string) error {
 		if err != nil {
 			return err
 		}
-		return bk.Put([]byte("admin_pass"), []byte(pass))
+		// 清除旧明文键，只保留哈希
+		_ = bk.Delete([]byte("admin_pass"))
+		return bk.Put([]byte("admin_pass_hash"), []byte(hash))
 	})
+}
+
+// recordAudit 写入管理操作审计（持锁或不持锁均可，内部自取锁）
+func recordAudit(ip, action, detail string) {
+	statsMu.Lock()
+	defer statsMu.Unlock()
+	ev := AuditEvent{Time: beijingRFC3339(time.Now()), IP: ip, Action: action, Detail: detail}
+	stats.Audit = append(stats.Audit, ev)
+	if len(stats.Audit) > maxAuditEvents {
+		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
+	}
+}
+
+// loginFail 登录失败拦截：短窗口计数 + 逐步加长锁定 + 多次锁定后自动拉黑
+type loginFailEntry struct {
+	Count    atomic.Int64
+	Window   atomic.Int64 // UnixNano，计数窗口起点
+	Locked   atomic.Int64 // 锁定截止 UnixNano
+	Lockouts atomic.Int64 // 累计被锁定次数（用于自动拉黑）
+}
+
+var loginFailers sync.Map // ip -> *loginFailEntry
+
+const (
+	loginFailLimit    = 5                // 窗口内失败次数上限
+	loginFailWindow   = 10 * time.Minute // 计数窗口
+	loginLockBase     = 15 * time.Minute // 首次锁定时长
+	loginLockMax      = 2 * time.Hour    // 锁定上限
+	loginAutoBanAfter = 3                // 累计锁定次数达到后自动加入黑名单
+	captchaRateLimit  = 30               // 每分钟每 IP 验证码请求上限
+)
+
+func loginLockDuration(lockouts int64) time.Duration {
+	// 15m → 30m → 60m → 120m（封顶）
+	d := loginLockBase
+	for i := int64(1); i < lockouts && d < loginLockMax; i++ {
+		d *= 2
+		if d > loginLockMax {
+			d = loginLockMax
+		}
+	}
+	return d
+}
+
+func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
+	now := time.Now().UnixNano()
+	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
+	e := val.(*loginFailEntry)
+	if until := e.Locked.Load(); until > now {
+		return false, int((until-now)/int64(time.Second)) + 1
+	}
+	return true, 0
+}
+
+// autoBanLoginIP 将暴力破解 IP 写入配置黑名单（copy-on-write，不阻塞请求）
+func autoBanLoginIP(ip string) {
+	if ip == "" || net.ParseIP(ip) == nil {
+		return
+	}
+	go func(banIP string) {
+		old := currentCfg()
+		for _, b := range old.BanList {
+			if strings.TrimSpace(b) == banIP {
+				return
+			}
+		}
+		nc := *old
+		nc.BanList = append(append([]string{}, old.BanList...), banIP)
+		if err := saveConfig(&nc); err != nil {
+			return
+		}
+		cfgPtr.Store(&nc)
+		rebuildACL(&nc)
+		recordAudit(banIP, "auto_ban_login", "登录暴力破解自动拉黑")
+	}(ip)
+}
+
+// recordLoginFail 记录一次失败；返回 (已锁定, 还需等待秒数, 本窗失败次数)
+func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails int64) {
+	now := time.Now().UnixNano()
+	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
+	e := val.(*loginFailEntry)
+	start := e.Window.Load()
+	if start == 0 || now-start > int64(loginFailWindow) {
+		if e.Window.CompareAndSwap(start, now) {
+			e.Count.Store(1)
+			fails = 1
+		} else {
+			fails = e.Count.Add(1)
+		}
+	} else {
+		fails = e.Count.Add(1)
+	}
+
+	// 写入拦截记录 + 审计，便于在后台查看暴力尝试
+	ua := ""
+	recordBlocked(ip, countryOf(ip), "/admin/api/login", "login_fail", ua)
+	recordAudit(ip, "login_fail", reason)
+
+	if fails >= loginFailLimit {
+		lockouts := e.Lockouts.Add(1)
+		dur := loginLockDuration(lockouts)
+		e.Locked.Store(now + int64(dur))
+		e.Count.Store(0)
+		e.Window.Store(now)
+		locked = true
+		retryAfterSec = int(dur / time.Second)
+		recordAudit(ip, "login_lock", fmt.Sprintf("失败 %d 次，锁定 %s（第 %d 次锁定）", loginFailLimit, dur, lockouts))
+		if lockouts >= loginAutoBanAfter {
+			autoBanLoginIP(ip)
+		}
+		return locked, retryAfterSec, fails
+	}
+	return false, 0, fails
+}
+
+func clearLoginFail(ip string) {
+	loginFailers.Delete(ip)
+}
+
+// captcha 接口限流，防止刷验证码
+type captchaRateEntry struct {
+	Count       atomic.Int64
+	WindowStart atomic.Int64
+}
+
+var captchaLimiters sync.Map
+
+func checkCaptchaRate(ip string) bool {
+	val, _ := captchaLimiters.LoadOrStore(ip, &captchaRateEntry{})
+	e := val.(*captchaRateEntry)
+	now := time.Now().UnixNano()
+	start := e.WindowStart.Load()
+	if start == 0 || now-start > int64(time.Minute) {
+		if e.WindowStart.CompareAndSwap(start, now) {
+			e.Count.Store(1)
+			return true
+		}
+	}
+	return e.Count.Add(1) <= captchaRateLimit
 }
 
 type statWriter struct {
@@ -2961,6 +3290,11 @@ func adminHandler() http.HandlerFunc {
 		serveHTMLPrecompressed(w, r, variant, html, "text/html; charset=utf-8", "no-store")
 	})
 	mux.HandleFunc("/admin/api/captcha", func(w http.ResponseWriter, r *http.Request) {
+		ip := getClientIP(r)
+		if !checkCaptchaRate(ip) {
+			http.Error(w, "验证码请求过于频繁，请稍后再试", http.StatusTooManyRequests)
+			return
+		}
 		id, _, svg := generateCaptchaSVG()
 		w.Header().Set("Content-Type", "image/svg+xml")
 		w.Header().Set("Cache-Control", "no-store, no-cache")
@@ -2972,32 +3306,69 @@ func adminHandler() http.HandlerFunc {
 			http.Error(w, "请求方法不支持，请刷新页面后重新登录", http.StatusMethodNotAllowed)
 			return
 		}
+		clientIP := getClientIP(r)
+		w.Header().Set("Content-Type", "application/json")
+		// 已被代理黑名单拦截的 IP 直接拒绝登录
+		if isBannedIP(clientIP, net.ParseIP(clientIP)) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"您的 IP 已被加入黑名单，无法登录"}`))
+			return
+		}
+		if ok, wait := checkLoginAllowed(clientIP); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(wait))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"登录失败次数过多，已暂时锁定，请 %d 秒后再试"}`, wait)))
+			return
+		}
 		var req struct {
 			Username  string `json:"username"`
 			Password  string `json:"password"`
 			Captcha   string `json:"captcha"`
 			CaptchaID string `json:"captcha_id"`
 		}
-		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"error":"提交的数据格式有误，请刷新页面后重新登录"}`))
 			return
 		}
+		failMsg := func(msg string, reason string) {
+			locked, wait, fails := recordLoginFail(clientIP, reason)
+			if locked {
+				w.Header().Set("Retry-After", strconv.Itoa(wait))
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"登录失败次数过多，已锁定 %d 秒。连续多次锁定将自动拉黑 IP"}`, wait)))
+				return
+			}
+			remain := loginFailLimit - int(fails)
+			if remain < 0 {
+				remain = 0
+			}
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s（还可尝试 %d 次）"}`, msg, remain)))
+		}
 		if !verifyCaptcha(req.CaptchaID, req.Captcha) {
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"error":"验证码不正确或已过期，点击图片可刷新验证码后重试"}`))
+			failMsg("验证码不正确或已过期，点击图片可刷新后重试", "captcha")
 			return
 		}
-		u, p := getAdminCred()
-		if subtle.ConstantTimeCompare([]byte(req.Username), []byte(u)) != 1 ||
-			subtle.ConstantTimeCompare([]byte(req.Password), []byte(p)) != 1 {
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"error":"用户名或密码不正确，请注意大小写；忘记密码可在服务器上重置"}`))
+		u := getAdminUser()
+		hash := getAdminHash()
+		userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(u)) == 1
+		passOK := verifyPassword(hash, req.Password)
+		if !userOK || !passOK {
+			failMsg("用户名或密码不正确，请注意大小写", "password")
 			return
 		}
+		// 旧明文迁移：登录成功后升级为 bcrypt
+		if hash != "" && !isBcryptHash(hash) {
+			if nh, err := hashPassword(req.Password); err == nil {
+				_ = saveAdminPassHash(nh)
+				setAdminCred(u, nh)
+			}
+		}
+		clearLoginFail(clientIP)
 		tok := createSession()
-		setSessionCookie(w, tok)
+		setSessionCookie(w, r, tok)
+		recordAudit(clientIP, "login", "管理后台登录成功")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/admin/api/logout", func(w http.ResponseWriter, r *http.Request) {
@@ -3030,6 +3401,7 @@ func adminHandler() http.HandlerFunc {
 		}
 		cfgPtr.Store(newCfg)
 		rebuildACL(newCfg)
+		recordAudit(getClientIP(r), "save_config", "保存网关设置")
 		if newCfg.Port > 0 && newCfg.Port != currentPort() && globalSrv != nil {
 			if err := startListen(globalSrv, newCfg.Port); err != nil {
 				// 端口切换失败：回滚配置。Transport 与配置无关，无需重建。
@@ -3071,7 +3443,9 @@ func adminHandler() http.HandlerFunc {
 			Date      string           `json:"date"`
 			Requests  int64            `json:"requests"`
 			Bytes     int64            `json:"bytes"`
-			Blocked   int64            `json:"blocked"` // 当日全部拦截（五种原因之和）
+			UpBytes   int64            `json:"up_bytes"`
+			DownBytes int64            `json:"down_bytes"`
+			Blocked   int64            `json:"blocked"`
 			BlockedCN int64            `json:"blocked_cn"`
 			BlockedWL int64            `json:"blocked_whitelist"`
 			Hours     map[string]int64 `json:"hours,omitempty"`
@@ -3089,7 +3463,7 @@ func adminHandler() http.HandlerFunc {
 			if slim {
 				// 轻量模式：只带每日汇总数字，跳过全部明细复制（锁内 O(天) 而非 O(全明细)）
 				trend = append(trend, TrendItem{
-					Date: k, Requests: d.Requests, Bytes: d.Bytes,
+					Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
 					Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
 					BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
 				})
@@ -3108,7 +3482,7 @@ func adminHandler() http.HandlerFunc {
 			pruneTopN(ctryCopy, 50)
 			pruneTopN(hostsCopy, 50)
 		trend = append(trend, TrendItem{
-			Date: k, Requests: d.Requests, Bytes: d.Bytes,
+			Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
 			Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
 			BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
 			Hours: hoursCopy, HourBytes: hourBytesCopy, Hosts: hostsCopy,
@@ -3132,18 +3506,25 @@ func adminHandler() http.HandlerFunc {
 			}
 		}
 		reqs, byts := stats.TotalRequests, stats.TotalBytes
+		totalUp, totalDown := stats.TotalUpBytes, stats.TotalDownBytes
+		todayUp, todayDown := stats.TodayUpBytes, stats.TodayDownBytes
 		cn, wl := stats.BlockedCN, stats.BlockedWhitelist
 		ban, rate, ua := stats.BlockedBan, stats.BlockedRate, stats.BlockedUA
+		ipUp := copyInt64Map(stats.IPUpBytes)
+		ipDown := copyInt64Map(stats.IPDownBytes)
 		pruneTopN(hostAll, 50)
 		statsMu.Unlock()
 
 		resp := map[string]any{
 			"total_requests": reqs, "total_bytes": byts,
+			"total_up_bytes": totalUp, "total_down_bytes": totalDown,
 			"today_date": today, "requests": reqs, "bytes": byts,
 			"blocked_cn": cn, "blocked_whitelist": wl,
 			"blocked_ban": ban, "blocked_rate": rate, "blocked_ua": ua,
 			"blocked_total": cn + wl + ban + rate + ua,
-			"today_requests": todayReqs, "today_bytes": todayBytes, "trend": trend,
+			"today_requests": todayReqs, "today_bytes": todayBytes,
+			"today_up_bytes": todayUp, "today_down_bytes": todayDown,
+			"trend": trend,
 			"uptime_sec":   int64(time.Since(startedAt).Seconds()),
 			"stat_dropped": statDropped.Load(),
 		}
@@ -3152,9 +3533,11 @@ func adminHandler() http.HandlerFunc {
 		} else {
 			resp["ip_counts"] = ips
 			resp["ip_bytes"] = ipBytes
+			resp["ip_up_bytes"] = ipUp
+			resp["ip_down_bytes"] = ipDown
 			resp["country_counts"] = ctry
 			resp["country_labels"] = labels
-			resp["host_counts"] = hostAll // 全周期上游主机汇总，便于后续排行页
+			resp["host_counts"] = hostAll
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -3191,8 +3574,26 @@ func adminHandler() http.HandlerFunc {
 			return
 		}
 		upgrader := websocket.Upgrader{
-			// 管理页同源；允许反代后 Host 不一致时的同站场景
-			CheckOrigin:       func(r *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true // 非浏览器或同端点
+				}
+				u, err := url.Parse(origin)
+				if err != nil {
+					return false
+				}
+				// 允许与当前 Host 一致，或反代场景下 Origin Host 与请求 Host 同站
+				reqHost := r.Host
+				if h, _, err := net.SplitHostPort(reqHost); err == nil {
+					reqHost = h
+				}
+				oh := u.Host
+				if h, _, err := net.SplitHostPort(oh); err == nil {
+					oh = h
+				}
+				return strings.EqualFold(oh, reqHost) || strings.EqualFold(u.Host, r.Host)
+			},
 			EnableCompression: true,
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -3244,33 +3645,112 @@ func adminHandler() http.HandlerFunc {
 		}
 	})
 	mux.HandleFunc("/admin/api/blocks", func(w http.ResponseWriter, r *http.Request) {
-		// limit 控制返回条数（最新 N 条）：概览轮询只需几条，避免每次全量序列化/传输
-		// 最多 5000 条历史；默认 1000，limit=0 表示全部
 		limit := 1000
 		if s := r.URL.Query().Get("limit"); s != "" {
 			if n, err := strconv.Atoi(s); err == nil && n >= 0 {
 				limit = n
 			}
 		}
+		qIP := strings.TrimSpace(r.URL.Query().Get("ip"))
+		qReason := strings.TrimSpace(r.URL.Query().Get("reason"))
+		qSearch := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 		w.Header().Set("Content-Type", "application/json")
 		statsMu.Lock()
-		n := len(stats.Blocks)
-		total := n
+		all := stats.Blocks
+		matched := make([]BlockEvent, 0, len(all))
+		for i := len(all) - 1; i >= 0; i-- {
+			ev := all[i]
+			if qIP != "" && ev.IP != qIP {
+				continue
+			}
+			if qReason != "" && ev.Reason != qReason {
+				continue
+			}
+			if qSearch != "" {
+				blob := strings.ToLower(ev.IP + " " + ev.Path + " " + ev.UA + " " + ev.ReasonText + " " + ev.Country)
+				if !strings.Contains(blob, qSearch) {
+					continue
+				}
+			}
+			matched = append(matched, ev)
+		}
+		total := len(matched)
+		n := total
 		if limit > 0 && n > limit {
 			n = limit
 		}
 		items := make([]map[string]any, n)
-		for i := range n {
-			// 倒序：最新在前
-			src := stats.Blocks[total-1-i]
+		for i := 0; i < n; i++ {
+			ev := matched[i]
 			items[i] = map[string]any{
-				"time": src.Time, "ip": src.IP, "country": src.Country,
-				"country_name": countryName(src.Country),
-				"path": src.Path, "reason": src.Reason, "reason_text": src.ReasonText, "ua": src.UA,
+				"time": ev.Time, "ip": ev.IP, "country": ev.Country,
+				"country_name": countryName(ev.Country),
+				"path": ev.Path, "reason": ev.Reason, "reason_text": ev.ReasonText, "ua": ev.UA,
 			}
 		}
 		statsMu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "returned": len(items), "items": items})
+	})
+
+	// 一键将 IP 加入黑名单
+	mux.HandleFunc("/admin/api/ban-ip", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			IP string `json:"ip"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		ip := strings.TrimSpace(req.IP)
+		if ip == "" {
+			ip = strings.TrimSpace(r.URL.Query().Get("ip"))
+		}
+		if net.ParseIP(ip) == nil {
+			http.Error(w, "IP 地址无效", http.StatusBadRequest)
+			return
+		}
+		old := currentCfg()
+		for _, b := range old.BanList {
+			if strings.TrimSpace(b) == ip {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true,"existed":true}`))
+				return
+			}
+		}
+		nc := *old
+		nc.BanList = append(append([]string{}, old.BanList...), ip)
+		if err := saveConfig(&nc); err != nil {
+			http.Error(w, "保存失败", http.StatusInternalServerError)
+			return
+		}
+		cfgPtr.Store(&nc)
+		rebuildACL(&nc)
+		recordAudit(getClientIP(r), "ban_ip", ip)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	mux.HandleFunc("/admin/api/audit", func(w http.ResponseWriter, r *http.Request) {
+		limit := 200
+		if s := r.URL.Query().Get("limit"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		statsMu.Lock()
+		all := stats.Audit
+		n := len(all)
+		if n > limit {
+			n = limit
+		}
+		items := make([]AuditEvent, n)
+		for i := 0; i < n; i++ {
+			items[i] = all[len(all)-1-i]
+		}
+		statsMu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
 	})
 	mux.HandleFunc("/admin/api/ip-detail", func(w http.ResponseWriter, r *http.Request) {
 		ip := strings.TrimSpace(r.URL.Query().Get("ip"))
@@ -3321,19 +3801,30 @@ func adminHandler() http.HandlerFunc {
 	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ OldPass, NewPass string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		// 新密码做基本强度校验（原实现允许空密码，会把后台门户大开）
 		if len(req.NewPass) < 6 {
 			http.Error(w, "新密码至少需要 6 位，请重新输入", http.StatusBadRequest)
 			return
 		}
-		_, pass := getAdminCred()
-		if subtle.ConstantTimeCompare([]byte(req.OldPass), []byte(pass)) != 1 {
+		if !verifyPassword(getAdminHash(), req.OldPass) {
 			http.Error(w, "当前密码不正确，修改未生效，请核对后重试", http.StatusForbidden)
 			return
 		}
-		_ = saveAdminPassFile(req.NewPass)
-		setAdminCred("admin", req.NewPass)
-		w.Write([]byte(`{"ok":true}`))
+		nh, err := hashPassword(req.NewPass)
+		if err != nil {
+			http.Error(w, "密码处理失败，请稍后重试", http.StatusInternalServerError)
+			return
+		}
+		if err := saveAdminPassHash(nh); err != nil {
+			http.Error(w, "保存失败，请稍后重试", http.StatusInternalServerError)
+			return
+		}
+		setAdminCred(getAdminUser(), nh)
+		// 踢出其他会话，强制重新登录
+		tok := getSessionToken(r)
+		destroyOtherSessions(tok)
+		recordAudit(getClientIP(r), "change_password", "管理员修改了密码")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/admin/api/clear-stats", func(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
@@ -3341,6 +3832,7 @@ func adminHandler() http.HandlerFunc {
 		snap := marshalStatsLocked()
 		statsMu.Unlock()
 		persistStats(snap)
+		recordAudit(getClientIP(r), "clear_stats", "清空全部统计与拦截记录")
 		// 物理清空分桶，避免残留日键
 		if db != nil {
 			_ = db.Update(func(tx *bolt.Tx) error {
@@ -3476,19 +3968,39 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	})
 
 	loadConfig()
-	var dbPass string
+	// 密码：优先使用 DB 中的 bcrypt 哈希；兼容旧明文 admin_pass；无则用启动参数写入哈希
+	var storedHash string
+	var legacyPlain string
 	_ = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("auth"))
-		if b != nil {
-			dbPass = string(b.Get([]byte("admin_pass")))
+		if b == nil {
+			return nil
 		}
+		storedHash = string(b.Get([]byte("admin_pass_hash")))
+		legacyPlain = string(b.Get([]byte("admin_pass")))
 		return nil
 	})
-	if dbPass == "" {
-		dbPass = adminPass
-		_ = saveAdminPassFile(adminPass)
+	finalHash := storedHash
+	if finalHash == "" && legacyPlain != "" {
+		if isBcryptHash(legacyPlain) {
+			finalHash = legacyPlain
+		} else if h, err := hashPassword(legacyPlain); err == nil {
+			finalHash = h
+			_ = saveAdminPassHash(h)
+		}
 	}
-	setAdminCred(adminUser, dbPass)
+	if finalHash == "" {
+		if adminPass == "" {
+			log.Fatal("必须指定管理密码（--admin-pass）或已在数据库中保存密码哈希")
+		}
+		h, err := hashPassword(adminPass)
+		if err != nil {
+			log.Fatalf("密码哈希失败: %v", err)
+		}
+		finalHash = h
+		_ = saveAdminPassHash(h)
+	}
+	setAdminCred(adminUser, finalHash)
 
 	geoCacheLoad()
 	loadStats()
@@ -3588,9 +4100,17 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 
 		if c.CORS {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "*")
+			// 宽松 CORS 仅用于播放器拉流；不反射任意 Origin 到带凭证场景
+			origin := r.Header.Get("Origin")
+			if origin == "" || origin == "null" {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+			}
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Range, X-Requested-With")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -3630,13 +4150,18 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		if r2, ok := w2.(*cacheRecorder); ok && r2.status == http.StatusOK && r2.buf != nil && r2.buf.Len() > 0 {
 			imageCachePut(r.URL.String(), r2.buf.Bytes())
 		}
-		recordBytes(ip, sw.bytes+atomic.LoadInt64(upBytes))
+		recordBytes(ip, atomic.LoadInt64(upBytes), sw.bytes)
 	})
 
 	adminSrv := adminHandler()
 	// 管理后台全部走 gzip（HTML/JSON 压缩 70%+，WS 与图片自动跳过）
 	adminGz := gzipMiddleware(adminSrv)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d}`, int64(time.Since(startedAt).Seconds()))))
+			return
+		}
 		if r.URL.Path == "/admin" {
 			http.Redirect(w, r, "/admin/", http.StatusFound)
 			return
@@ -3679,6 +4204,7 @@ func main() {
 	}
 	runServer(*port, *adminUser, *adminPass, *dbFile)
 }
+
 GO_SOURCE
 
   cat > "$dir/admin.html" <<'ADMIN_HTML'
@@ -4040,7 +4566,23 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <section id="blocks" class="pg">
 <div class="card">
 <div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区、白名单、限流或 UA 策略被拒绝的请求 · 每 5 秒自动刷新</div></div></div>
-<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th></tr></thead><tbody id="blockTable"></tbody></table></div>
+<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;align-items:center">
+  <input id="blkQ" class="inp m" type="search" placeholder="搜索 IP / 路径 / UA" style="max-width:220px">
+  <select id="blkReason" class="inp m" style="width:auto;max-width:160px">
+    <option value="">全部原因</option>
+    <option value="cn">地区限制</option>
+    <option value="whitelist">域名未授权</option>
+    <option value="ban">IP 黑名单</option>
+    <option value="rate_limit">触发限流</option>
+    <option value="ua">UA 不允许</option>
+    <option value="login_fail">登录失败</option>
+  </select>
+  <input id="blkIP" class="inp m" type="text" placeholder="精确 IP" style="max-width:150px">
+  <button type="button" class="btn b s" id="blkFilterBtn">筛选</button>
+  <button type="button" class="btn g s" id="blkResetBtn">重置</button>
+  <span id="blkCount" style="font-size:12.5px;color:var(--t3)"></span>
+</div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
 </div>
 </section>
 <section id="settings" class="pg">
@@ -4074,7 +4616,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
     <div class="row"><div><div class="rl">自动封禁异常 IP</div><div class="rd">触发地区或白名单拦截时写入黑名单</div></div><label class="sw"><input type="checkbox" id="autoBan"><span class="tr2"></span></label></div>
     <div class="fi" style="margin-top:14px"><label class="fl">限流（次/分钟，0 为关闭）</label><input id="rateLimit" type="number" class="inp m" placeholder="例如 120"></div>
     <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
-    <div class="fi"><label class="fl">域名白名单</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配</div><textarea id="whitelist" class="tarea" placeholder="example.com"></textarea></div>
+    <div class="fi"><label class="fl">域名白名单</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
     <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
   </div>
@@ -4137,8 +4679,8 @@ function fmtBeijing(iso, mode){
 function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
 /* 拦截原因统一映射：cn=地区限制 whitelist=域名白名单 ban=IP黑名单 rate_limit=限流 ua=UA白名单 */
-function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ban:'IP 黑名单',rate_limit:'触发限流',ua:'UA 不允许'}[r]||'其他拦截'}
-function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',rate_limit:'pl',ua:'pu'}[r]||'pw'}
+function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ban:'IP 黑名单',rate_limit:'触发限流',ua:'UA 不允许',login_fail:'登录失败'}[r]||'其他拦截'}
+function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',rate_limit:'pl',ua:'pu',login_fail:'pb'}[r]||'pw'}
 function reasonFull(r){return {cn:'地区限制：仅允许中国大陆 IP',whitelist:'域名未授权：目标域名不在白名单',ban:'IP 黑名单：命中黑名单规则',rate_limit:'触发限流：超过每分钟请求上限',ua:'UA 不允许：User-Agent 不在白名单'}[r]||'其他拦截'}
 
 function countryLabel(code){  if(!code) return '未知';
@@ -4812,12 +5354,20 @@ async function loadLive(){
 
 async function loadBlocks(){
   try{
-    // 默认拉最新 500 条（服务端上限 5000；轮询模式下全量传输既慢又浪费）
-    const r=await fetch('/admin/api/blocks?limit=500',{cache:'no-store'});
+    const q=document.getElementById('blkQ')?.value?.trim()||'';
+    const reason=document.getElementById('blkReason')?.value||'';
+    const ip=document.getElementById('blkIP')?.value?.trim()||'';
+    const params=new URLSearchParams({limit:'500'});
+    if(q) params.set('q',q);
+    if(reason) params.set('reason',reason);
+    if(ip) params.set('ip',ip);
+    const r=await fetch('/admin/api/blocks?'+params.toString(),{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
     const tb=document.getElementById('blockTable');
-    if(!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="6"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">尚未产生拦截事件；触发黑名单、地区、白名单、限流或 UA 拦截后将在此显示</span></div></td></tr>';return}
+    const cnt=document.getElementById('blkCount');
+    if(cnt) cnt.textContent='共 '+(t.total||0)+' 条'+(t.returned<t.total?' · 显示最新 '+t.returned:'');
+    if(!t.items||!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="7"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">没有匹配的拦截事件</span></div></td></tr>';return}
     tb.innerHTML=t.items.map(b=>{
       const ua=String(b.ua||'').trim();
       const uaShort=ua.length>60?ua.slice(0,58)+'…':ua;
@@ -4828,8 +5378,21 @@ async function loadBlocks(){
       <td data-label="拦截原因"><span class="cell-v"><span class="pill ${reasonClass(b.reason)}" title="${esc(b.reason_text||'')}">${esc(reasonLabel(b.reason))}</span></span></td>
       <td data-label="访问路径"><span class="cell-v" title="${esc(b.path)}">${esc(b.path)}</span></td>
       <td data-label="User-Agent"><span class="cell-v mono" style="font-size:12px;color:var(--t2);word-break:break-all" title="${esc(ua)}">${ua?esc(uaShort):'<span style="color:var(--t3)">—</span>'}</span></td>
+      <td data-label="操作"><span class="cell-v"><button type="button" class="btn d s ban-ip-btn" data-ip="${esc(b.ip)}" style="padding:4px 8px;font-size:12px">拉黑</button></span></td>
     </tr>`}).join('');
     tb.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
+    tb.querySelectorAll('.ban-ip-btn').forEach(el=>el.addEventListener('click',async(ev)=>{
+      ev.stopPropagation();
+      const ip=el.dataset.ip;
+      if(!ip||!confirm('确认将 '+ip+' 加入黑名单？'))return;
+      try{
+        const r=await fetch('/admin/api/ban-ip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+        const d=await r.json().catch(()=>({}));
+        if(!r.ok){alert(d.error||'拉黑失败');return;}
+        alert(d.existed?'该 IP 已在黑名单中':'已加入黑名单');
+        loadConfig();
+      }catch(e){alert('网络异常');}
+    }));
   }catch(e){console.error('loadBlocks error:',e)}
 }
 
@@ -4869,6 +5432,14 @@ document.getElementById('changePassBtn').addEventListener('click',async()=>{
   const r=await fetch('/admin/api/change-password',{method:'POST',body:JSON.stringify({OldPass:o,NewPass:n})});
   if(r.ok){alert('密码修改成功，即将跳转到登录页，请用新密码重新登录');location.reload()}else{alert('密码修改失败：'+(await r.text()||'未知错误'))}
 });
+document.getElementById('blkFilterBtn')?.addEventListener('click',()=>loadBlocks());
+document.getElementById('blkResetBtn')?.addEventListener('click',()=>{
+  const q=document.getElementById('blkQ'); if(q)q.value='';
+  const r=document.getElementById('blkReason'); if(r)r.value='';
+  const i=document.getElementById('blkIP'); if(i)i.value='';
+  loadBlocks();
+});
+document.getElementById('blkQ')?.addEventListener('keydown',e=>{if(e.key==='Enter')loadBlocks()});
 document.getElementById('clearStatsBtn').addEventListener('click',async()=>{
   if(!confirm('确定清空全部统计数据？此操作不可恢复。'))return;
   await fetch('/admin/api/clear-stats',{method:'POST'});alert('统计数据已清空');loadOverview();
@@ -5003,6 +5574,7 @@ document.addEventListener('visibilitychange',()=>{
 </script>
 </body>
 </html>
+
 ADMIN_HTML
 }
 
@@ -5056,6 +5628,7 @@ build_binary() {
     go get "go.etcd.io/bbolt@latest" >/dev/null 2>&1 || true
     go get "golang.org/x/sync/singleflight@v0.10.0" >/dev/null 2>&1 || true
     go get "github.com/gorilla/websocket@v1.5.3" >/dev/null 2>&1 || true
+    go get "golang.org/x/crypto/bcrypt@v0.31.0" >/dev/null 2>&1 || true
     go mod tidy >/dev/null 2>&1 || die "依赖解析失败（可设 GOPROXY=https://goproxy.cn,direct 后重试）"
   )
   info "编译中..."
@@ -5079,7 +5652,18 @@ print_access_info() {
   local ip ep; ip="$(local_ip)"; ep="$(effective_port)"
   printf '\n   管理页:  http://%s:%s/admin/\n' "$ip" "$ep"
   printf '   用户名:  %s\n' "$ADMIN_USER"
-  printf '   密  码:  %s\n' "$ADMIN_PASS"
+  # 密码以数据库为准（后台「修改密码」只更新 DB 哈希，不会改 unit 里的启动参数）
+  # 因此：仅在本次新生成/用户显式指定密码时打印；更新/已有安装不打印 unit 中的旧明文，避免误导
+  if [[ ${GENERATED_PASS:-0} -eq 1 ]] || [[ ${PASS_GIVEN:-0} -eq 1 ]]; then
+    if [[ -n "$ADMIN_PASS" ]]; then
+      printf '   密  码:  %s\n' "$ADMIN_PASS"
+      printf '   %s（请立即保存；之后可在管理后台修改，修改后以后台为准）%s\n' "$C_D" "$C_0"
+    fi
+  else
+    printf '   密  码:  %s沿用数据库中已保存的密码%s\n' "$C_D" "$C_0"
+    printf '            %s若曾在管理后台修改过，请用修改后的密码登录%s\n' "$C_D" "$C_0"
+    printf '            %s（unit 中的 -admin-pass 仅作首次引导，改密后不再使用）%s\n' "$C_D" "$C_0"
+  fi
   printf '   查看日志: journalctl -u %s -f\n\n' "$SERVICE_NAME"
 }
 
