@@ -428,7 +428,7 @@ type Config struct {
 	ChinaOnly   bool     `json:"china_only"`   // 仅允许中国大陆 IP（本地 iploc 判断）
 	Whitelist   []string `json:"whitelist"`    // 上游域名白名单，空=不限制；支持根域匹配
 	GeoAPI      bool     `json:"geo_api"`      // 管理端 IP 详情是否拉远程 geo
-	GeoAPIURL   string   `json:"geo_api_url"`  // 预留，当前使用内置 ip-api
+	GeoAPIURL   string   `json:"geo_api_url"`  // 预留；实际优先 ip9.com.cn，失败回退 ip-api
 	BanList     []string `json:"ban_list"`     // IP 或 CIDR
 	AutoBan     bool     `json:"auto_ban"`     // 触发地区拦截时自动写入黑名单
 	RateLimit   int      `json:"rate_limit"`   // 每 IP 每分钟请求上限，0=关闭
@@ -532,7 +532,7 @@ func serveCachedIcon(w http.ResponseWriter, r *http.Request, p *atomic.Pointer[c
 // 双上限：条数 + 总字节；单条过大直接不入队。缓存键为完整请求 URL。
 const (
 	imgCacheMaxCount = 500
-	imgCacheMaxBytes = 50 << 20 // 50MB
+	imgCacheMaxBytes = 32 << 20 // 32MB（原 50MB）
 )
 
 var imgCache = struct {
@@ -546,8 +546,9 @@ var imgCache = struct {
 }
 
 type imgCacheItem struct {
-	key  string
-	data []byte
+	key      string
+	data     []byte
+	accessed int64 // unix nano，用于二次淘汰参考
 }
 
 func imageCacheGet(key string) ([]byte, bool) {
@@ -558,11 +559,13 @@ func imageCacheGet(key string) ([]byte, bool) {
 		return nil, false
 	}
 	imgCache.ll.MoveToBack(el) // 命中即提升为最新
-	return el.Value.(*imgCacheItem).data, true
+	it := el.Value.(*imgCacheItem)
+	it.accessed = time.Now().UnixNano()
+	return it.data, true
 }
 
 func imageCachePut(key string, data []byte) {
-	if len(data) > imgCacheMaxBytes/imgCacheMaxCount*4 { // 单条超过 400KB 一般不是小图标，不缓存
+	if len(data) > 128<<10 { // 单条超过 128KB 不缓存，避免大图挤占内存
 		return
 	}
 	imgCache.mu.Lock()
@@ -600,9 +603,13 @@ func currentCfg() *Config {
 // compiledACL 由 rebuildACL 在配置加载/保存时生成，供每个请求快速检查，
 // 避免在热路径上反复 net.ParseCIDR 与 strings.ToLower。
 type compiledACL struct {
-	exactBan map[string]struct{}
-	cidrs    []*net.IPNet
+	exactBan  map[string]struct{}
+	cidrs     []*net.IPNet
 	uaNeedles []string // 已小写；空 = 不限制
+	// 白名单预编译：精确 host、根域、通配后缀
+	wlExact   map[string]struct{}
+	wlRoots   map[string]struct{}
+	wlSuffixes []string // 已小写，不含前导点
 }
 
 var aclPtr atomic.Pointer[compiledACL]
@@ -630,6 +637,30 @@ func rebuildACL(c *Config) {
 		u = strings.ToLower(strings.TrimSpace(u))
 		if u != "" {
 			a.uaNeedles = append(a.uaNeedles, u)
+		}
+	}
+	// 预编译白名单
+	a.wlExact = map[string]struct{}{}
+	a.wlRoots = map[string]struct{}{}
+	for _, w := range c.Whitelist {
+		w = strings.TrimSpace(w)
+		if i := strings.IndexAny(w, "#;"); i >= 0 {
+			w = strings.TrimSpace(w[:i])
+		}
+		if w == "" {
+			continue
+		}
+		if strings.HasPrefix(w, "*.") {
+			suf := strings.ToLower(strings.TrimPrefix(w, "*."))
+			if suf != "" {
+				a.wlSuffixes = append(a.wlSuffixes, suf)
+			}
+			continue
+		}
+		norm := normalizeHost(w)
+		if norm != "" {
+			a.wlExact[norm] = struct{}{}
+			a.wlRoots[rootDomain(w)] = struct{}{}
 		}
 	}
 	aclPtr.Store(a)
@@ -753,16 +784,33 @@ func rootDomain(hostport string) string {
 	}
 	return strings.Join(parts[n-2:], ".")
 }
-// whitelistMatch 空列表表示不限制；支持完整 host、根域、以及 *.example.com 通配。
+// whitelistMatch 空列表表示不限制；优先用预编译 ACL，未命中再走原逻辑（兼容热更新前）。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
 	}
+	a := currentACL()
+	if a != nil && (len(a.wlExact) > 0 || len(a.wlRoots) > 0 || len(a.wlSuffixes) > 0) {
+		target := normalizeHost(targetHost)
+		if _, ok := a.wlExact[target]; ok {
+			return true
+		}
+		targetRoot := rootDomain(target)
+		if _, ok := a.wlRoots[targetRoot]; ok {
+			return true
+		}
+		for _, suf := range a.wlSuffixes {
+			if target == suf || strings.HasSuffix(target, "."+suf) {
+				return true
+			}
+		}
+		return false
+	}
+	// 回退：配置刚加载尚未 rebuild 时
 	target := normalizeHost(targetHost)
 	targetRoot := rootDomain(target)
 	for _, w := range list {
 		w = strings.TrimSpace(w)
-		// 允许行内注释
 		if i := strings.IndexAny(w, "#;"); i >= 0 {
 			w = strings.TrimSpace(w[:i])
 		}
@@ -991,12 +1039,12 @@ func pruneStatsLocked() {
 	}
 	for _, day := range stats.Daily {
 		ensureDayMaps(day)
-		pruneTopN(day.IPs, 500)
-		pruneTopN(day.IPBytes, 500)
-		pruneTopN(day.IPUpBytes, 500)
-		pruneTopN(day.IPDownBytes, 500)
-		pruneTopN(day.Hosts, 300)
-		pruneTopN(day.Countries, 200)
+		pruneTopN(day.IPs, 200)
+		pruneTopN(day.IPBytes, 200)
+		pruneTopN(day.IPUpBytes, 200)
+		pruneTopN(day.IPDownBytes, 200)
+		pruneTopN(day.Hosts, 120)
+		pruneTopN(day.Countries, 80)
 	}
 	if len(stats.Audit) > maxAuditEvents {
 		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
@@ -1378,8 +1426,11 @@ func startStatsSaver() {
 			snap := marshalStatsLocked()
 			statsMu.Unlock()
 			persistStats(snap)
-			geoCacheSave()
-			geoPrune()
+
+			// 监控统计丢弃：通道满时会丢事件，便于运维发现压力
+			if dropped := statDropped.Load(); dropped > 0 {
+				log.Printf("统计通道丢弃事件累计 %d（高并发时正常，持续增长需关注）", dropped)
+			}
 
 			now := time.Now().UnixNano()
 			ipLimiters.Range(func(k, v interface{}) bool {
@@ -1904,7 +1955,107 @@ func geoParseGeneric(m map[string]any) (geoEntry, error) {
 	}
 	return geoEntry{Code: code, Name: raw, Region: region, City: city, At: time.Now().Unix()}, nil
 }
+
+// geoEntryFresh 缓存是否仍可用。旧 ip-api 条目城市常为英文/拼音（如 Taohua）且无 ISP，视为过期强制重查。
+func geoEntryFresh(e geoEntry) bool {
+	if e.Code == "" || e.Code == "??" {
+		return false
+	}
+	if time.Now().Unix()-e.At >= 30*86400 {
+		return false
+	}
+	// 无运营商且城市几乎全是 ASCII，多半是旧 ip-api 缓存
+	if e.ISP == "" && e.City != "" {
+		ascii := true
+		for _, r := range e.City {
+			if r > 127 {
+				ascii = false
+				break
+			}
+		}
+		if ascii {
+			return false
+		}
+	}
+	return true
+}
+
+// geoFetchIp9 优先用 ip9.com.cn（中文省市 + 运营商）
+func geoFetchIp9(ipStr string) (geoEntry, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	u := "https://ip9.com.cn/get?ip=" + url.QueryEscape(ipStr)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return geoEntry{}, err
+	}
+	req.Header.Set("User-Agent", "Cloudflare-Worker")
+	resp, err := client.Do(req)
+	if err != nil {
+		return geoEntry{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return geoEntry{}, fmt.Errorf("ip9 http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if err != nil {
+		return geoEntry{}, err
+	}
+	var wrap struct {
+		Ret  int            `json:"ret"`
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return geoEntry{}, err
+	}
+	if wrap.Ret != 200 || wrap.Data == nil {
+		return geoEntry{}, fmt.Errorf("ip9 bad data")
+	}
+	d := wrap.Data
+	str := func(k string) string {
+		if v, ok := d[k].(string); ok {
+			return strings.TrimSpace(v)
+		}
+		return ""
+	}
+	country := str("country")
+	prov := str("prov")
+	city := str("city")
+	area := str("area")
+	isp := str("isp")
+	parts := make([]string, 0, 4)
+	for _, s := range []string{country, prov, city, area} {
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	name := strings.Join(parts, " ")
+	if name == "" {
+		return geoEntry{}, fmt.Errorf("ip9 empty location")
+	}
+	code := countryOf(ipStr)
+	if code == "??" || code == "" {
+		code = "CN"
+		if country != "" && country != "中国" && !strings.Contains(country, "中国") {
+			code = "??"
+		}
+	}
+	return geoEntry{
+		Code:   code,
+		Name:   name,
+		Region: prov,
+		City:   city,
+		ISP:    isp,
+		At:     time.Now().Unix(),
+	}, nil
+}
+
 func geoFetch(ipStr string) (geoEntry, error) {
+	// 1. 优先 ip9（国内源，中文省市 + 运营商）
+	if e, err := geoFetchIp9(ipStr); err == nil {
+		return e, nil
+	}
+	// 2. 回退 ip-api
 	client := &http.Client{Timeout: 4 * time.Second}
 	urls := []string{
 		"http://ip-api.com/json/" + url.QueryEscape(ipStr) + "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,isp,org,as,lat,lon,query",
@@ -1929,53 +2080,28 @@ func geoFetch(ipStr string) (geoEntry, error) {
 	}
 	return geoEntry{}, last
 }
-// ipLabelSync 返回 (国家码, 中文名)。先查缓存/本地库，必要时 singleflight 拉 geo API。
+// ipLabelSync 只走本地 iploc，不缓存、不请求远程（详情接口自行现查）。
 func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
 		return "??", "未知"
 	}
-	// 严禁 isSelfOrLocalIP(ip, "LO")：传入 "LO" 会恒为 true
 	if ip.IsLoopback() {
 		return "LO", "本机"
 	}
 	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
 		return "PV", "内网"
 	}
-
-	geoMu.RLock()
-	e, ok := geoMap[ipStr]
-	geoMu.RUnlock()
-	if ok && e.Code != "??" && time.Now().Unix()-e.At < 30*86400 {
-		return e.Code, e.Name
+	c := countryOf(ipStr)
+	if c == "??" {
+		return "??", "未知"
 	}
-
-	v, err, _ := geoGroup.Do(ipStr, func() (interface{}, error) {
-		geoMu.RLock()
-		cached, ok := geoMap[ipStr]
-		geoMu.RUnlock()
-		if ok && cached.Code != "??" && time.Now().Unix()-cached.At < 30*86400 {
-			return cached, nil
-		}
-		e, err := geoFetch(ipStr)
-		if err == nil {
-			geoMu.Lock()
-			geoMap[ipStr] = e
-			geoMu.Unlock()
-		}
-		return e, err
-	})
-	if err == nil {
-		e := v.(geoEntry)
-		return e.Code, e.Name
-	}
-	if c := countryOf(ipStr); c != "??" {
-		return c, countryName(c)
-	}
-	return "??", "未知"
+	return c, countryName(c)
 }
 
-// checkRateLimit 每 IP 固定 1 分钟窗口；窗口起点与计数均用 atomic，避免热路径加锁。
+// checkRateLimit 每 IP 近似滑动窗口（令牌桶思路）：
+// 以 1 分钟为窗口，但窗口过半后按比例允许更多请求，减少固定窗口边界突发。
+// 全部用 atomic，避免热路径加锁。
 func checkRateLimit(ip string, limit int) bool {
 	if limit <= 0 {
 		return true
@@ -1983,16 +2109,25 @@ func checkRateLimit(ip string, limit int) bool {
 	val, _ := ipLimiters.LoadOrStore(ip, &rateLimitEntry{})
 	entry := val.(*rateLimitEntry)
 	now := time.Now().UnixNano()
-	// 滑动窗口重置：全部用原子操作，避免并发请求间的 data race
 	start := entry.WindowStart.Load()
-	if start == 0 || now-start > int64(time.Minute) {
+	elapsed := now - start
+	window := int64(time.Minute)
+	if start == 0 || elapsed > window {
 		if entry.WindowStart.CompareAndSwap(start, now) {
 			entry.Count.Store(1)
-			return 1 <= int64(limit)
+			return true
 		}
-		// CAS 失败说明另一并发请求刚重置过窗口，走正常计数
+		// CAS 失败，走下面正常计数
+		start = entry.WindowStart.Load()
+		elapsed = now - start
 	}
-	return entry.Count.Add(1) <= int64(limit)
+	// 窗口过半时，按已过时间比例放宽限额（简易滑动）
+	effectiveLimit := int64(limit)
+	if elapsed > window/2 && elapsed < window {
+		// 允许最多 limit * 1.5，平滑边界
+		effectiveLimit = int64(limit) + int64(limit)/2
+	}
+	return entry.Count.Add(1) <= effectiveLimit
 }
 
 // ---------- 实时连接监控 ----------
@@ -2011,6 +2146,8 @@ type liveConn struct {
 	Start   time.Time
 	Up      atomic.Int64
 	Down    atomic.Int64
+	Status  atomic.Int32 // 上游状态码，0=未收到
+	Err     atomic.Value // string，失败原因
 	cancel  context.CancelFunc // 管理端可主动断开
 }
 
@@ -2071,7 +2208,7 @@ func liveStart(ip, country, host, method, path string) *liveConn {
 	return c
 }
 
-const liveHistMax = 2000
+const liveHistMax = 600 // 原 2000，收紧以降低小内存机器压力
 
 type liveRow struct {
 	ID          string `json:"id"`
@@ -2087,6 +2224,8 @@ type liveRow struct {
 	Start       string `json:"start"`
 	Active      bool   `json:"active"`
 	Ended       string `json:"ended,omitempty"`
+	Status      int    `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 var (
@@ -2103,6 +2242,8 @@ func liveEnd(c *liveConn) {
 		ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
 		Host: c.Host, Method: c.Method, Path: c.Path,
 		Up: c.Up.Load(), Down: c.Down.Load(),
+		Status: int(c.Status.Load()),
+		Error: func() string { if v := c.Err.Load(); v != nil { return v.(string) }; return "" }(),
 		DurationMs: now.Sub(c.Start).Milliseconds(),
 		Start: beijingRFC3339(c.Start),
 		Active: false, Ended: beijingRFC3339(now),
@@ -2125,9 +2266,14 @@ func liveSnapshotActive() map[string]any {
 	liveConns.Range(func(_, v any) bool {
 		c := v.(*liveConn)
 		up, down := c.Up.Load(), c.Down.Load()
+		errStr := ""
+		if v := c.Err.Load(); v != nil {
+			errStr = v.(string)
+		}
 		list = append(list, liveRow{
 			ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
 			Host: c.Host, Method: c.Method, Path: c.Path, Up: up, Down: down,
+			Status: int(c.Status.Load()), Error: errStr,
 			DurationMs: now.Sub(c.Start).Milliseconds(),
 			Start: beijingRFC3339(c.Start), Active: true,
 		})
@@ -2159,9 +2305,14 @@ func liveSnapshot() map[string]any {
 	liveConns.Range(func(_, v any) bool {
 		c := v.(*liveConn)
 		up, down := c.Up.Load(), c.Down.Load()
+		errStr := ""
+		if v := c.Err.Load(); v != nil {
+			errStr = v.(string)
+		}
 		list = append(list, liveRow{
 			ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
 			Host: c.Host, Method: c.Method, Path: c.Path, Up: up, Down: down,
+			Status: int(c.Status.Load()), Error: errStr,
 			DurationMs: now.Sub(c.Start).Milliseconds(),
 			Start: beijingRFC3339(c.Start), Active: true,
 		})
@@ -2716,13 +2867,66 @@ func checkCaptchaRate(ip string) bool {
 			return true
 		}
 	}
-	return e.Count.Add(1) <= captchaRateLimit
+	ok := e.Count.Add(1) <= captchaRateLimit
+	if !ok {
+		// 超限时轻量记入登录失败信誉，防止刷验证码绕过
+		recordLoginFail(ip, "captcha_rate")
+	}
+	return ok
+}
+
+
+// estimateHeaderSize 粗略估算请求/响应头字节（含方法行或状态行开销）
+func estimateReqHeaderSize(r *http.Request) int64 {
+	if r == nil {
+		return 0
+	}
+	n := int64(len(r.Method) + len(r.URL.RequestURI()) + 20)
+	for k, vs := range r.Header {
+		n += int64(len(k) + 4)
+		for _, v := range vs {
+			n += int64(len(v) + 2)
+		}
+	}
+	return n
+}
+func estimateRespHeaderSize(h http.Header, status int) int64 {
+	n := int64(20) // status line
+	for k, vs := range h {
+		n += int64(len(k) + 4)
+		for _, v := range vs {
+			n += int64(len(v) + 2)
+		}
+	}
+	return n
+}
+
+
+// countReadCloser 统计从上游读到的字节（服务器下行 = 去 Emby 原站下载）
+type countReadCloser struct {
+	io.ReadCloser
+	n    *int64
+	live *liveConn
+}
+func (c *countReadCloser) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	if n > 0 {
+		if c.n != nil {
+			atomic.AddInt64(c.n, int64(n))
+		}
+		if c.live != nil {
+			c.live.Down.Add(int64(n))
+			liveDownSum.Add(int64(n))
+		}
+	}
+	return n, err
 }
 
 type statWriter struct {
 	http.ResponseWriter
-	bytes int64
-	live  *liveConn
+	bytes    int64
+	live     *liveConn
+	hdrNoted bool
 }
 
 func (w *statWriter) noteDown(n int) {
@@ -2730,18 +2934,33 @@ func (w *statWriter) noteDown(n int) {
 		return
 	}
 	w.bytes += int64(n)
+	// 写给客户端 = 服务器上行
 	if w.live != nil {
-		w.live.Down.Add(int64(n))
-		liveDownSum.Add(int64(n))
+		w.live.Up.Add(int64(n))
+		liveUpSum.Add(int64(n))
 	}
 }
 
 func (w *statWriter) Write(b []byte) (int, error) {
+	if !w.hdrNoted {
+		w.noteRespHeaders(http.StatusOK) // 隐式 200
+	}
 	n, err := w.ResponseWriter.Write(b)
 	w.noteDown(n)
 	return n, err
 }
-func (w *statWriter) WriteHeader(code int) { w.ResponseWriter.WriteHeader(code) }
+func (w *statWriter) WriteHeader(code int) {
+	w.ResponseWriter.WriteHeader(code)
+	w.noteRespHeaders(code)
+}
+func (w *statWriter) noteRespHeaders(code int) {
+	if w.hdrNoted {
+		return
+	}
+	w.hdrNoted = true
+	hs := estimateRespHeaderSize(w.Header(), code)
+	w.noteDown(int(hs))
+}
 func (w *statWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
@@ -2845,7 +3064,7 @@ func (r *statReadCloser) Read(p []byte) (int, error) {
 type switchTransport struct{ v atomic.Value }
 
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	t, _ := s.v.Load().(*http.Transport)
+	t, _ := s.v.Load().(http.RoundTripper)
 	if t == nil {
 		return nil, fmt.Errorf("transport nil")
 	}
@@ -2858,11 +3077,11 @@ func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
 	}
-	return make([]byte, 32*1024)
+	return make([]byte, 256*1024)
 }
 func (b *bufferPool) Put(p []byte) {
-	if cap(p) >= 32*1024 {
-		b.pool.Put(p[:32*1024])
+	if cap(p) >= 256*1024 {
+		b.pool.Put(p[:256*1024])
 	}
 }
 
@@ -2871,11 +3090,85 @@ var proxyBufPool = &bufferPool{}
 func newTransport() *http.Transport {
 	return &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
-		DialContext:       (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2: true, MaxIdleConns: 512, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 45 * time.Second, ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+			c, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)          // 降低小包延迟
+				_ = tc.SetKeepAlive(true)
+				_ = tc.SetKeepAlivePeriod(30 * time.Second)
+				// 适当放大缓冲，利于视频流
+				_ = tc.SetReadBuffer(1 << 20)  // 1MB，稳住高速视频流
+				_ = tc.SetWriteBuffer(1 << 20)
+			}
+			return c, nil
+		},
+		ForceAttemptHTTP2: false, MaxIdleConns: 512, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 0, IdleConnTimeout: 180 * time.Second,
+		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 0, ExpectContinueTimeout: 1 * time.Second, // 0=不限制响应头等待，避免转码慢启动被掐
+		DisableCompression: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
 	}
+}
+
+
+// retryTransport 对幂等 GET/HEAD 在短暂网络错误时重试一次，提升稳定性
+type retryTransport struct{ base http.RoundTripper }
+
+func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return rt.roundTrip(req, 0)
+}
+
+// roundTrip 跟随最多 3 次跳转（Emby stream 常 302 到真实文件），并在完全无响应时重试一次。
+func (rt *retryTransport) roundTrip(req *http.Request, hops int) (*http.Response, error) {
+	resp, err := rt.base.RoundTrip(req)
+	if err != nil && resp == nil && hops == 0 && req.Header.Get("Range") == "" {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			req2 := req.Clone(req.Context())
+			resp, err = rt.base.RoundTrip(req2)
+		}
+	}
+	if err != nil || resp == nil || hops >= 3 {
+		return resp, err
+	}
+	code := resp.StatusCode
+	if code != 301 && code != 302 && code != 303 && code != 307 && code != 308 {
+		return resp, nil
+	}
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		return resp, nil
+	}
+	u, perr := url.Parse(loc)
+	if perr != nil {
+		return resp, nil
+	}
+	if !u.IsAbs() {
+		u = req.URL.ResolveReference(u)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return resp, nil
+	}
+	resp.Body.Close()
+	next := req.Clone(req.Context())
+	next.URL = u
+	next.Host = u.Host
+	// 拖动进度：跳转后必须保留 Range / If-Range，否则会从头播或拖动失败
+	if rng := req.Header.Get("Range"); rng != "" {
+		next.Header.Set("Range", rng)
+	}
+	if ir := req.Header.Get("If-Range"); ir != "" {
+		next.Header.Set("If-Range", ir)
+	}
+	if code == 302 || code == 303 {
+		next.Method = http.MethodGet
+		next.Body = nil
+		next.ContentLength = 0
+		next.Header.Del("Content-Type")
+		next.Header.Del("Content-Length")
+	}
+	return rt.roundTrip(next, hops+1)
 }
 
 var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
@@ -2895,13 +3188,246 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	}
 }
 
+
+// shouldRewriteBody 判断是否值得对响应体做绝对 URL 重写
+// 仅处理小体积文本，避免影响视频流和性能
+func shouldRewriteBody(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		return false
+	}
+	okType := strings.Contains(ct, "text/") ||
+		strings.Contains(ct, "application/json") ||
+		strings.Contains(ct, "application/javascript") ||
+		strings.Contains(ct, "application/xml") ||
+		strings.Contains(ct, "text/xml") ||
+		strings.Contains(ct, "application/xhtml")
+	if !okType {
+		return false
+	}
+	// 支持 identity 与 gzip；其他编码跳过
+	enc := strings.ToLower(resp.Header.Get("Content-Encoding"))
+	if enc != "" && enc != "identity" && enc != "gzip" {
+		return false
+	}
+	// 体积限制：声明 >1MB 不重写（gzip 解压后仍限 1MB）
+	if resp.ContentLength > 1<<20 {
+		return false
+	}
+	return true
+}
+
+// rewriteAbsoluteURLs 把响应体中指向当前上游的绝对 URL 改写为路径反代形式
+// 例如 https://emby.example.com:8096/web/index.html → /https://emby.example.com:8096/web/index.html
+func rewriteAbsoluteURLs(resp *http.Response, scheme, host string) error {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	if len(raw) > 1<<20 {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		return nil
+	}
+	body := raw
+	wasGzip := strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip")
+	if wasGzip {
+		zr, zerr := gzip.NewReader(bytes.NewReader(raw))
+		if zerr != nil {
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			return nil
+		}
+		decompressed, derr := io.ReadAll(io.LimitReader(zr, 1<<20+1))
+		zr.Close()
+		if derr != nil || len(decompressed) > 1<<20 {
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			return nil
+		}
+		body = decompressed
+	}
+	prefix := scheme + "://" + host
+	proxyPrefix := "/" + prefix
+	already := []byte("/" + prefix)
+	placeholder := []byte("\x00PROXY\x00")
+	tmp := bytes.ReplaceAll(body, already, placeholder)
+	tmp = bytes.ReplaceAll(tmp, []byte(prefix), []byte(proxyPrefix))
+	replaced := bytes.ReplaceAll(tmp, placeholder, already)
+	var out []byte
+	if wasGzip {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, werr := zw.Write(replaced); werr != nil {
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			return nil
+		}
+		zw.Close()
+		out = buf.Bytes()
+	} else {
+		out = replaced
+		resp.Header.Del("Content-Encoding")
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(out))
+	resp.ContentLength = int64(len(out))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(out)))
+	resp.Header.Del("Transfer-Encoding")
+	return nil
+}
+
+// isWebSocketRequest 判断是否为 WebSocket 升级请求
+func isWebSocketRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+// proxyWebSocket 将客户端 WebSocket 升级透传到上游（Emby 直播/实时功能常用）
+func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, lc *liveConn) {
+	// 构造上游 WS URL
+	up := *target
+	switch up.Scheme {
+	case "http":
+		up.Scheme = "ws"
+	case "https":
+		up.Scheme = "wss"
+	}
+	if up.Path == "" {
+		up.Path = "/"
+	}
+
+	// 拨号上游
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	// 复制必要头（Origin、Sec-WebSocket-*、Cookie、Authorization 等）
+	hdr := http.Header{}
+	for k, vs := range r.Header {
+		lk := strings.ToLower(k)
+		if lk == "upgrade" || lk == "connection" || lk == "sec-websocket-key" ||
+			lk == "sec-websocket-version" || lk == "sec-websocket-extensions" ||
+			lk == "sec-websocket-protocol" || strings.HasPrefix(lk, "sec-websocket-") {
+			continue // Dialer 自己处理
+		}
+		if lk == "host" {
+			continue
+		}
+		hdr[k] = vs
+	}
+	// 让上游看到原始 Host
+	hdr.Set("Host", target.Host)
+	if origin := r.Header.Get("Origin"); origin != "" {
+		hdr.Set("Origin", origin)
+	}
+
+	upConn, resp, err := dialer.Dial(up.String(), hdr)
+	if err != nil {
+		if resp != nil {
+			// 把上游握手失败状态尽量返回给客户端
+			for k, vs := range resp.Header {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, resp.Body)
+			resp.Body.Close()
+			return
+		}
+		serveError(w, http.StatusBadGateway, "WebSocket 连接失败", "无法与上游建立 WebSocket 连接，请稍后重试。")
+		return
+	}
+	defer upConn.Close()
+
+	// 升级客户端
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true }, // 路径反代场景放宽
+	}
+	clientConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer clientConn.Close()
+
+	// 双向拷贝，统计字节，并响应 context 取消（支持管理端主动断开）
+	errc := make(chan error, 2)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-r.Context().Done():
+			_ = clientConn.Close()
+			_ = upConn.Close()
+		case <-done:
+		}
+	}()
+	go func() {
+		defer func() { errc <- nil }()
+		for {
+			mt, msg, err := clientConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if lc != nil {
+				// 客户端发来、转给上游：对服务器而言是从客户端收，不是本次口径的下行
+				// 口径只计：从上游收=下行，发给用户=上行。这里是发给上游，不计上下行主口径
+			}
+			if err := upConn.WriteMessage(mt, msg); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer func() { errc <- nil }()
+		for {
+			mt, msg, err := upConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if lc != nil {
+				// 从上游收到并转给用户：下行+上行
+				lc.Down.Add(int64(len(msg)))
+				liveDownSum.Add(int64(len(msg)))
+				lc.Up.Add(int64(len(msg)))
+				liveUpSum.Add(int64(len(msg)))
+			}
+			if err := clientConn.WriteMessage(mt, msg); err != nil {
+				return
+			}
+		}
+	}()
+	<-errc
+	close(done)
+}
+
+
+// isPlaybackRequest 视频/音频流请求（拖动、直链、转码分片）
+func isPlaybackRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	p := strings.ToLower(r.URL.Path)
+	if strings.Contains(p, "/videos/") || strings.Contains(p, "/audio/") ||
+		strings.Contains(p, "/stream") || strings.Contains(p, ".mkv") ||
+		strings.Contains(p, ".mp4") || strings.Contains(p, ".m3u8") ||
+		strings.Contains(p, ".ts") || strings.Contains(p, "/master") {
+		return true
+	}
+	ct := strings.ToLower(r.Header.Get("Accept"))
+	return strings.Contains(ct, "video/") || strings.Contains(ct, "audio/")
+}
+
 // buildProxy 构造反向代理：
 //   Rewrite        把路径中的目标写到 Out.URL，并统计上行 Body
 //   ModifyResponse 剥离 Set-Cookie Domain、把指回上游的 Location 改成相对路径
 //   ErrorHandler   上游失败时返回统一错误页
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: tr, FlushInterval: 50 * time.Millisecond, BufferPool: proxyBufPool,
+		Transport: tr, FlushInterval: 100 * time.Millisecond, BufferPool: proxyBufPool, // 100ms 批量刷，避免每包都刷导致速度不稳
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
 			if !ok || t == nil {
@@ -2930,18 +3456,28 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			if resp.Request != nil {
+				if v, ok := resp.Request.Context().Value(liveCtxKey{}).(*liveConn); ok && v != nil {
+					v.Status.Store(int32(resp.StatusCode))
+				}
+			}
 			upHost := ""
+			upScheme := ""
 			if resp.Request != nil && resp.Request.URL != nil {
 				upHost = resp.Request.URL.Host
+				upScheme = resp.Request.URL.Scheme
 			}
 			if loc := resp.Header.Get("Location"); loc != "" && upHost != "" {
 				if lu, err := url.Parse(loc); err == nil && lu.Host != "" && strings.EqualFold(lu.Host, upHost) {
-					lu.Scheme = ""
-					lu.Host = ""
+					// 改成路径反代形式：/https://host/path
+					prefix := "/" + upScheme + "://" + upHost
 					if lu.Path == "" {
 						lu.Path = "/"
 					}
-					resp.Header.Set("Location", lu.String())
+					resp.Header.Set("Location", prefix+lu.Path)
+					if lu.RawQuery != "" {
+						resp.Header.Set("Location", prefix+lu.Path+"?"+lu.RawQuery)
+					}
 				}
 			}
 			if cks, ok := resp.Header["Set-Cookie"]; ok && len(cks) > 0 {
@@ -2949,14 +3485,56 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 					cks[i] = cookieDomainRE.ReplaceAllString(c, "")
 				}
 			}
+
+			// 对小文本响应做绝对 URL 重写（把上游绝对地址改成路径反代形式）
+			// 避免客户端拿到 https://upstream/... 后绕过代理
+			if shouldRewriteBody(resp) && upHost != "" && upScheme != "" {
+				if err := rewriteAbsoluteURLs(resp, upScheme, upHost); err != nil {
+					// 重写失败不阻断请求，仅记录
+					log.Printf("响应体重写失败: %v", err)
+				}
+			}
+			// 统计从上游读到的字节 = 服务器下行（去 Emby 原站下载）
+			if p, ok := resp.Request.Context().Value(upBytesCtxKey{}).(*int64); ok && resp.Body != nil {
+				hs := estimateRespHeaderSize(resp.Header, resp.StatusCode)
+				atomic.AddInt64(p, hs)
+				var lc *liveConn
+				if v, ok := resp.Request.Context().Value(liveCtxKey{}).(*liveConn); ok {
+					lc = v
+					lc.Down.Add(hs)
+					liveDownSum.Add(hs)
+				}
+				resp.Body = &countReadCloser{ReadCloser: resp.Body, n: p, live: lc}
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			msg := "无法连接到上游服务，可能是上游服务器暂时不可用或网络波动，请稍后重试。"
-			if err != nil {
-				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">技术详情：" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "&lt;"), ">", "&gt;") + "</span>"
+			if v, ok := r.Context().Value(liveCtxKey{}).(*liveConn); ok && v != nil && err != nil {
+				v.Err.Store(err.Error())
 			}
-			serveError(w, http.StatusBadGateway, "上游服务连接失败", msg)
+			status := http.StatusBadGateway
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					status = http.StatusGatewayTimeout
+				}
+			}
+			// 播放请求只回状态码，不回 HTML，避免播放器把错误页当媒体缓存
+			if isPlaybackRequest(r) {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(status)
+				if err != nil {
+					_, _ = w.Write([]byte(err.Error()))
+				}
+				return
+			}
+			msg := "无法连接到上游服务，可能是上游服务器暂时不可用或网络波动，请稍后重试。"
+			if status == http.StatusGatewayTimeout {
+				msg = "连接上游超时，请检查网络或稍后重试。"
+			}
+			if err != nil {
+				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">技术详情：" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "<"), ">", ">") + "</span>"
+			}
+			serveError(w, status, "上游服务连接失败", msg)
 		},
 	}
 }
@@ -3440,19 +4018,21 @@ func adminHandler() http.HandlerFunc {
 		}
 
 		type TrendItem struct {
-			Date      string           `json:"date"`
-			Requests  int64            `json:"requests"`
-			Bytes     int64            `json:"bytes"`
-			UpBytes   int64            `json:"up_bytes"`
-			DownBytes int64            `json:"down_bytes"`
-			Blocked   int64            `json:"blocked"`
-			BlockedCN int64            `json:"blocked_cn"`
-			BlockedWL int64            `json:"blocked_whitelist"`
-			Hours     map[string]int64 `json:"hours,omitempty"`
-			HourBytes map[string]int64 `json:"hour_bytes,omitempty"`
-			Hosts     map[string]int64 `json:"hosts,omitempty"`
-			IPs       map[string]int64 `json:"ips,omitempty"`
-			Countries map[string]int64 `json:"countries,omitempty"`
+			Date         string           `json:"date"`
+			Requests     int64            `json:"requests"`
+			Bytes        int64            `json:"bytes"`
+			UpBytes      int64            `json:"up_bytes"`
+			DownBytes    int64            `json:"down_bytes"`
+			Blocked      int64            `json:"blocked"`
+			BlockedCN    int64            `json:"blocked_cn"`
+			BlockedWL    int64            `json:"blocked_whitelist"`
+			Hours        map[string]int64 `json:"hours,omitempty"`
+			HourBytes    map[string]int64 `json:"hour_bytes,omitempty"`
+			HourUpBytes  map[string]int64 `json:"hour_up_bytes,omitempty"`
+			HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"`
+			Hosts        map[string]int64 `json:"hosts,omitempty"`
+			IPs          map[string]int64 `json:"ips,omitempty"`
+			Countries    map[string]int64 `json:"countries,omitempty"`
 		}
 		var trend []TrendItem
 		hostAll := map[string]int64{}
@@ -3475,6 +4055,8 @@ func adminHandler() http.HandlerFunc {
 			}
 			hoursCopy := copyInt64Map(d.Hours)
 			hourBytesCopy := copyInt64Map(d.HourBytes)
+			hourUpCopy := copyInt64Map(d.HourUpBytes)
+			hourDownCopy := copyInt64Map(d.HourDownBytes)
 			hostsCopy := copyInt64Map(d.Hosts)
 			ipsCopy := copyInt64Map(d.IPs)
 			ctryCopy := copyInt64Map(d.Countries)
@@ -3485,8 +4067,9 @@ func adminHandler() http.HandlerFunc {
 			Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
 			Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
 			BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
-			Hours: hoursCopy, HourBytes: hourBytesCopy, Hosts: hostsCopy,
-			IPs: ipsCopy, Countries: ctryCopy,
+			Hours: hoursCopy, HourBytes: hourBytesCopy,
+			HourUpBytes: hourUpCopy, HourDownBytes: hourDownCopy,
+			Hosts: hostsCopy, IPs: ipsCopy, Countries: ctryCopy,
 		})
 		}
 		sort.Slice(trend, func(i, j int) bool { return trend[i].Date < trend[j].Date })
@@ -3758,38 +4341,37 @@ func adminHandler() http.HandlerFunc {
 			http.Error(w, "IP 地址格式无效，请输入合法的 IPv4/IPv6 地址", http.StatusBadRequest)
 			return
 		}
-		code, name := ipLabelSync(ip)
+		// 国家用本地库；详情每次现查，不缓存（避免旧数据）
+		code := countryOf(ip)
+		name := countryName(code)
 		geo := geoEntry{}
-		if currentCfg().GeoAPI {
+		if currentCfg().GeoAPI && !isSelfOrLocalIP(ip, code) {
 			v, err, _ := geoGroup.Do(ip, func() (interface{}, error) {
-				geoMu.RLock()
-				cached, ok := geoMap[ip]
-				geoMu.RUnlock()
-				if ok && cached.Code != "??" && time.Now().Unix()-cached.At < 30*86400 {
-					return cached, nil
-				}
 				return geoFetch(ip)
 			})
 			if err == nil {
-				geo = v.(geoEntry)
-				geoMu.Lock()
-				geoMap[ip] = geo
-				geoMu.Unlock()
+				if e, ok := v.(geoEntry); ok {
+					geo = e
+				}
 			}
 		}
-		if geo.Code != "" {
+		if geo.Code != "" && geo.Code != "??" {
 			code = geo.Code
 			name = countryName(code)
 		}
 		locParts := []string{}
-		if name != "未知" {
-			locParts = append(locParts, name)
-		}
-		if geo.Region != "" {
-			locParts = append(locParts, geo.Region)
-		}
-		if geo.City != "" && geo.City != geo.Region {
-			locParts = append(locParts, geo.City)
+		if geo.Name != "" {
+			locParts = append(locParts, geo.Name)
+		} else {
+			if name != "未知" {
+				locParts = append(locParts, name)
+			}
+			if geo.Region != "" {
+				locParts = append(locParts, geo.Region)
+			}
+			if geo.City != "" && geo.City != geo.Region {
+				locParts = append(locParts, geo.City)
+			}
 		}
 		statsMu.Lock()
 		reqs := stats.IPCounts[ip]
@@ -3927,7 +4509,7 @@ func adminHandler() http.HandlerFunc {
 // 打开 DB → 迁移旧 JSON → 加载配置/统计 → 启动后台协程 → 监听并阻塞等信号。
 func runServer(port int, adminUser, adminPass, dbFile string) {
 	// Transport 与配置无关，只在启动时创建一次（见 newTransport 上方说明）
-	proxyTr.v.Store(newTransport())
+	proxyTr.v.Store(&retryTransport{base: newTransport()})
 	var err error
 	db, err = bolt.Open(dbFile, 0600, &bolt.Options{Timeout: 3 * time.Second})
 	if err != nil {
@@ -4002,7 +4584,6 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	}
 	setAdminCred(adminUser, finalHash)
 
-	geoCacheLoad()
 	loadStats()
 	startStatsWorker()
 	startLiveRateSampler()
@@ -4019,7 +4600,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		icon192Data.Store(fetchIcon(icon192URL))
 		icon512Data.Store(fetchIcon(icon512URL))
 	}()
-	defer func() { saveStatsOnce(); geoCacheSave() }()
+	defer func() { saveStatsOnce() }()
 
 	proxy := buildProxy(proxyTr)
 	// 代理主处理：静态资源 → ACL → 地区 → 解析目标 → 白名单 → 可选缓存 → 反代并记流量
@@ -4099,30 +4680,24 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
-		if c.CORS {
-			// 宽松 CORS 仅用于播放器拉流；不反射任意 Origin 到带凭证场景
-			origin := r.Header.Get("Origin")
-			if origin == "" || origin == "null" {
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
-			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Range, X-Requested-With")
-			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-		}
-
-		if c.EnableCache && strings.Contains(r.URL.Path, "/Images/") && r.Method == "GET" {
-			if cached, ok := imageCacheGet(r.URL.String()); ok {
-				w.Header().Set("Content-Type", "image/jpeg")
-				_, _ = w.Write(cached)
-				return
-			}
+		// WebSocket 升级单独处理（Emby 实时/直播常用）
+		if isWebSocketRequest(r) {
+			recordRequestStart(ip, country, target.Host)
+			reqCtx, cancel := context.WithCancel(r.Context())
+			lc := liveStart(ip, country, target.Host, r.Method, r.URL.RequestURI())
+			lc.cancel = cancel
+			// 握手头计入
+			hs := estimateReqHeaderSize(r)
+			lc.Up.Add(hs)
+			liveUpSum.Add(hs)
+			defer func() {
+				cancel()
+				liveEnd(lc)
+				// WS 结束时把累计字节写入日统计
+				recordBytes(ip, lc.Up.Load(), lc.Down.Load())
+			}()
+			proxyWebSocket(w, r.WithContext(reqCtx), target, lc)
+			return
 		}
 
 		recordRequestStart(ip, country, target.Host)
@@ -4134,23 +4709,19 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		defer liveEnd(lc)
 
 		sw := &statWriter{ResponseWriter: w, live: lc}
-		var w2 http.ResponseWriter = sw
-		if c.EnableCache && strings.Contains(r.URL.Path, "/Images/") && r.Method == "GET" {
-			rec := &cacheRecorder{statWriter: sw, buf: &bytes.Buffer{}}
-			w2 = rec
-		}
 
-		upBytes := new(int64)
+		// downFromUp：从 Emby 原站下载的字节（服务器下行）
+		downFromUp := new(int64)
 		ctx := context.WithValue(reqCtx, targetCtxKey{}, target)
-		ctx = context.WithValue(ctx, upBytesCtxKey{}, upBytes)
+		ctx = context.WithValue(ctx, upBytesCtxKey{}, downFromUp)
 		ctx = context.WithValue(ctx, liveCtxKey{}, lc)
 
-		proxy.ServeHTTP(w2, r.WithContext(ctx))
+		proxy.ServeHTTP(sw, r.WithContext(ctx))
 
-		if r2, ok := w2.(*cacheRecorder); ok && r2.status == http.StatusOK && r2.buf != nil && r2.buf.Len() > 0 {
-			imageCachePut(r.URL.String(), r2.buf.Bytes())
-		}
-		recordBytes(ip, atomic.LoadInt64(upBytes), sw.bytes)
+		// 口径：上行=转发给用户，下行=从 Emby 原站下载
+		toClient := sw.bytes
+		fromOrigin := atomic.LoadInt64(downFromUp)
+		recordBytes(ip, toClient, fromOrigin)
 	})
 
 	adminSrv := adminHandler()
@@ -4159,7 +4730,11 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d}`, int64(time.Since(startedAt).Seconds()))))
+			active := liveActive.Load()
+			dropped := statDropped.Load()
+			dbOk := db != nil
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d,"active_conns":%d,"stat_dropped":%d,"db_ok":%t}`,
+				int64(time.Since(startedAt).Seconds()), active, dropped, dbOk)))
 			return
 		}
 		if r.URL.Path == "/admin" {
@@ -4175,7 +4750,14 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	if c := currentCfg(); c.Port > 0 {
 		port = c.Port
 	}
-	srv := &http.Server{Handler: root, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 32 << 10}
+	srv := &http.Server{
+		Handler:           root,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       0, // 不限制，避免长视频被掐
+		WriteTimeout:      0, // 流式响应不设写超时
+		IdleTimeout:       180 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 	globalSrv = srv
 	if err := startListen(srv, port); err != nil {
 		log.Fatalf("监听失败: %v", err)
@@ -4476,7 +5058,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   </div>
 </div>
 <div class="sg">
-<div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">流量 <b id="ovBytes">0 B</b></div></div>
+<div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">上行 <b id="ovUp">0 B</b> · 下行 <b id="ovDown">0 B</b></div></div>
 <div class="stc g"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>平均每日请求</div><div class="sv" id="ovAvgReq">-</div><div class="ss">日均流量 <b id="ovAvgBytes">0 B</b></div></div>
 <div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">全部拦截类型</div></div>
 <div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
@@ -4508,7 +5090,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </div>
 <div class="sg" style="margin-bottom:18px">
   <div class="stc b"><div class="sl">区间请求</div><div class="sv" id="tfReq">-</div><div class="ss" id="tfReqHint">—</div></div>
-  <div class="stc g"><div class="sl">区间流量</div><div class="sv" id="tfBytes">-</div><div class="ss" id="tfBytesHint">—</div></div>
+  <div class="stc g"><div class="sl">区间流量</div><div class="sv" id="tfBytes">-</div><div class="ss" id="tfBytesHint">下行 — · 上行 —</div></div>
   <div class="stc o"><div class="sl">独立 IP</div><div class="sv" id="tfIPs">-</div><div class="ss">当前筛选</div></div>
   <div class="stc r"><div class="sl">拦截次数</div><div class="sv" id="tfBlocked" style="color:var(--d)">-</div><div class="ss">当前筛选</div></div>
 </div>
@@ -4517,7 +5099,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div style="position:relative;height:260px"><canvas id="reqChart"></canvas></div>
 </div>
 <div class="card">
-<div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">按天统计上下行流量</div></div></div>
+<div class="ch"><div><h2 class="ct" id="tfByteTitle">上下行流量趋势</h2><div class="cd" id="tfByteDesc">蓝=下行 · 绿=上行</div></div></div>
 <div style="position:relative;height:260px"><canvas id="byteChart"></canvas></div>
 </div>
 <div class="card" style="margin-top:0">
@@ -4591,8 +5173,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
     <div class="card" style="margin-bottom:0;">
       <div class="ch"><div><h2 class="ct">基础服务设置</h2></div></div>
       <div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center"><input id="portInput" class="inp m" type="number" style="max-width:140px"><button class="btn b" id="savePort">保存并重启监听</button></div></div>
-      <div class="row"><div><div class="rl">开启 CORS 跨域</div><div class="rd">缓解部分播放器跨域拉流失败</div></div><label class="sw"><input type="checkbox" id="corsToggle"><span class="tr2"></span></label></div>
-      <div class="row"><div><div class="rl">缓存海报图片</div><div class="rd">缓存上游图片资源，减轻回源压力</div></div><label class="sw"><input type="checkbox" id="cacheToggle"><span class="tr2"></span></label></div>
       <div class="row"><div><div class="rl">PWA 模式</div><div class="rd">后台可安装到手机/电脑桌面，全屏运行并支持离线打开；保存后刷新页面生效</div></div><label class="sw"><input type="checkbox" id="pwaToggle"><span class="tr2"></span></label></div>
       <div class="row" id="pwaInstallRow" style="display:none"><div><div class="rl">安装到主屏幕</div><div class="rd">安装后从桌面图标秒开启动页进入后台</div></div><button type="button" class="btn b s" id="pwaInstallBtn">安装应用</button></div>
     </div>
@@ -4882,7 +5462,7 @@ async function loadConfig(){
     const r=await fetch('/admin/api/config',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const c=await r.json();applyPort(c.effective_port);
-    document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('corsToggle').checked=!!c.cors;document.getElementById('cacheToggle').checked=!!c.enable_cache;document.getElementById('pwaToggle').checked=!!c.pwa;state.pwaOn=!!c.pwa;
+    document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('pwaToggle').checked=!!c.pwa;state.pwaOn=!!c.pwa;
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');document.getElementById('autoBan').checked=!!c.auto_ban;
     document.getElementById('rateLimit').value=c.rate_limit||0;document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
   }catch(e){console.error('loadConfig error:',e)}
@@ -4909,17 +5489,23 @@ function updateOvStats() {
   else if (state.ovRange === '30d') filterFn = d => d.date >= d30Str;
   
   const filtered = ovTrendData.filter(filterFn);
-  let reqs = 0, bytes = 0, bTotal = 0;
+  let reqs = 0, bytes = 0, up = 0, down = 0, bTotal = 0;
   filtered.forEach(d => {
     reqs += d.requests || 0;
     bytes += d.bytes || 0;
-    // 优先用后端汇总字段（五种拦截之和）；旧数据无 blocked 字段时回退老两字段
+    up += d.up_bytes || 0;
+    down += d.down_bytes || 0;
     bTotal += (d.blocked != null) ? d.blocked : ((d.blocked_cn||0)+(d.blocked_whitelist||0));
   });
+  // 旧数据无 up/down 时，把合计当作下行
+  if (down === 0 && up === 0 && bytes > 0) down = bytes;
   
   const days = filtered.length || 1;
   document.getElementById('ovReq').textContent = reqs.toLocaleString();
-  document.getElementById('ovBytes').textContent = fmtBytes(bytes);
+  const ovDown = document.getElementById('ovDown');
+  const ovUp = document.getElementById('ovUp');
+  if (ovDown) ovDown.textContent = fmtBytes(down);
+  if (ovUp) ovUp.textContent = fmtBytes(up);
   document.getElementById('ovAvgReq').textContent = Math.round(reqs/days).toLocaleString();
   document.getElementById('ovAvgBytes').textContent = fmtBytes(Math.round(bytes/days));
   document.getElementById('ovBlocked').textContent = bTotal.toLocaleString();
@@ -4951,7 +5537,6 @@ function renderSysInfo(c, uptime){
   <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">运行时长</span><span>${Math.floor(uptime/3600)} 小时</span></div>
   <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">访问防护</span><span style="color:var(--ok)">${fw}</span></div>
   <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">域名白名单</span><span>${c.whitelist?.length||0} 个</span></div>
-  <div style="display:flex;justify-content:space-between;padding:8px 0"><span style="color:#94a3b8">图片缓存</span><span>${c.enable_cache?"已开启":"已关闭"}</span></div>
   `;
   document.getElementById('sysInfo').innerHTML = html;
 }
@@ -5017,23 +5602,30 @@ function buildTrafficView(trend){
   const filtered=filterTrendByRange(trend);
   const {from,to,today}=dateRangeBounds();
   const isToday = state.tfRange === 'today' || (state.tfRange === 'custom' && from && to && from === to && from === today);
-  const labels=[],reqs=[],bytes=[];
+  const labels=[],reqs=[],bytes=[],ups=[],downs=[];
   const ipMap={},ctryMap={},hostMap={};
-  let totalReq=0,totalBytes=0,blocked=0,rawDayCount=0,gran='hour';
+  let totalReq=0,totalBytes=0,totalUp=0,totalDown=0,blocked=0,rawDayCount=0,gran='hour';
   filtered.forEach(d=>{
     totalReq+=d.requests||0; totalBytes+=d.bytes||0;
+    totalUp+=d.up_bytes||0; totalDown+=d.down_bytes||0;
     blocked+=(d.blocked!=null)?d.blocked:((d.blocked_cn||0)+(d.blocked_whitelist||0));
     Object.entries(d.ips||{}).forEach(([k,v])=>{ipMap[k]=(ipMap[k]||0)+v});
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
     Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
   });
+  if(totalDown===0&&totalUp===0&&totalBytes>0) totalDown=totalBytes;
   if(isToday){
     gran='hour';
-    const day=filtered.find(d=>d.date===today)||filtered[0]||{hours:{},hour_bytes:{}};
+    const day=filtered.find(d=>d.date===today)||filtered[0]||{hours:{},hour_bytes:{},hour_up_bytes:{},hour_down_bytes:{}};
     const hours=day.hours||{}, hourBytes=day.hour_bytes||{};
+    const hourUp=day.hour_up_bytes||{}, hourDown=day.hour_down_bytes||{};
     for(let h=0;h<24;h++){
       const key=String(h).padStart(2,'0');
-      labels.push(key+':00'); reqs.push(hours[key]||0); bytes.push(hourBytes[key]||0);
+      labels.push(key+':00');
+      reqs.push(hours[key]||0);
+      bytes.push(hourBytes[key]||0);
+      ups.push(hourUp[key]||0);
+      downs.push(hourDown[key]||0);
     }
     rawDayCount=1;
   }else{
@@ -5046,16 +5638,17 @@ function buildTrafficView(trend){
     rawDayCount=days.length||1;
     gran=pickGranularity(rawDayCount);
     if(gran==='day'){
-      days.forEach(date=>{ const d=byDate[date]||{}; labels.push(date); reqs.push(d.requests||0); bytes.push(d.bytes||0); });
+      days.forEach(date=>{ const d=byDate[date]||{}; labels.push(date); reqs.push(d.requests||0); bytes.push(d.bytes||0); ups.push(d.up_bytes||0); downs.push(d.down_bytes||0); });
     }else{
       const buckets={}, order=[];
       days.forEach(date=>{
         const key=gran==='week'?weekStartKey(date):monthKey(date);
-        if(!buckets[key]){ buckets[key]={req:0,bytes:0}; order.push(key); }
+        if(!buckets[key]){ buckets[key]={req:0,bytes:0,up:0,down:0}; order.push(key); }
         const d=byDate[date]||{};
         buckets[key].req+=(d.requests||0); buckets[key].bytes+=(d.bytes||0);
+        buckets[key].up+=(d.up_bytes||0); buckets[key].down+=(d.down_bytes||0);
       });
-      order.forEach(key=>{ labels.push(key); reqs.push(buckets[key].req); bytes.push(buckets[key].bytes); });
+      order.forEach(key=>{ labels.push(key); reqs.push(buckets[key].req); bytes.push(buckets[key].bytes); ups.push(buckets[key].up); downs.push(buckets[key].down); });
     }
   }
   const hostTop=Object.entries(hostMap).sort((a,b)=>b[1]-a[1]).slice(0,12);
@@ -5065,7 +5658,7 @@ function buildTrafficView(trend){
   const ipMapTrim={}, ctryMapTrim={};
   ipEntries.slice(0,ipTopN).forEach(([k,v])=>{ipMapTrim[k]=v});
   ctryEntries.slice(0,ctryTopN).forEach(([k,v])=>{ctryMapTrim[k]=v});
-  return {isToday,gran,labels,reqs,bytes,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN};
+  return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN};
 }
 function applyTrafficView(){
   const v=buildTrafficView(trafficTrendData);
@@ -5075,7 +5668,7 @@ function applyTrafficView(){
   document.getElementById('tfBlocked').textContent=v.blocked.toLocaleString();
   const granHint={hour:'今日分时段',day:'共 '+v.dayCount+' 天',week:'共 '+v.dayCount+' 天 · 按周汇总',month:'共 '+v.dayCount+' 天 · 按月汇总'};
   document.getElementById('tfReqHint').textContent=granHint[v.gran]||('共 '+v.dayCount+' 天');
-  document.getElementById('tfBytesHint').textContent=v.isToday?'今日真实分时流量':('日均 '+fmtBytes(Math.round(v.totalBytes/(v.dayCount||1))));
+  document.getElementById('tfBytesHint').textContent='下行 '+fmtBytes(v.totalDown||0)+' · 上行 '+fmtBytes(v.totalUp||0);
   const titleMap={hour:['请求量趋势（分时）','流量消耗趋势（分时）'],day:['请求量趋势','流量消耗趋势'],week:['请求量趋势（按周）','流量消耗趋势（按周）'],month:['请求量趋势（按月）','流量消耗趋势（按月）']};
   const descMap={hour:['今天 00:00–23:00 各时段请求数（北京时间）','今天 00:00–23:00 各时段真实流量（北京时间）'],day:['筛选区间内每日请求次数（北京时间）','筛选区间内每日上下行流量（北京时间）'],week:['区间超过 60 天，已按周汇总','区间超过 60 天，已按周汇总流量'],month:['区间超过 180 天，已按月汇总','区间超过 180 天，已按月汇总流量']};
   const tt=titleMap[v.gran]||titleMap.day, dd=descMap[v.gran]||descMap.day;
@@ -5085,7 +5678,7 @@ function applyTrafficView(){
   document.getElementById('tfByteDesc').textContent=dd[1];
   document.getElementById('tfHostDesc').textContent=v.isToday?'今日访问量最高的上游主机':'当前范围内访问量最高的上游主机';
   renderReqChart(v.labels,v.reqs,v.gran);
-  renderByteChart(v.labels,v.bytes,v.gran);
+  renderByteChart(v.labels,v.downs||v.bytes,v.ups||[],v.gran);
   renderHostChart(v.hostTop);
   renderIP(v.ipMap,{},v.ipTotalUnique,v.ipTopN);
   renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN);
@@ -5154,12 +5747,16 @@ function renderReqChart(labels,data,gran){
   const cfg={type:'bar',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:gran==='hour'?'rgba(16,185,129,0.75)':'rgba(16,185,129,0.65)',borderWidth:1,borderRadius:dense?2:4,maxBarThickness:dense?10:28}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
-function renderByteChart(labels,data,gran){
+function renderByteChart(labels,downData,upData,gran){
   const cv=document.getElementById('byteChart');if(!cv||typeof Chart==='undefined')return;
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  const cfg={type:'line',data:{labels:labs,datasets:[{label:'流量',data,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',fill:true,tension:0.3,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),borderWidth:2,pointHoverRadius:4}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
+  const pr=dense||gran==='hour'?0:(labels.length>20?2:3);
+  const cfg={type:'line',data:{labels:labs,datasets:[
+    {label:'下行',data:downData||[],borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.12)',fill:true,tension:0.3,pointRadius:pr,borderWidth:2,pointHoverRadius:4},
+    {label:'上行',data:upData||[],borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.08)',fill:true,tension:0.3,pointRadius:pr,borderWidth:2,pointHoverRadius:4}
+  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:true,position:'top'},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>c.dataset.label+' '+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
 function renderHostChart(hostTop){
@@ -5303,7 +5900,7 @@ function renderLiveTables(){
       return `<tr class="live-row ${c.active?'lv-active':''}" data-live-id="${esc(c.id)}" style="cursor:pointer" title="点击查看详情">
       <td data-label="操作"><span class="cell-v">${c.active?`<button type="button" class="lv-x" data-close-id="${esc(c.id)}" title="断开连接">×</button>`:'<button type="button" class="lv-x" disabled title="已结束">×</button>'}</span></td>
       <td data-label="主机"><span class="cell-v lv-host">${esc(c.host||'-')}</span></td>
-      <td data-label="类型"><span class="cell-v"><span class="lv-type ${c.active?'on':''}">${esc(c.method||'GET')}${c.active?' · 进行中':' · 已结束'}</span></span></td>
+      <td data-label="类型"><span class="cell-v"><span class="lv-type ${c.active?'on':''}" title="${esc(c.error||'')}">${esc(c.method||'GET')}${c.status?' '+c.status:''}${c.active?' · 进行中':' · 已结束'}${c.error?' · 失败':''}</span></span></td>
       <td data-label="来源"><span class="cell-v"><span class="lv-src"><span class="ip">${esc(c.ip||'-')}</span><span class="rg">${esc(c.country_name||countryLabel(c.country))}</span></span></span></td>
       <td data-label="路径"><span class="cell-v"><span class="lv-path" title="${esc(c.path||path)}">${esc(pathShort)}</span></span></td>
       <td data-label="下载速度"><span class="cell-v lv-rate ${dRate>0?'on':''}">${fmtRate(dRate)}</span></td>
@@ -5399,7 +5996,7 @@ async function loadBlocks(){
 
 function collect(){
   const raw=parseInt(document.getElementById('portInput').value,10);
-  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),enable_cache:document.getElementById('cacheToggle').checked,cors:document.getElementById('corsToggle').checked,pwa:document.getElementById('pwaToggle').checked}
+  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),enable_cache:false,cors:false,pwa:document.getElementById('pwaToggle').checked}
 }
 async function save(){
   try{
@@ -5624,8 +6221,8 @@ build_binary() {
     cd "$BUILD_TMPDIR"
     export GOTOOLCHAIN=auto GOFLAGS=-mod=mod
     go mod init emby-proxy >/dev/null 2>&1 || true
-    go get "github.com/phuslu/iploc@${IPLOC_VERSION}" >/dev/null 2>&1 || true
-    go get "go.etcd.io/bbolt@latest" >/dev/null 2>&1 || true
+    go get "github.com/phuslu/iploc@v1.0.1" >/dev/null 2>&1 || true
+    go get "go.etcd.io/bbolt@v1.3.11" >/dev/null 2>&1 || true
     go get "golang.org/x/sync/singleflight@v0.10.0" >/dev/null 2>&1 || true
     go get "github.com/gorilla/websocket@v1.5.3" >/dev/null 2>&1 || true
     go get "golang.org/x/crypto/bcrypt@v0.31.0" >/dev/null 2>&1 || true
