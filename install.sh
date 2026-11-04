@@ -9,7 +9,7 @@
 #   · 子命令：menu | install | update | uninstall | status | start|stop|restart
 #
 # 数据目录（默认）
-#   /etc/emby-proxy/emby.db     bolt 库：配置、统计、认证、geo 缓存
+#   /etc/emby-proxy/emby.db     bolt 库：配置、统计、认证（唯一的本地持久化数据）
 #   /usr/local/bin/emby-proxy   编译产物
 #   /etc/systemd/system/emby-proxy.service
 #
@@ -164,7 +164,7 @@ ensure_go() {
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
-package main
+  package main
 
 /*
 Emby 路径反代服务（单文件）
@@ -173,21 +173,26 @@ Emby 路径反代服务（单文件）
   客户端请求：  GET /https://emby.example.com:8096/web/index.html
   本服务解析路径中的目标 URL，按白名单/地区/限流校验后反代到上游。
 
+上下行口径（服务端视角）
+  · 下行 down = 上游→本机（从源站读到的字节）
+  · 上行 up   = 本机→客户端（写给客户端的字节）
+
 主要模块
   · parseTarget / buildProxy     路径解析与 httputil.ReverseProxy
   · Config + bolt DB            持久化配置与统计
   · 访问控制                    白名单、ChinaOnly、黑名单、UA、限流（ACL 预编译）
   · 统计                        异步 channel 聚合，按日分桶，定期落盘
-  · 实时监控                    liveConn + WebSocket(/admin/api/live/ws) 推送活跃连接
   · 管理后台                    /admin/ 嵌入 admin.html，会话 Cookie + 验证码登录
-  · PWA 模式                    可选开启：manifest + Service Worker，后台可安装为独立应用、离线打开
-  · 品牌图标                    favicon / Logo / PWA 图标（192、512）启动预热，本地提供
+  · PWA 模式                    内置常开：manifest + Service Worker（不含离线缓存），后台可安装为独立应用
+  · 品牌图标                    favicon / Logo / PWA 图标（192、512）一律 302 到源站，本地不留副本
+  · CORS                        不提供跨域响应头（功能已移除，预检按普通请求转发上游）
 
 时区
   统计分日/分时与对外时间字段统一按 Asia/Shanghai（北京时间）。
 
 内存与资源
-  · 图片 LRU 缓存有条数与总字节上限
+  · 除 bolt 数据库外不做任何本地缓存（图标/HTML/SW/geo 均不落盘、不驻留副本）
+  · geo 查询结果仅放在进程内 map，随进程退出丢弃
   · 统计 map 定期 pruneTopN，防止无限增长
   · GOMEMLIMIT 由 systemd unit 设为 256MiB 软限制
 */
@@ -195,7 +200,6 @@ Emby 路径反代服务（单文件）
 import (
 	"bufio"
 	"bytes"
-	"container/list"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -217,6 +221,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -225,7 +231,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/phuslu/iploc"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/crypto/bcrypt"
@@ -236,9 +241,9 @@ import (
 // adminHTML 为管理后台单页（构建时由脚本写入同目录 admin.html 后 embed）
 var adminHTML []byte
 
-// 上下文键：在 ReverseProxy.Rewrite 中取回目标 URL / 上行字节计数 / 实时连接
+// 上下文键：在 ReverseProxy.Rewrite / ModifyResponse 中取回目标 URL / 下行计数器
 type targetCtxKey struct{}
-type upBytesCtxKey struct{}
+type downBytesCtxKey struct{}
 
 var httpPorts = map[string]bool{"80": true, "8080": true, "8000": true, "8008": true, "8081": true, "8088": true, "8888": true, "3000": true, "5000": true, "7001": true, "8090": true, "8096": true, "9000": true, "9090": true, "9200": true, "10000": true, "15672": true}
 
@@ -347,7 +352,7 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 <div class="ex" style="margin-bottom:28px"><div class="ex-t">示例</div><code>/https://emby.example.com:8096/web/index.html</code></div>
 <div class="acts"><a class="btn b" href="/admin/">管理后台</a></div>`
 	writePage(w, http.StatusOK, "", "", "",
-		"按路径将请求转发到指定上游，可配置域名白名单、地区限制、限流与缓存。", extra)
+		"按路径将请求转发到指定上游，可配置域名白名单、地区限制与限流。", extra)
 }
 
 func serveError(w http.ResponseWriter, status int, title, message string) {
@@ -427,15 +432,12 @@ type Config struct {
 	Port        int      `json:"port"`         // 监听端口；保存后可热切换
 	ChinaOnly   bool     `json:"china_only"`   // 仅允许中国大陆 IP（本地 iploc 判断）
 	Whitelist   []string `json:"whitelist"`    // 上游域名白名单，空=不限制；支持根域匹配
-	GeoAPI      bool     `json:"geo_api"`      // 管理端 IP 详情是否拉远程 geo
-	GeoAPIURL   string   `json:"geo_api_url"`  // 预留；实际优先 ip9.com.cn，失败回退 ip-api
 	BanList     []string `json:"ban_list"`     // IP 或 CIDR
 	AutoBan     bool     `json:"auto_ban"`     // 触发地区拦截时自动写入黑名单
 	RateLimit   int      `json:"rate_limit"`   // 每 IP 每分钟请求上限，0=关闭
 	AllowedUAs  []string `json:"allowed_uas"`  // UA 关键字白名单，空=不限制
-	EnableCache bool     `json:"enable_cache"` // 缓存 /Images/ 小图
-	CORS        bool     `json:"cors"`         // 是否添加宽松 CORS 头
-	PWA         bool     `json:"pwa"`          // 管理后台 PWA 模式（可安装到桌面、全屏运行、离线壳）
+	// 说明：CORS 与 PWA 已固化为程序常量（CORS 关闭、PWA 常开），不再作为可配置项，
+	// 也不再出现在后台设置中；旧数据库里遗留的 cors/pwa 字段会被自动忽略。
 }
 
 // rateLimitEntry：每 IP 限流窗口（Count/WindowStart 须 atomic 访问）。
@@ -461,136 +463,30 @@ func beijingHour(t time.Time) string { return t.In(beijingLoc).Format("15") }
 func beijingRFC3339(t time.Time) string { return t.In(beijingLoc).Format(time.RFC3339) }
 
 var (
-	db         *bolt.DB
-	dbPath     string
-	faviconData atomic.Pointer[cachedIcon] // 启动时后台预热，处理器只读，避免首次请求阻塞
-	logoData    atomic.Pointer[cachedIcon] // 品牌 Logo（登录页/侧边栏）
-	icon192Data atomic.Pointer[cachedIcon] // PWA 192x192 图标
-	icon512Data atomic.Pointer[cachedIcon] // PWA 512x512 图标
-	cfgPtr     atomic.Pointer[Config]
-	proxyTr    = &switchTransport{}
-	listenMu   sync.Mutex
-	curLn      net.Listener
-	curPort    int
-	globalSrv  *http.Server
+	db        *bolt.DB
+	dbPath    string
+	cfgPtr    atomic.Pointer[Config]
+	proxyTr   = &switchTransport{}
+	listenMu  sync.Mutex
+	curLn     net.Listener
+	curPort   int
+	globalSrv *http.Server
 
 	ipLimiters sync.Map
 )
 
-// ---------- 品牌图标资源（启动时预热，本地缓存后由 /admin/* 提供）----------
+// ---------- 品牌图标资源 ----------
+// 不再在本地缓存图标：一律 302 到源站，由浏览器自行缓存（省去进程内的图标副本与启动预热请求）。
 const (
-	iconFaviconURL = "https://i.ibb.co/H9QXXb8/emby-rp-icon.jpg"   // 网页 favicon（32x32）
-	iconLogoURL    = "https://i.ibb.co/KxByc0q8/emby-rp-logo.png"  // 品牌 Logo（512x512）
+	iconFaviconURL = "https://i.ibb.co/H9QXXb8/emby-rp-icon.jpg"      // 网页 favicon（32x32）
+	iconLogoURL    = "https://i.ibb.co/KxByc0q8/emby-rp-logo.png"    // 品牌 Logo（512x512）
 	icon192URL     = "https://i.ibb.co/84fwCqPj/emby-rp-logo-192.png" // PWA 192x192
 	icon512URL     = "https://i.ibb.co/RkTFtq4n/emby-rp-logo-512.png" // PWA 512x512
 )
 
-// cachedIcon 带正确 Content-Type 的图标缓存（favicon 为 jpeg，其余为 png）
-type cachedIcon struct {
-	data  []byte
-	ctype string
-}
-
-// fetchIcon 拉取远端图标；失败返回 nil（调用方回退 302 源站）
-func fetchIcon(url string) *cachedIcon {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil || len(data) == 0 {
-		return nil
-	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		if strings.HasSuffix(strings.ToLower(url), ".jpg") || strings.HasSuffix(strings.ToLower(url), ".jpeg") {
-			ct = "image/jpeg"
-		} else {
-			ct = "image/png"
-		}
-	}
-	return &cachedIcon{data: data, ctype: ct}
-}
-
-// serveCachedIcon 输出预热缓存；未预热完成则 302 到源站，不阻塞请求
-func serveCachedIcon(w http.ResponseWriter, r *http.Request, p *atomic.Pointer[cachedIcon], fallbackURL string) {
-	if ic := p.Load(); ic != nil {
-		w.Header().Set("Content-Type", ic.ctype)
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		_, _ = w.Write(ic.data)
-		return
-	}
-	http.Redirect(w, r, fallbackURL, http.StatusFound)
-}
-
-// ---------- 图片缓存（仅 GET 且路径含 /Images/ 的小响应）----------
-// 双上限：条数 + 总字节；单条过大直接不入队。缓存键为完整请求 URL。
-const (
-	imgCacheMaxCount = 500
-	imgCacheMaxBytes = 32 << 20 // 32MB（原 50MB）
-)
-
-var imgCache = struct {
-	mu    sync.Mutex
-	ll    *list.List               // 前端 = 最旧，后端 = 最新
-	items map[string]*list.Element // key -> element(值为 *imgCacheItem)
-	size  int64
-}{
-	ll:    list.New(),
-	items: map[string]*list.Element{},
-}
-
-type imgCacheItem struct {
-	key      string
-	data     []byte
-	accessed int64 // unix nano，用于二次淘汰参考
-}
-
-func imageCacheGet(key string) ([]byte, bool) {
-	imgCache.mu.Lock()
-	defer imgCache.mu.Unlock()
-	el, ok := imgCache.items[key]
-	if !ok {
-		return nil, false
-	}
-	imgCache.ll.MoveToBack(el) // 命中即提升为最新
-	it := el.Value.(*imgCacheItem)
-	it.accessed = time.Now().UnixNano()
-	return it.data, true
-}
-
-func imageCachePut(key string, data []byte) {
-	if len(data) > 128<<10 { // 单条超过 128KB 不缓存，避免大图挤占内存
-		return
-	}
-	imgCache.mu.Lock()
-	defer imgCache.mu.Unlock()
-	if el, ok := imgCache.items[key]; ok { // 已存在则更新并移动到队尾
-		it := el.Value.(*imgCacheItem)
-		imgCache.size += int64(len(data) - len(it.data))
-		it.data = data
-		imgCache.ll.MoveToBack(el)
-	} else {
-		el := imgCache.ll.PushBack(&imgCacheItem{key: key, data: data})
-		imgCache.items[key] = el
-		imgCache.size += int64(len(data))
-	}
-	// 逐个淘汰最旧条目，直到满足双重上限
-	for imgCache.size > imgCacheMaxBytes || imgCache.ll.Len() > imgCacheMaxCount {
-		oldest := imgCache.ll.Front()
-		if oldest == nil {
-			break
-		}
-		it := oldest.Value.(*imgCacheItem)
-		imgCache.size -= int64(len(it.data))
-		delete(imgCache.items, it.key)
-		imgCache.ll.Remove(oldest)
-	}
+// redirectIcon 直接 302 到源站图标，不在本地保存任何副本
+func redirectIcon(w http.ResponseWriter, r *http.Request, src string) {
+	http.Redirect(w, r, src, http.StatusFound)
 }
 
 func currentCfg() *Config {
@@ -603,13 +499,9 @@ func currentCfg() *Config {
 // compiledACL 由 rebuildACL 在配置加载/保存时生成，供每个请求快速检查，
 // 避免在热路径上反复 net.ParseCIDR 与 strings.ToLower。
 type compiledACL struct {
-	exactBan  map[string]struct{}
-	cidrs     []*net.IPNet
+	exactBan map[string]struct{}
+	cidrs    []*net.IPNet
 	uaNeedles []string // 已小写；空 = 不限制
-	// 白名单预编译：精确 host、根域、通配后缀
-	wlExact   map[string]struct{}
-	wlRoots   map[string]struct{}
-	wlSuffixes []string // 已小写，不含前导点
 }
 
 var aclPtr atomic.Pointer[compiledACL]
@@ -637,30 +529,6 @@ func rebuildACL(c *Config) {
 		u = strings.ToLower(strings.TrimSpace(u))
 		if u != "" {
 			a.uaNeedles = append(a.uaNeedles, u)
-		}
-	}
-	// 预编译白名单
-	a.wlExact = map[string]struct{}{}
-	a.wlRoots = map[string]struct{}{}
-	for _, w := range c.Whitelist {
-		w = strings.TrimSpace(w)
-		if i := strings.IndexAny(w, "#;"); i >= 0 {
-			w = strings.TrimSpace(w[:i])
-		}
-		if w == "" {
-			continue
-		}
-		if strings.HasPrefix(w, "*.") {
-			suf := strings.ToLower(strings.TrimPrefix(w, "*."))
-			if suf != "" {
-				a.wlSuffixes = append(a.wlSuffixes, suf)
-			}
-			continue
-		}
-		norm := normalizeHost(w)
-		if norm != "" {
-			a.wlExact[norm] = struct{}{}
-			a.wlRoots[rootDomain(w)] = struct{}{}
 		}
 	}
 	aclPtr.Store(a)
@@ -784,33 +652,16 @@ func rootDomain(hostport string) string {
 	}
 	return strings.Join(parts[n-2:], ".")
 }
-// whitelistMatch 空列表表示不限制；优先用预编译 ACL，未命中再走原逻辑（兼容热更新前）。
+// whitelistMatch 空列表表示不限制；支持完整 host、根域、以及 *.example.com 通配。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
 	}
-	a := currentACL()
-	if a != nil && (len(a.wlExact) > 0 || len(a.wlRoots) > 0 || len(a.wlSuffixes) > 0) {
-		target := normalizeHost(targetHost)
-		if _, ok := a.wlExact[target]; ok {
-			return true
-		}
-		targetRoot := rootDomain(target)
-		if _, ok := a.wlRoots[targetRoot]; ok {
-			return true
-		}
-		for _, suf := range a.wlSuffixes {
-			if target == suf || strings.HasSuffix(target, "."+suf) {
-				return true
-			}
-		}
-		return false
-	}
-	// 回退：配置刚加载尚未 rebuild 时
 	target := normalizeHost(targetHost)
 	targetRoot := rootDomain(target)
 	for _, w := range list {
 		w = strings.TrimSpace(w)
+		// 允许行内注释
 		if i := strings.IndexAny(w, "#;"); i >= 0 {
 			w = strings.TrimSpace(w[:i])
 		}
@@ -844,12 +695,12 @@ type BlockEvent struct {
 	UA         string `json:"ua"`
 }
 
-// DayStat：按天统计
+// DayStat：按天统计（UpBytes=本机→客户端，DownBytes=上游→本机，Bytes=上下行合计）
 type DayStat struct {
 	Requests   int64            `json:"requests"`
 	Bytes      int64            `json:"bytes"`       // 上下行合计（兼容旧字段）
-	UpBytes    int64            `json:"up_bytes"`    // 上行（客户端→代理）
-	DownBytes  int64            `json:"down_bytes"`  // 下行（代理→客户端）
+	UpBytes    int64            `json:"up_bytes"`    // 上行（本机→客户端）
+	DownBytes  int64            `json:"down_bytes"`  // 下行（上游→本机）
 	BlockedCN  int64            `json:"blocked_cn"`
 	BlockedWL  int64            `json:"blocked_wl"`
 	BlockedBan int64            `json:"blocked_ban"`
@@ -926,6 +777,17 @@ func copyInt64Map(src map[string]int64) map[string]int64 {
 	return out
 }
 
+// hour24 把分时 map 规整成固定 24 个键（00~23），缺值为 0。
+// 前端按 0~23 点直接取键作图，缺键会导致整条曲线退化为全 0 直线。
+func hour24(src map[string]int64) map[string]int64 {
+	out := make(map[string]int64, 24)
+	for h := 0; h < 24; h++ {
+		k := fmt.Sprintf("%02d", h)
+		out[k] = src[k]
+	}
+	return out
+}
+
 // dayOf 需在持有 statsMu 时调用。
 func dayOf(date string) *DayStat {
 	if stats.Daily == nil {
@@ -944,6 +806,7 @@ func dayOf(date string) *DayStat {
 // 写入：recordRequestStart/recordBytes → statChan → startStatsWorker 单协程聚合
 // 落盘：startStatsSaver 每 5 分钟 prune + 写入 stats_meta / stats_daily / stats_blocks
 type Stats struct {
+	SchemaVersion    int                 `json:"schema_version"` // 2 = 上下行新口径（下行=上游→本机，上行=本机→客户端）
 	TodayDate        string              `json:"today_date"`
 	TodayRequests    int64               `json:"today_requests"`
 	TodayBytes       int64               `json:"today_bytes"`
@@ -1039,12 +902,12 @@ func pruneStatsLocked() {
 	}
 	for _, day := range stats.Daily {
 		ensureDayMaps(day)
-		pruneTopN(day.IPs, 200)
-		pruneTopN(day.IPBytes, 200)
-		pruneTopN(day.IPUpBytes, 200)
-		pruneTopN(day.IPDownBytes, 200)
-		pruneTopN(day.Hosts, 120)
-		pruneTopN(day.Countries, 80)
+		pruneTopN(day.IPs, 500)
+		pruneTopN(day.IPBytes, 500)
+		pruneTopN(day.IPUpBytes, 500)
+		pruneTopN(day.IPDownBytes, 500)
+		pruneTopN(day.Hosts, 300)
+		pruneTopN(day.Countries, 200)
 	}
 	if len(stats.Audit) > maxAuditEvents {
 		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
@@ -1146,6 +1009,7 @@ func recordBytes(ip string, up, down int64) {
 // 磁盘分桶：stats_meta / stats_daily / stats_blocks（兼容旧版 stats/data 迁移）
 
 type statsMetaDisk struct {
+	SchemaVersion    int    `json:"schema_version"`
 	TodayDate        string `json:"today_date"`
 	TodayRequests    int64  `json:"today_requests"`
 	TodayBytes       int64  `json:"today_bytes"`
@@ -1165,6 +1029,7 @@ type statsMetaDisk struct {
 
 func emptyStats() Stats {
 	return Stats{
+		SchemaVersion: 2,
 		TodayDate:     beijingDate(time.Now()),
 		CountryCounts: map[string]int64{},
 		IPCounts:      map[string]int64{},
@@ -1222,6 +1087,7 @@ func loadStats() {
 			if data := b.Get([]byte("data")); data != nil {
 				var m statsMetaDisk
 				if json.Unmarshal(data, &m) == nil {
+					stats.SchemaVersion = m.SchemaVersion
 					stats.TodayDate = m.TodayDate
 					stats.TodayRequests = m.TodayRequests
 					stats.TodayBytes = m.TodayBytes
@@ -1317,6 +1183,10 @@ func loadStats() {
 			stats.TodayBytes = d.Bytes
 		}
 	}
+	// 旧数据无 schema_version：标记为 1（旧口径），保留但不与新数据混算语义
+	if stats.SchemaVersion == 0 {
+		stats.SchemaVersion = 1
+	}
 	if migrated {
 		statsMu.Lock()
 		snap := marshalStatsLocked()
@@ -1342,6 +1212,7 @@ type statsSnapshot struct {
 // marshalStatsLocked 持锁序列化统计快照（调用方必须已持有 statsMu）
 func marshalStatsLocked() *statsSnapshot {
 	meta := statsMetaDisk{
+		SchemaVersion:    stats.SchemaVersion,
 		TodayDate:        stats.TodayDate,
 		TodayRequests:    stats.TodayRequests,
 		TodayBytes:       stats.TodayBytes,
@@ -1426,11 +1297,7 @@ func startStatsSaver() {
 			snap := marshalStatsLocked()
 			statsMu.Unlock()
 			persistStats(snap)
-
-			// 监控统计丢弃：通道满时会丢事件，便于运维发现压力
-			if dropped := statDropped.Load(); dropped > 0 {
-				log.Printf("统计通道丢弃事件累计 %d（高并发时正常，持续增长需关注）", dropped)
-			}
+			geoPrune()
 
 			now := time.Now().UnixNano()
 			ipLimiters.Range(func(k, v interface{}) bool {
@@ -1772,6 +1639,60 @@ func countryName(code string) string {
 	return code
 }
 
+// countryCodeByName 由国家中文名反查两位国家码（ip9 等接口偶尔只给名字不给码）。
+// 首次调用时构建反向表，之后只读。
+var (
+	countryCodeOnce sync.Once
+	countryCodeRev  map[string]string
+)
+
+// countryCodeByEnglishName 常见英文国名 → 两位国家码（ip-api 兜底时只给英文名）
+var countryCodeByEnglishName = map[string]string{
+	"China": "CN", "United States": "US", "United States of America": "US",
+	"Japan": "JP", "South Korea": "KR", "Korea": "KR", "North Korea": "KP",
+	"Hong Kong": "HK", "Macao": "MO", "Macau": "MO", "Taiwan": "TW",
+	"Singapore": "SG", "Malaysia": "MY", "Thailand": "TH", "Vietnam": "VN",
+	"Philippines": "PH", "Indonesia": "ID", "India": "IN", "Pakistan": "PK",
+	"Australia": "AU", "New Zealand": "NZ", "Canada": "CA", "Mexico": "MX",
+	"Brazil": "BR", "Argentina": "AR", "Chile": "CL", "Peru": "PE",
+	"United Kingdom": "GB", "UK": "GB", "Germany": "DE", "France": "FR",
+	"Italy": "IT", "Spain": "ES", "Portugal": "PT", "Netherlands": "NL",
+	"Belgium": "BE", "Switzerland": "CH", "Austria": "AT", "Sweden": "SE",
+	"Norway": "NO", "Denmark": "DK", "Finland": "FI", "Ireland": "IE",
+	"Poland": "PL", "Czechia": "CZ", "Czech Republic": "CZ", "Hungary": "HU",
+	"Romania": "RO", "Bulgaria": "BG", "Greece": "GR", "Turkey": "TR",
+	"Russia": "RU", "Ukraine": "UA", "Belarus": "BY", "Kazakhstan": "KZ",
+	"Israel": "IL", "Saudi Arabia": "SA", "United Arab Emirates": "AE",
+	"Qatar": "QA", "Kuwait": "KW", "Iran": "IR", "Iraq": "IQ",
+	"Egypt": "EG", "South Africa": "ZA", "Nigeria": "NG", "Kenya": "KE",
+	"Morocco": "MA", "Algeria": "DZ", "Tunisia": "TN", "Ethiopia": "ET",
+}
+
+func countryCodeByName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	countryCodeOnce.Do(func() {
+		countryCodeRev = make(map[string]string, len(countryNames))
+		for code, n := range countryNames {
+			if n == "" || n == "未知" {
+				continue
+			}
+			if _, dup := countryCodeRev[n]; !dup {
+				countryCodeRev[n] = code
+			}
+		}
+	})
+	if c, ok := countryCodeRev[name]; ok {
+		return c
+	}
+	if c, ok := countryCodeByEnglishName[name]; ok {
+		return c
+	}
+	return ""
+}
+
 
 func isSelfOrLocalIP(ip, country string) bool {
 	if country == "LO" || country == "PV" {
@@ -1862,46 +1783,12 @@ type geoEntry struct {
 }
 
 var (
-	geoMu       sync.RWMutex
-	geoMap      = map[string]geoEntry{}
-	geoPath     string
-	geoInflight int32
-	geoGroup    singleflight.Group
+	geoMu    sync.RWMutex
+	geoMap   = map[string]geoEntry{} // 纯内存，进程退出即丢弃，不落盘
+	geoGroup singleflight.Group
 )
 
-func geoCacheLoad() {
-	if db != nil {
-		_ = db.View(func(tx *bolt.Tx) error {
-			b := tx.Bucket([]byte("geo"))
-			if b != nil {
-				if data := b.Get([]byte("data")); data != nil {
-					_ = json.Unmarshal(data, &geoMap)
-				}
-			}
-			return nil
-		})
-	}
-	if geoMap == nil {
-		geoMap = map[string]geoEntry{}
-	}
-}
-func geoCacheSave() {
-	if db == nil {
-		return
-	}
-	geoMu.RLock()
-	b, _ := json.Marshal(geoMap)
-	geoMu.RUnlock()
-	_ = db.Update(func(tx *bolt.Tx) error {
-		bk, err := tx.CreateBucketIfNotExists([]byte("geo"))
-		if err != nil {
-			return err
-		}
-		return bk.Put([]byte("data"), b)
-	})
-}
-
-// geoPrune：清理过期与超量 geo 缓存
+// geoPrune：清理过期与超量 geo 缓存（纯内存，不涉及磁盘）
 func geoPrune() {
 	const geoMaxEntries = 50000
 	now := time.Now().Unix()
@@ -1917,149 +1804,115 @@ func geoPrune() {
 	}
 	geoMu.Unlock()
 }
+// geoParseGeneric 把上游 JSON 归一化成 geoEntry。
+//   · 主接口 ip9.com.cn：{ret:200, data:{country, country_code, prov, city, isp, ...}}
+//   · 兜底 ip-api.com：{status:"success", country, countryCode, regionName, city, isp, org, as}
+// 两种结构字段名不同（country_code vs countryCode、prov vs regionName），这里统一兼容。
 func geoParseGeneric(m map[string]any) (geoEntry, error) {
+	// ip9 把业务数据放在 data 里；ip-api 是平铺结构
 	if data, ok := m["data"].(map[string]any); ok {
 		m = data
 	}
-	if st, ok := m["status"].(string); ok && st == "fail" {
+	// ip9 的失败标记：ret != 200
+	if ret, ok := m["ret"]; ok {
+		if n, ok2 := toFloat(ret); ok2 && int(n) != 200 {
+			msg, _ := m["msg"].(string)
+			if msg == "" {
+				msg, _ = m["message"].(string)
+			}
+			return geoEntry{}, fmt.Errorf("ip9 failed: %d %s", int(n), msg)
+		}
+	}
+	// ip-api 的失败标记：status == fail
+	if st, ok := m["status"].(string); ok && (st == "fail" || st == "error") {
 		msg, _ := m["message"].(string)
-		return geoEntry{}, fmt.Errorf("api failed: %s", msg)
+		return geoEntry{}, fmt.Errorf("ip-api failed: %s", msg)
 	}
-	raw := ""
-	if v, ok := m["country"].(string); ok {
-		raw = v
+
+	str := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
 	}
-	code := ""
-	if v, ok := m["countryCode"].(string); ok {
-		code = v
-	}
-	if code == "" {
-		code = raw
-	}
+
+	raw := str("country") // 国家名（ip9 为中文，ip-api 为英文）
+	code := strings.ToUpper(str("countryCode", "country_code"))
 	if len(code) > 2 {
+		// 某些接口把国家名塞进国家码字段，长度异常则直接丢弃（下方会用国家名反查）
 		code = ""
 	}
-	region := ""
-	if v, ok := m["regionName"].(string); ok {
-		region = v
-	}
-	city := ""
-	if v, ok := m["city"].(string); ok {
-		city = v
+	region := str("regionName", "prov", "region", "big_area")
+	city := str("city")
+	isp := str("isp")
+	org := str("org", "isp")
+	asn := str("as", "asn")
+
+	if code == "" && raw == "" {
+		return geoEntry{}, fmt.Errorf("no code")
 	}
 	if code == "" {
-		return geoEntry{}, fmt.Errorf("no code")
+		// 只有国家名时反查国家码，失败则标记为未知
+		code = countryCodeByName(raw)
+		if code == "" {
+			code = "??"
+		}
+	}
+	// 统一成中文国家名：ip-api 只给英文（China / United States），ip9 给中文。
+	// isASCII 判断：只要原始名是纯 ASCII，就用国家码换成中文名。
+	if zh := countryName(code); code != "??" && zh != code && (raw == "" || isASCIIName(raw)) {
+		raw = zh
 	}
 	if raw == "" {
 		raw = countryName(code)
 	}
-	return geoEntry{Code: code, Name: raw, Region: region, City: city, At: time.Now().Unix()}, nil
+	return geoEntry{Code: code, Name: raw, Region: region, City: city, ISP: isp, Org: org, AS: asn, At: time.Now().Unix()}, nil
 }
 
-// geoEntryFresh 缓存是否仍可用。旧 ip-api 条目城市常为英文/拼音（如 Taohua）且无 ISP，视为过期强制重查。
-func geoEntryFresh(e geoEntry) bool {
-	if e.Code == "" || e.Code == "??" {
-		return false
-	}
-	if time.Now().Unix()-e.At >= 30*86400 {
-		return false
-	}
-	// 无运营商且城市几乎全是 ASCII，多半是旧 ip-api 缓存
-	if e.ISP == "" && e.City != "" {
-		ascii := true
-		for _, r := range e.City {
-			if r > 127 {
-				ascii = false
-				break
-			}
-		}
-		if ascii {
+// isASCIIName 判断国家名是否为纯 ASCII（即英文名，需要转中文）
+func isASCIIName(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
 			return false
 		}
 	}
 	return true
 }
 
-// geoFetchIp9 优先用 ip9.com.cn（中文省市 + 运营商）
-func geoFetchIp9(ipStr string) (geoEntry, error) {
-	client := &http.Client{Timeout: 3 * time.Second}
-	u := "https://ip9.com.cn/get?ip=" + url.QueryEscape(ipStr)
-	req, err := http.NewRequest(http.MethodGet, u, nil)
-	if err != nil {
-		return geoEntry{}, err
+// toFloat 把任意 JSON 数字（float64 / int / json.Number）转成 float64
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
 	}
-	req.Header.Set("User-Agent", "Cloudflare-Worker")
-	resp, err := client.Do(req)
-	if err != nil {
-		return geoEntry{}, err
+	return 0, false
+}
+
+// geoEndpoints 返回按优先级排列的查询地址：ip9 优先，失效再由 ip-api.com 兜底
+func geoEndpoints(ipEscaped string) []string {
+	return []string{
+		"https://ip9.com.cn/get?ip=" + ipEscaped,
+		"http://ip-api.com/json/" + ipEscaped + "?fields=status,message,country,regionName,city,isp,as,org",
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return geoEntry{}, fmt.Errorf("ip9 http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
-	if err != nil {
-		return geoEntry{}, err
-	}
-	var wrap struct {
-		Ret  int            `json:"ret"`
-		Data map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(body, &wrap); err != nil {
-		return geoEntry{}, err
-	}
-	if wrap.Ret != 200 || wrap.Data == nil {
-		return geoEntry{}, fmt.Errorf("ip9 bad data")
-	}
-	d := wrap.Data
-	str := func(k string) string {
-		if v, ok := d[k].(string); ok {
-			return strings.TrimSpace(v)
-		}
-		return ""
-	}
-	country := str("country")
-	prov := str("prov")
-	city := str("city")
-	area := str("area")
-	isp := str("isp")
-	parts := make([]string, 0, 4)
-	for _, s := range []string{country, prov, city, area} {
-		if s != "" {
-			parts = append(parts, s)
-		}
-	}
-	name := strings.Join(parts, " ")
-	if name == "" {
-		return geoEntry{}, fmt.Errorf("ip9 empty location")
-	}
-	code := countryOf(ipStr)
-	if code == "??" || code == "" {
-		code = "CN"
-		if country != "" && country != "中国" && !strings.Contains(country, "中国") {
-			code = "??"
-		}
-	}
-	return geoEntry{
-		Code:   code,
-		Name:   name,
-		Region: prov,
-		City:   city,
-		ISP:    isp,
-		At:     time.Now().Unix(),
-	}, nil
 }
 
 func geoFetch(ipStr string) (geoEntry, error) {
-	// 1. 优先 ip9（国内源，中文省市 + 运营商）
-	if e, err := geoFetchIp9(ipStr); err == nil {
-		return e, nil
-	}
-	// 2. 回退 ip-api
-	client := &http.Client{Timeout: 4 * time.Second}
-	urls := []string{
-		"http://ip-api.com/json/" + url.QueryEscape(ipStr) + "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,isp,org,as,lat,lon,query",
-	}
+	return geoFetchVia(geoEndpoints(url.QueryEscape(ipStr)), ipStr)
+}
+
+// geoFetchVia 按给定地址顺序逐个尝试，任一成功即返回（便于测试与自定义顺序）
+func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
+	// 6s 上限：ip9 通常 <300ms，ip-api 从国内访问约 1.5s，留足余量避免误判失效
+	client := &http.Client{Timeout: 6 * time.Second}
 	var last error
 	for _, u := range urls {
 		resp, err := client.Get(u)
@@ -2069,39 +1922,71 @@ func geoFetch(ipStr string) (geoEntry, error) {
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			last = fmt.Errorf("%s: HTTP %d", u, resp.StatusCode)
+			continue
+		}
 		var m map[string]any
-		if err := json.Unmarshal(body, &m); err == nil {
-			if e, err := geoParseGeneric(m); err == nil {
-				return e, nil
-			} else {
-				last = err
-			}
+		if err := json.Unmarshal(body, &m); err != nil {
+			last = err
+			continue
+		}
+		if e, err := geoParseGeneric(m); err == nil {
+			return e, nil
+		} else {
+			last = err
 		}
 	}
 	return geoEntry{}, last
 }
-// ipLabelSync 只走本地 iploc，不缓存、不请求远程（详情接口自行现查）。
+
+// ipLabelSync 返回 (国家码, 中文名)。先查缓存/本地库，必要时 singleflight 拉 geo API。
 func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
 		return "??", "未知"
 	}
+	// 严禁 isSelfOrLocalIP(ip, "LO")：传入 "LO" 会恒为 true
 	if ip.IsLoopback() {
 		return "LO", "本机"
 	}
 	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
 		return "PV", "内网"
 	}
-	c := countryOf(ipStr)
-	if c == "??" {
-		return "??", "未知"
+
+	geoMu.RLock()
+	e, ok := geoMap[ipStr]
+	geoMu.RUnlock()
+	if ok && e.Code != "??" && time.Now().Unix()-e.At < 30*86400 {
+		return e.Code, e.Name
 	}
-	return c, countryName(c)
+
+	v, err, _ := geoGroup.Do(ipStr, func() (interface{}, error) {
+		geoMu.RLock()
+		cached, ok := geoMap[ipStr]
+		geoMu.RUnlock()
+		if ok && cached.Code != "??" && time.Now().Unix()-cached.At < 30*86400 {
+			return cached, nil
+		}
+		e, err := geoFetch(ipStr)
+		if err == nil {
+			geoMu.Lock()
+			geoMap[ipStr] = e
+			geoMu.Unlock()
+		}
+		return e, err
+	})
+	if err == nil {
+		e := v.(geoEntry)
+		return e.Code, e.Name
+	}
+	if c := countryOf(ipStr); c != "??" {
+		return c, countryName(c)
+	}
+	return "??", "未知"
 }
 
-// checkRateLimit 每 IP 近似滑动窗口（令牌桶思路）：
-// 以 1 分钟为窗口，但窗口过半后按比例允许更多请求，减少固定窗口边界突发。
-// 全部用 atomic，避免热路径加锁。
+// checkRateLimit 每 IP 固定 1 分钟窗口；窗口起点与计数均用 atomic，避免热路径加锁。
 func checkRateLimit(ip string, limit int) bool {
 	if limit <= 0 {
 		return true
@@ -2109,271 +1994,16 @@ func checkRateLimit(ip string, limit int) bool {
 	val, _ := ipLimiters.LoadOrStore(ip, &rateLimitEntry{})
 	entry := val.(*rateLimitEntry)
 	now := time.Now().UnixNano()
+	// 滑动窗口重置：全部用原子操作，避免并发请求间的 data race
 	start := entry.WindowStart.Load()
-	elapsed := now - start
-	window := int64(time.Minute)
-	if start == 0 || elapsed > window {
+	if start == 0 || now-start > int64(time.Minute) {
 		if entry.WindowStart.CompareAndSwap(start, now) {
 			entry.Count.Store(1)
-			return true
+			return 1 <= int64(limit)
 		}
-		// CAS 失败，走下面正常计数
-		start = entry.WindowStart.Load()
-		elapsed = now - start
+		// CAS 失败说明另一并发请求刚重置过窗口，走正常计数
 	}
-	// 窗口过半时，按已过时间比例放宽限额（简易滑动）
-	effectiveLimit := int64(limit)
-	if elapsed > window/2 && elapsed < window {
-		// 允许最多 limit * 1.5，平滑边界
-		effectiveLimit = int64(limit) + int64(limit)/2
-	}
-	return entry.Count.Add(1) <= effectiveLimit
-}
-
-// ---------- 实时连接监控 ----------
-// 每个代理请求 liveStart → 结束后 liveEnd 写入环形历史。
-// WebSocket /admin/api/live/ws 高频推送 liveSnapshotActive（仅活跃）；
-// HTTP /admin/api/live 返回含历史的完整快照。管理端可 liveKill 取消 context。
-type liveCtxKey struct{}
-
-type liveConn struct {
-	ID      string
-	IP      string
-	Country string
-	Host    string
-	Method  string
-	Path    string
-	Start   time.Time
-	Up      atomic.Int64
-	Down    atomic.Int64
-	Status  atomic.Int32 // 上游状态码，0=未收到
-	Err     atomic.Value // string，失败原因
-	cancel  context.CancelFunc // 管理端可主动断开
-}
-
-func liveKill(id string) bool {
-	if id == "" {
-		return false
-	}
-	v, ok := liveConns.Load(id)
-	if !ok {
-		return false
-	}
-	c := v.(*liveConn)
-	if c.cancel != nil {
-		c.cancel()
-		return true
-	}
-	return false
-}
-
-var (
-	liveConns    sync.Map // id -> *liveConn
-	liveActive   atomic.Int64
-	liveUpSum    atomic.Int64
-	liveDownSum  atomic.Int64
-	liveUpRate   atomic.Int64 // 近 1 秒上行字节
-	liveDownRate atomic.Int64
-	liveSeq      atomic.Uint64
-)
-
-func startLiveRateSampler() {
-	go func() {
-		var prevU, prevD int64
-		t := time.NewTicker(time.Second)
-		for range t.C {
-			u, d := liveUpSum.Load(), liveDownSum.Load()
-			liveUpRate.Store(max64(0, u-prevU))
-			liveDownRate.Store(max64(0, d-prevD))
-			prevU, prevD = u, d
-		}
-	}()
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func liveStart(ip, country, host, method, path string) *liveConn {
-	id := fmt.Sprintf("%d", liveSeq.Add(1))
-	if len(path) > 160 {
-		path = path[:160] + "…"
-	}
-	c := &liveConn{ID: id, IP: ip, Country: country, Host: host, Method: method, Path: path, Start: time.Now()}
-	liveConns.Store(id, c)
-	liveActive.Add(1)
-	return c
-}
-
-const liveHistMax = 600 // 原 2000，收紧以降低小内存机器压力
-
-type liveRow struct {
-	ID          string `json:"id"`
-	IP          string `json:"ip"`
-	Country     string `json:"country"`
-	CountryName string `json:"country_name"`
-	Host        string `json:"host"`
-	Method      string `json:"method"`
-	Path        string `json:"path"`
-	Up          int64  `json:"up"`
-	Down        int64  `json:"down"`
-	DurationMs  int64  `json:"duration_ms"`
-	Start       string `json:"start"`
-	Active      bool   `json:"active"`
-	Ended       string `json:"ended,omitempty"`
-	Status      int    `json:"status,omitempty"`
-	Error       string `json:"error,omitempty"`
-}
-
-var (
-	liveHistMu sync.Mutex
-	liveHist   []liveRow // 已结束连接的环形缓冲，供监控页累计展示
-)
-
-func liveEnd(c *liveConn) {
-	if c == nil {
-		return
-	}
-	now := time.Now()
-	row := liveRow{
-		ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
-		Host: c.Host, Method: c.Method, Path: c.Path,
-		Up: c.Up.Load(), Down: c.Down.Load(),
-		Status: int(c.Status.Load()),
-		Error: func() string { if v := c.Err.Load(); v != nil { return v.(string) }; return "" }(),
-		DurationMs: now.Sub(c.Start).Milliseconds(),
-		Start: beijingRFC3339(c.Start),
-		Active: false, Ended: beijingRFC3339(now),
-	}
-	liveHistMu.Lock()
-	liveHist = append(liveHist, row)
-	if len(liveHist) > liveHistMax {
-		liveHist = liveHist[len(liveHist)-liveHistMax:]
-	}
-	liveHistMu.Unlock()
-	liveConns.Delete(c.ID)
-	liveActive.Add(-1)
-}
-
-// liveSnapshotActive 仅包含当前活跃连接，供 WebSocket 约 500ms 推送一次。
-// 前端本页会话自行累计已结束连接，服务端不必每次序列化 liveHist。
-func liveSnapshotActive() map[string]any {
-	var list []liveRow
-	now := time.Now()
-	liveConns.Range(func(_, v any) bool {
-		c := v.(*liveConn)
-		up, down := c.Up.Load(), c.Down.Load()
-		errStr := ""
-		if v := c.Err.Load(); v != nil {
-			errStr = v.(string)
-		}
-		list = append(list, liveRow{
-			ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
-			Host: c.Host, Method: c.Method, Path: c.Path, Up: up, Down: down,
-			Status: int(c.Status.Load()), Error: errStr,
-			DurationMs: now.Sub(c.Start).Milliseconds(),
-			Start: beijingRFC3339(c.Start), Active: true,
-		})
-		return true
-	})
-	// 活跃连接通常很少，按下行排序即可
-	sort.Slice(list, func(i, j int) bool { return list[i].Down > list[j].Down })
-	return map[string]any{
-		"active":      liveActive.Load(),
-		"up_bps":      liveUpRate.Load(),
-		"down_bps":    liveDownRate.Load(),
-		"up_total":    liveUpSum.Load(),
-		"down_total":  liveDownSum.Load(),
-		"connections": list,
-		"history":     0,
-		"active_only": true,
-	}
-}
-
-func liveSnapshot() map[string]any {
-	var list []liveRow
-	ipAgg := map[string]struct {
-		Count   int
-		Up      int64
-		Down    int64
-		Country string
-	}{}
-	now := time.Now()
-	liveConns.Range(func(_, v any) bool {
-		c := v.(*liveConn)
-		up, down := c.Up.Load(), c.Down.Load()
-		errStr := ""
-		if v := c.Err.Load(); v != nil {
-			errStr = v.(string)
-		}
-		list = append(list, liveRow{
-			ID: c.ID, IP: c.IP, Country: c.Country, CountryName: countryName(c.Country),
-			Host: c.Host, Method: c.Method, Path: c.Path, Up: up, Down: down,
-			Status: int(c.Status.Load()), Error: errStr,
-			DurationMs: now.Sub(c.Start).Milliseconds(),
-			Start: beijingRFC3339(c.Start), Active: true,
-		})
-		a := ipAgg[c.IP]
-		a.Count++
-		a.Up += up
-		a.Down += down
-		a.Country = c.Country
-		ipAgg[c.IP] = a
-		return true
-	})
-	liveHistMu.Lock()
-	hist := append([]liveRow(nil), liveHist...)
-	liveHistMu.Unlock()
-	// 历史在前（旧→新），活跃接在后面；前端会按 id 合并
-	list = append(hist, list...)
-	for _, r := range hist {
-		a := ipAgg[r.IP]
-		a.Count++
-		a.Up += r.Up
-		a.Down += r.Down
-		if a.Country == "" {
-			a.Country = r.Country
-		}
-		ipAgg[r.IP] = a
-	}
-	sort.SliceStable(list, func(i, j int) bool {
-		// 活跃优先，再按下行
-		if list[i].Active != list[j].Active {
-			return list[i].Active
-		}
-		return list[i].Down > list[j].Down
-	})
-	type ipRow struct {
-		IP          string `json:"ip"`
-		Country     string `json:"country"`
-		CountryName string `json:"country_name"`
-		Conns       int    `json:"conns"`
-		Up          int64  `json:"up"`
-		Down        int64  `json:"down"`
-	}
-	var ips []ipRow
-	for ip, a := range ipAgg {
-		ips = append(ips, ipRow{IP: ip, Country: a.Country, CountryName: countryName(a.Country), Conns: a.Count, Up: a.Up, Down: a.Down})
-	}
-	sort.Slice(ips, func(i, j int) bool {
-		if ips[i].Down != ips[j].Down {
-			return ips[i].Down > ips[j].Down
-		}
-		return ips[i].Conns > ips[j].Conns
-	})
-	return map[string]any{
-		"active":      liveActive.Load(),
-		"up_bps":      liveUpRate.Load(),
-		"down_bps":    liveDownRate.Load(),
-		"up_total":    liveUpSum.Load(),
-		"down_total":  liveDownSum.Load(),
-		"connections": list,
-		"ips":         ips,
-		"history":     len(hist),
-	}
+	return entry.Count.Add(1) <= int64(limit)
 }
 
 var (
@@ -2498,7 +2128,7 @@ func validSession(tok string) bool {
 func destroyOtherSessions(keep string) {
 	sessions.Range(func(k, _ interface{}) bool {
 		if ks, ok := k.(string); ok && ks != keep {
-			sessions.Delete(k)
+			sessions.Delete(ks)
 		}
 		return true
 	})
@@ -2867,100 +2497,32 @@ func checkCaptchaRate(ip string) bool {
 			return true
 		}
 	}
-	ok := e.Count.Add(1) <= captchaRateLimit
-	if !ok {
-		// 超限时轻量记入登录失败信誉，防止刷验证码绕过
-		recordLoginFail(ip, "captcha_rate")
-	}
-	return ok
+	return e.Count.Add(1) <= captchaRateLimit
 }
 
-
-// estimateHeaderSize 粗略估算请求/响应头字节（含方法行或状态行开销）
-func estimateReqHeaderSize(r *http.Request) int64 {
-	if r == nil {
-		return 0
-	}
-	n := int64(len(r.Method) + len(r.URL.RequestURI()) + 20)
-	for k, vs := range r.Header {
-		n += int64(len(k) + 4)
-		for _, v := range vs {
-			n += int64(len(v) + 2)
-		}
-	}
-	return n
-}
-func estimateRespHeaderSize(h http.Header, status int) int64 {
-	n := int64(20) // status line
-	for k, vs := range h {
-		n += int64(len(k) + 4)
-		for _, v := range vs {
-			n += int64(len(v) + 2)
-		}
-	}
-	return n
-}
-
-
-// countReadCloser 统计从上游读到的字节（服务器下行 = 去 Emby 原站下载）
-type countReadCloser struct {
-	io.ReadCloser
-	n    *int64
-	live *liveConn
-}
-func (c *countReadCloser) Read(p []byte) (int, error) {
-	n, err := c.ReadCloser.Read(p)
-	if n > 0 {
-		if c.n != nil {
-			atomic.AddInt64(c.n, int64(n))
-		}
-		if c.live != nil {
-			c.live.Down.Add(int64(n))
-			liveDownSum.Add(int64(n))
-		}
-	}
-	return n, err
-}
-
+// statWriter 统计「本机→客户端」的字节（上行）
 type statWriter struct {
 	http.ResponseWriter
-	bytes    int64
-	live     *liveConn
-	hdrNoted bool
+	bytes int64
+	up    *int64 // 指向请求级上行计数器
 }
 
-func (w *statWriter) noteDown(n int) {
+func (w *statWriter) noteUp(n int) {
 	if n <= 0 {
 		return
 	}
 	w.bytes += int64(n)
-	// 写给客户端 = 服务器上行
-	if w.live != nil {
-		w.live.Up.Add(int64(n))
-		liveUpSum.Add(int64(n))
+	if w.up != nil {
+		atomic.AddInt64(w.up, int64(n))
 	}
 }
 
 func (w *statWriter) Write(b []byte) (int, error) {
-	if !w.hdrNoted {
-		w.noteRespHeaders(http.StatusOK) // 隐式 200
-	}
 	n, err := w.ResponseWriter.Write(b)
-	w.noteDown(n)
+	w.noteUp(n)
 	return n, err
 }
-func (w *statWriter) WriteHeader(code int) {
-	w.ResponseWriter.WriteHeader(code)
-	w.noteRespHeaders(code)
-}
-func (w *statWriter) noteRespHeaders(code int) {
-	if w.hdrNoted {
-		return
-	}
-	w.hdrNoted = true
-	hs := estimateRespHeaderSize(w.Header(), code)
-	w.noteDown(int(hs))
-}
+func (w *statWriter) WriteHeader(code int) { w.ResponseWriter.WriteHeader(code) }
 func (w *statWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
@@ -2975,7 +2537,7 @@ func (w *statWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (w *statWriter) ReadFrom(r io.Reader) (int64, error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		n, err := rf.ReadFrom(r)
-		w.noteDown(int(n))
+		w.noteUp(int(n))
 		return n, err
 	}
 	buf := make([]byte, 32*1024)
@@ -2999,64 +2561,16 @@ func (w *statWriter) ReadFrom(r io.Reader) (int64, error) {
 }
 func (w *statWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// cacheRecorder：仅用于“可缓存候选请求”（GET /Images/...）。
-// 关键修复：原实现给【所有】代理请求都套了 io.MultiWriter + bytes.Buffer，
-// 即便缓存关闭，视频流等大响应也会在内存里完整复制一份，内存占用巨大。
-// 现在：
-//   - 非缓存请求直接用 statWriter，零额外内存；
-//   - 缓存候选请求才缓冲，且缓冲超过 cacheBodyLimit 后自动停止（不再复制），
-//     并记录状态码，只有 200 才写入 LRU。
-const cacheBodyLimit = 5 << 20 // 5MB，超过则放弃缓存
-
-type cacheRecorder struct {
-	*statWriter
-	buf    *bytes.Buffer
-	status int
-}
-
-func (c *cacheRecorder) WriteHeader(code int) {
-	c.status = code
-	c.statWriter.WriteHeader(code)
-}
-
-func (c *cacheRecorder) Write(b []byte) (int, error) {
-	if c.buf != nil && c.status/100 == 2 && c.buf.Len()+len(b) <= cacheBodyLimit {
-		c.buf.Write(b) // 尽力而为地缓冲；超限后 buf 置 nil 停止复制
-	} else {
-		c.buf = nil
-	}
-	n, err := c.statWriter.Write(b)
-	return n, err
-}
-
-func (c *cacheRecorder) Flush() {
-	// 出现过 Flush（流式响应）说明不是可整体缓存的小图片，停止缓冲
-	c.buf = nil
-	c.statWriter.Flush()
-}
-
-func (c *cacheRecorder) ReadFrom(r io.Reader) (int64, error) {
-	// 大体量拷贝（如视频）不走缓冲
-	c.buf = nil
-	return c.statWriter.ReadFrom(r)
-}
-
-type statReadCloser struct {
+// upstreamBody 包装上游响应体，统计「上游→本机」的字节（下行）
+type upstreamBody struct {
 	io.ReadCloser
-	bytes *int64
-	live  *liveConn
+	down *int64
 }
 
-func (r *statReadCloser) Read(p []byte) (int, error) {
+func (r *upstreamBody) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
-	if n > 0 {
-		if r.bytes != nil {
-			atomic.AddInt64(r.bytes, int64(n))
-		}
-		if r.live != nil {
-			r.live.Up.Add(int64(n))
-			liveUpSum.Add(int64(n))
-		}
+	if n > 0 && r.down != nil {
+		atomic.AddInt64(r.down, int64(n))
 	}
 	return n, err
 }
@@ -3064,7 +2578,7 @@ func (r *statReadCloser) Read(p []byte) (int, error) {
 type switchTransport struct{ v atomic.Value }
 
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	t, _ := s.v.Load().(http.RoundTripper)
+	t, _ := s.v.Load().(*http.Transport)
 	if t == nil {
 		return nil, fmt.Errorf("transport nil")
 	}
@@ -3077,11 +2591,11 @@ func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
 	}
-	return make([]byte, 256*1024)
+	return make([]byte, 32*1024)
 }
 func (b *bufferPool) Put(p []byte) {
-	if cap(p) >= 256*1024 {
-		b.pool.Put(p[:256*1024])
+	if cap(p) >= 32*1024 {
+		b.pool.Put(p[:32*1024])
 	}
 }
 
@@ -3090,85 +2604,11 @@ var proxyBufPool = &bufferPool{}
 func newTransport() *http.Transport {
 	return &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
-			c, err := d.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			if tc, ok := c.(*net.TCPConn); ok {
-				_ = tc.SetNoDelay(true)          // 降低小包延迟
-				_ = tc.SetKeepAlive(true)
-				_ = tc.SetKeepAlivePeriod(30 * time.Second)
-				// 适当放大缓冲，利于视频流
-				_ = tc.SetReadBuffer(1 << 20)  // 1MB，稳住高速视频流
-				_ = tc.SetWriteBuffer(1 << 20)
-			}
-			return c, nil
-		},
-		ForceAttemptHTTP2: false, MaxIdleConns: 512, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 0, IdleConnTimeout: 180 * time.Second,
-		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 0, ExpectContinueTimeout: 1 * time.Second, // 0=不限制响应头等待，避免转码慢启动被掐
-		DisableCompression: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
+		DialContext:       (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2: true, MaxIdleConns: 512, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 45 * time.Second, ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
 	}
-}
-
-
-// retryTransport 对幂等 GET/HEAD 在短暂网络错误时重试一次，提升稳定性
-type retryTransport struct{ base http.RoundTripper }
-
-func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return rt.roundTrip(req, 0)
-}
-
-// roundTrip 跟随最多 3 次跳转（Emby stream 常 302 到真实文件），并在完全无响应时重试一次。
-func (rt *retryTransport) roundTrip(req *http.Request, hops int) (*http.Response, error) {
-	resp, err := rt.base.RoundTrip(req)
-	if err != nil && resp == nil && hops == 0 && req.Header.Get("Range") == "" {
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			req2 := req.Clone(req.Context())
-			resp, err = rt.base.RoundTrip(req2)
-		}
-	}
-	if err != nil || resp == nil || hops >= 3 {
-		return resp, err
-	}
-	code := resp.StatusCode
-	if code != 301 && code != 302 && code != 303 && code != 307 && code != 308 {
-		return resp, nil
-	}
-	loc := resp.Header.Get("Location")
-	if loc == "" {
-		return resp, nil
-	}
-	u, perr := url.Parse(loc)
-	if perr != nil {
-		return resp, nil
-	}
-	if !u.IsAbs() {
-		u = req.URL.ResolveReference(u)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return resp, nil
-	}
-	resp.Body.Close()
-	next := req.Clone(req.Context())
-	next.URL = u
-	next.Host = u.Host
-	// 拖动进度：跳转后必须保留 Range / If-Range，否则会从头播或拖动失败
-	if rng := req.Header.Get("Range"); rng != "" {
-		next.Header.Set("Range", rng)
-	}
-	if ir := req.Header.Get("If-Range"); ir != "" {
-		next.Header.Set("If-Range", ir)
-	}
-	if code == 302 || code == 303 {
-		next.Method = http.MethodGet
-		next.Body = nil
-		next.ContentLength = 0
-		next.Header.Del("Content-Type")
-		next.Header.Del("Content-Length")
-	}
-	return rt.roundTrip(next, hops+1)
 }
 
 var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
@@ -3188,246 +2628,13 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	}
 }
 
-
-// shouldRewriteBody 判断是否值得对响应体做绝对 URL 重写
-// 仅处理小体积文本，避免影响视频流和性能
-func shouldRewriteBody(resp *http.Response) bool {
-	if resp == nil || resp.Body == nil {
-		return false
-	}
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		return false
-	}
-	okType := strings.Contains(ct, "text/") ||
-		strings.Contains(ct, "application/json") ||
-		strings.Contains(ct, "application/javascript") ||
-		strings.Contains(ct, "application/xml") ||
-		strings.Contains(ct, "text/xml") ||
-		strings.Contains(ct, "application/xhtml")
-	if !okType {
-		return false
-	}
-	// 支持 identity 与 gzip；其他编码跳过
-	enc := strings.ToLower(resp.Header.Get("Content-Encoding"))
-	if enc != "" && enc != "identity" && enc != "gzip" {
-		return false
-	}
-	// 体积限制：声明 >1MB 不重写（gzip 解压后仍限 1MB）
-	if resp.ContentLength > 1<<20 {
-		return false
-	}
-	return true
-}
-
-// rewriteAbsoluteURLs 把响应体中指向当前上游的绝对 URL 改写为路径反代形式
-// 例如 https://emby.example.com:8096/web/index.html → /https://emby.example.com:8096/web/index.html
-func rewriteAbsoluteURLs(resp *http.Response, scheme, host string) error {
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
-	resp.Body.Close()
-	if err != nil {
-		return err
-	}
-	if len(raw) > 1<<20 {
-		resp.Body = io.NopCloser(bytes.NewReader(raw))
-		return nil
-	}
-	body := raw
-	wasGzip := strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip")
-	if wasGzip {
-		zr, zerr := gzip.NewReader(bytes.NewReader(raw))
-		if zerr != nil {
-			resp.Body = io.NopCloser(bytes.NewReader(raw))
-			return nil
-		}
-		decompressed, derr := io.ReadAll(io.LimitReader(zr, 1<<20+1))
-		zr.Close()
-		if derr != nil || len(decompressed) > 1<<20 {
-			resp.Body = io.NopCloser(bytes.NewReader(raw))
-			return nil
-		}
-		body = decompressed
-	}
-	prefix := scheme + "://" + host
-	proxyPrefix := "/" + prefix
-	already := []byte("/" + prefix)
-	placeholder := []byte("\x00PROXY\x00")
-	tmp := bytes.ReplaceAll(body, already, placeholder)
-	tmp = bytes.ReplaceAll(tmp, []byte(prefix), []byte(proxyPrefix))
-	replaced := bytes.ReplaceAll(tmp, placeholder, already)
-	var out []byte
-	if wasGzip {
-		var buf bytes.Buffer
-		zw := gzip.NewWriter(&buf)
-		if _, werr := zw.Write(replaced); werr != nil {
-			resp.Body = io.NopCloser(bytes.NewReader(raw))
-			return nil
-		}
-		zw.Close()
-		out = buf.Bytes()
-	} else {
-		out = replaced
-		resp.Header.Del("Content-Encoding")
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(out))
-	resp.ContentLength = int64(len(out))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(out)))
-	resp.Header.Del("Transfer-Encoding")
-	return nil
-}
-
-// isWebSocketRequest 判断是否为 WebSocket 升级请求
-func isWebSocketRequest(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
-}
-
-// proxyWebSocket 将客户端 WebSocket 升级透传到上游（Emby 直播/实时功能常用）
-func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, lc *liveConn) {
-	// 构造上游 WS URL
-	up := *target
-	switch up.Scheme {
-	case "http":
-		up.Scheme = "ws"
-	case "https":
-		up.Scheme = "wss"
-	}
-	if up.Path == "" {
-		up.Path = "/"
-	}
-
-	// 拨号上游
-	dialer := websocket.Dialer{
-		Proxy:            http.ProxyFromEnvironment,
-		HandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
-	}
-	// 复制必要头（Origin、Sec-WebSocket-*、Cookie、Authorization 等）
-	hdr := http.Header{}
-	for k, vs := range r.Header {
-		lk := strings.ToLower(k)
-		if lk == "upgrade" || lk == "connection" || lk == "sec-websocket-key" ||
-			lk == "sec-websocket-version" || lk == "sec-websocket-extensions" ||
-			lk == "sec-websocket-protocol" || strings.HasPrefix(lk, "sec-websocket-") {
-			continue // Dialer 自己处理
-		}
-		if lk == "host" {
-			continue
-		}
-		hdr[k] = vs
-	}
-	// 让上游看到原始 Host
-	hdr.Set("Host", target.Host)
-	if origin := r.Header.Get("Origin"); origin != "" {
-		hdr.Set("Origin", origin)
-	}
-
-	upConn, resp, err := dialer.Dial(up.String(), hdr)
-	if err != nil {
-		if resp != nil {
-			// 把上游握手失败状态尽量返回给客户端
-			for k, vs := range resp.Header {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
-			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = io.Copy(w, resp.Body)
-			resp.Body.Close()
-			return
-		}
-		serveError(w, http.StatusBadGateway, "WebSocket 连接失败", "无法与上游建立 WebSocket 连接，请稍后重试。")
-		return
-	}
-	defer upConn.Close()
-
-	// 升级客户端
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true }, // 路径反代场景放宽
-	}
-	clientConn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	defer clientConn.Close()
-
-	// 双向拷贝，统计字节，并响应 context 取消（支持管理端主动断开）
-	errc := make(chan error, 2)
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-r.Context().Done():
-			_ = clientConn.Close()
-			_ = upConn.Close()
-		case <-done:
-		}
-	}()
-	go func() {
-		defer func() { errc <- nil }()
-		for {
-			mt, msg, err := clientConn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if lc != nil {
-				// 客户端发来、转给上游：对服务器而言是从客户端收，不是本次口径的下行
-				// 口径只计：从上游收=下行，发给用户=上行。这里是发给上游，不计上下行主口径
-			}
-			if err := upConn.WriteMessage(mt, msg); err != nil {
-				return
-			}
-		}
-	}()
-	go func() {
-		defer func() { errc <- nil }()
-		for {
-			mt, msg, err := upConn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if lc != nil {
-				// 从上游收到并转给用户：下行+上行
-				lc.Down.Add(int64(len(msg)))
-				liveDownSum.Add(int64(len(msg)))
-				lc.Up.Add(int64(len(msg)))
-				liveUpSum.Add(int64(len(msg)))
-			}
-			if err := clientConn.WriteMessage(mt, msg); err != nil {
-				return
-			}
-		}
-	}()
-	<-errc
-	close(done)
-}
-
-
-// isPlaybackRequest 视频/音频流请求（拖动、直链、转码分片）
-func isPlaybackRequest(r *http.Request) bool {
-	if r == nil || r.URL == nil {
-		return false
-	}
-	p := strings.ToLower(r.URL.Path)
-	if strings.Contains(p, "/videos/") || strings.Contains(p, "/audio/") ||
-		strings.Contains(p, "/stream") || strings.Contains(p, ".mkv") ||
-		strings.Contains(p, ".mp4") || strings.Contains(p, ".m3u8") ||
-		strings.Contains(p, ".ts") || strings.Contains(p, "/master") {
-		return true
-	}
-	ct := strings.ToLower(r.Header.Get("Accept"))
-	return strings.Contains(ct, "video/") || strings.Contains(ct, "audio/")
-}
-
 // buildProxy 构造反向代理：
-//   Rewrite        把路径中的目标写到 Out.URL，并统计上行 Body
-//   ModifyResponse 剥离 Set-Cookie Domain、把指回上游的 Location 改成相对路径
+//   Rewrite        把路径中的目标写到 Out.URL
+//   ModifyResponse 包装上游响应体统计下行；剥离 Set-Cookie Domain；改 Location
 //   ErrorHandler   上游失败时返回统一错误页
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: tr, FlushInterval: 100 * time.Millisecond, BufferPool: proxyBufPool, // 100ms 批量刷，避免每包都刷导致速度不稳
+		Transport: tr, FlushInterval: 50 * time.Millisecond, BufferPool: proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
 			if !ok || t == nil {
@@ -3441,43 +2648,25 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			pr.Out.Host = t.Host
 			pr.SetXForwarded()
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
-			if pr.In.Body != nil && pr.In.Body != http.NoBody {
-				var upPtr *int64
-				if p, ok := pr.In.Context().Value(upBytesCtxKey{}).(*int64); ok {
-					upPtr = p
-				}
-				var lc *liveConn
-				if v, ok := pr.In.Context().Value(liveCtxKey{}).(*liveConn); ok {
-					lc = v
-				}
-				if upPtr != nil || lc != nil {
-					pr.Out.Body = &statReadCloser{ReadCloser: pr.In.Body, bytes: upPtr, live: lc}
-				}
-			}
+			// 请求体不做上下行统计（客户端上传量不属于上下行定义）
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			if resp.Request != nil {
-				if v, ok := resp.Request.Context().Value(liveCtxKey{}).(*liveConn); ok && v != nil {
-					v.Status.Store(int32(resp.StatusCode))
-				}
+			// 下行统计：包装上游响应体，读取时累加
+			if p, ok := resp.Request.Context().Value(downBytesCtxKey{}).(*int64); ok && resp.Body != nil {
+				resp.Body = &upstreamBody{ReadCloser: resp.Body, down: p}
 			}
 			upHost := ""
-			upScheme := ""
 			if resp.Request != nil && resp.Request.URL != nil {
 				upHost = resp.Request.URL.Host
-				upScheme = resp.Request.URL.Scheme
 			}
 			if loc := resp.Header.Get("Location"); loc != "" && upHost != "" {
 				if lu, err := url.Parse(loc); err == nil && lu.Host != "" && strings.EqualFold(lu.Host, upHost) {
-					// 改成路径反代形式：/https://host/path
-					prefix := "/" + upScheme + "://" + upHost
+					lu.Scheme = ""
+					lu.Host = ""
 					if lu.Path == "" {
 						lu.Path = "/"
 					}
-					resp.Header.Set("Location", prefix+lu.Path)
-					if lu.RawQuery != "" {
-						resp.Header.Set("Location", prefix+lu.Path+"?"+lu.RawQuery)
-					}
+					resp.Header.Set("Location", lu.String())
 				}
 			}
 			if cks, ok := resp.Header["Set-Cookie"]; ok && len(cks) > 0 {
@@ -3485,56 +2674,14 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 					cks[i] = cookieDomainRE.ReplaceAllString(c, "")
 				}
 			}
-
-			// 对小文本响应做绝对 URL 重写（把上游绝对地址改成路径反代形式）
-			// 避免客户端拿到 https://upstream/... 后绕过代理
-			if shouldRewriteBody(resp) && upHost != "" && upScheme != "" {
-				if err := rewriteAbsoluteURLs(resp, upScheme, upHost); err != nil {
-					// 重写失败不阻断请求，仅记录
-					log.Printf("响应体重写失败: %v", err)
-				}
-			}
-			// 统计从上游读到的字节 = 服务器下行（去 Emby 原站下载）
-			if p, ok := resp.Request.Context().Value(upBytesCtxKey{}).(*int64); ok && resp.Body != nil {
-				hs := estimateRespHeaderSize(resp.Header, resp.StatusCode)
-				atomic.AddInt64(p, hs)
-				var lc *liveConn
-				if v, ok := resp.Request.Context().Value(liveCtxKey{}).(*liveConn); ok {
-					lc = v
-					lc.Down.Add(hs)
-					liveDownSum.Add(hs)
-				}
-				resp.Body = &countReadCloser{ReadCloser: resp.Body, n: p, live: lc}
-			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if v, ok := r.Context().Value(liveCtxKey{}).(*liveConn); ok && v != nil && err != nil {
-				v.Err.Store(err.Error())
-			}
-			status := http.StatusBadGateway
-			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					status = http.StatusGatewayTimeout
-				}
-			}
-			// 播放请求只回状态码，不回 HTML，避免播放器把错误页当媒体缓存
-			if isPlaybackRequest(r) {
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				w.WriteHeader(status)
-				if err != nil {
-					_, _ = w.Write([]byte(err.Error()))
-				}
-				return
-			}
 			msg := "无法连接到上游服务，可能是上游服务器暂时不可用或网络波动，请稍后重试。"
-			if status == http.StatusGatewayTimeout {
-				msg = "连接上游超时，请检查网络或稍后重试。"
-			}
 			if err != nil {
-				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">技术详情：" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "<"), ">", ">") + "</span>"
+				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">技术详情：" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "&lt;"), ">", "&gt;") + "</span>"
 			}
-			serveError(w, status, "上游服务连接失败", msg)
+			serveError(w, http.StatusBadGateway, "上游服务连接失败", msg)
 		},
 	}
 }
@@ -3549,26 +2696,21 @@ type adminConfigResp struct {
 // 更换图标时递增版本号即可。
 const iconVer = "?v=3"
 
-// pwaHeadExtra 返回注入到 <head> 的图标/PWA 标签；关闭 PWA 时仅注入基本图标。
-func pwaHeadExtra(pwaOn bool) string {
-	s := "<link rel=\"icon\" href=\"/favicon.ico" + iconVer + "\">\n" +
-		"<link rel=\"apple-touch-icon\" href=\"/admin/icon-192.png" + iconVer + "\">\n"
-	if pwaOn {
-		s += "<link rel=\"manifest\" href=\"/admin/manifest.webmanifest\">\n" +
-			"<meta name=\"theme-color\" content=\"#3b82f6\">\n" +
-			"<meta name=\"mobile-web-app-capable\" content=\"yes\">\n" +
-			"<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n" +
-			"<meta name=\"apple-mobile-web-app-status-bar-style\" content=\"default\">\n" +
-			"<meta name=\"apple-mobile-web-app-title\" content=\"Emby Proxy\">\n"
-	}
-	return s
+// pwaHeadExtra 返回注入到 <head> 的图标/PWA 标签。
+// PWA 已固化为常开（不再提供后台开关），因此这里恒定输出完整标签。
+func pwaHeadExtra() string {
+	return "<link rel=\"icon\" href=\"/favicon.ico" + iconVer + "\">\n" +
+		"<link rel=\"apple-touch-icon\" href=\"/admin/icon-192.png" + iconVer + "\">\n" +
+		"<link rel=\"manifest\" href=\"/admin/manifest.webmanifest\">\n" +
+		"<meta name=\"theme-color\" content=\"#3b82f6\">\n" +
+		"<meta name=\"mobile-web-app-capable\" content=\"yes\">\n" +
+		"<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n" +
+		"<meta name=\"apple-mobile-web-app-status-bar-style\" content=\"default\">\n" +
+		"<meta name=\"apple-mobile-web-app-title\" content=\"Emby Proxy\">\n"
 }
 
-// pwaBodyExtra 返回注入到 </body> 前的 SW 注册脚本；关闭 PWA 时为空。
-func pwaBodyExtra(pwaOn bool) string {
-	if !pwaOn {
-		return ""
-	}
+// pwaBodyExtra 返回注入到 </body> 前的 SW 注册脚本（PWA 常开，始终注入）。
+func pwaBodyExtra() string {
 	return "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/admin/sw.js').catch(function(){})})}</script>"
 }
 
@@ -3595,7 +2737,7 @@ func pwaManifestJSON() []byte {
 }
 
 // splashHTML PWA 启动页：纯静态、极轻量（无外链脚本、无 API 阻塞渲染），
-// 由 SW 预缓存后秒开；页面显示后并行预热 Chart.js 与登录态检测，就绪即跳转。
+// 渲染后直接探测登录态并跳转（不做任何预缓存/预热）。
 const splashHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3625,104 +2767,40 @@ h1{font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-.3px}
 </div>
 <script>
 /* 启动流程：
- * 1. 页面本身零网络依赖（Logo/HTML 均在 SW 预缓存），立即渲染；
- * 2. 后台并行预热 Chart.js（SW cache-first，命中即完成）与登录态探测；
- * 3. 全部就绪或超时（2.5s）后跳转：已登录 → /admin/，未登录 → /admin/login。
- * 跳转用 replace，避免后退键回到启动页。 */
+ * 1. 页面本身零外链依赖，立即渲染；
+ * 2. 直接探测登录态（不做任何缓存/预热）：
+ *    已登录 → /admin/，未登录 → /admin/login。
+ * 3. 最短展示 400ms，避免闪烁；跳转用 replace，避免后退键回到启动页。 */
 (function () {
   var t0 = Date.now();
   var tip = document.getElementById('tip');
-  var CHART_URL = 'https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
-  function done() {
-    var wait = Math.max(0, 400 - (Date.now() - t0)); // 最短展示 400ms，避免闪烁
-    setTimeout(function () {
-      // 探测登录态：config 需要会话，401/302 → 登录页
-      fetch('/admin/api/config', { cache: 'no-store' }).then(function (r) {
-        location.replace(r.ok ? '/admin/' : '/admin/login');
-      }).catch(function () {
-        location.replace('/admin/');
-      });
-    }, wait);
-  }
-  // 预热 Chart.js：SW 命中缓存时立即完成；首次访问走网络，超时不阻塞跳转
-  var warm;
-  if (typeof fetch !== 'undefined') {
-    warm = fetch(CHART_URL, { mode: 'no-cors', cache: 'force-cache' }).catch(function () {});
-  } else {
-    warm = Promise.resolve();
-  }
-  var timeout = new Promise(function (res) { setTimeout(res, 2500); });
-  Promise.race([warm, timeout]).then(function () {
-    tip.textContent = '即将进入…';
-    done();
-  });
+  var wait = Math.max(0, 400 - (Date.now() - t0));
+  setTimeout(function () {
+    // 探测登录态：config 需要会话，401/302 → 登录页
+    fetch('/admin/api/config', { cache: 'no-store' }).then(function (r) {
+      location.replace(r.ok ? '/admin/' : '/admin/login');
+    }).catch(function () {
+      location.replace('/admin/');
+    });
+  }, wait);
 })();
 </script>
 </body>
 </html>
 `
 
-// swSource 管理后台 Service Worker：
-//   · 预缓存应用壳（后台页 + 登录页 + 图标）
-//   · 导航请求 stale-while-revalidate：缓存即时返回（PWA 秒开），后台静默更新
-//   · Chart.js 等 CDN 脚本运行时缓存（cache-first），二次访问零网络等待
-//   · /admin/api/* 一律直连网络，绝不缓存（保证数据实时性）
-const swSource = `const CACHE = 'emby-proxy-admin-v4';
-const SHELL = ['/admin/splash', '/admin/', '/admin/login', '/admin/logo.png?v=3', '/admin/icon-192.png?v=3', '/admin/icon-512.png?v=3'];
-self.addEventListener('install', function (e) {
-  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }).then(function () { return self.skipWaiting(); }));
+// swSource 管理后台 Service Worker（仅保留 PWA 安装能力，不做任何缓存）：
+//   · 不预缓存应用壳、不缓存导航请求、不缓存 CDN 脚本、不调用 caches API
+//   · fetch 事件直接放行（浏览器默认行为），保证页面与数据永远是最新版本
+//   · install 时立即激活并清理历史版本遗留的缓存（老版本 SW 缓存的旧页面）
+const swSource = `self.addEventListener('install', function (e) {
+  e.waitUntil(self.skipWaiting());
 });
 self.addEventListener('activate', function (e) {
-  e.waitUntil(caches.keys().then(function (ks) {
-    return Promise.all(ks.filter(function (k) { return k !== CACHE; }).map(function (k) { return caches.delete(k); }));
-  }).then(function () { return self.clients.claim(); }));
-});
-function cachePut(req, res) {
-  var cp = res.clone();
-  caches.open(CACHE).then(function (c) { c.put(req, cp); });
-}
-self.addEventListener('fetch', function (e) {
-  if (e.request.method !== 'GET') return;
-  var url;
-  try { url = new URL(e.request.url); } catch (err) { return; }
-  // Chart.js 等静态 CDN 资源：cache-first，命中即零网络等待
-  if (url.origin !== location.origin) {
-    if (url.hostname === 'cdn.bootcdn.net') {
-      e.respondWith(caches.match(e.request).then(function (hit) {
-        if (hit) return hit;
-        return fetch(e.request).then(function (res) { cachePut(e.request, res); return res; });
-      }));
-    }
-    return;
-  }
-  if (url.pathname.indexOf('/admin/api/') === 0) return;
-  if (url.pathname === '/admin/sw.js' || url.pathname === '/admin/manifest.webmanifest') return;
-  if (e.request.mode === 'navigate') {
-    // stale-while-revalidate：有缓存立即返回（秒开），同时后台拉最新版供下次使用；
-    // 无缓存时走网络并顺手缓存；离线且无缓存时回退应用壳
-    e.respondWith(caches.match(e.request).then(function (hit) {
-      if (hit) {
-        fetch(e.request).then(function (res) { if (res && res.ok) cachePut(e.request, res); }).catch(function () {});
-        return hit;
-      }
-      return fetch(e.request).then(function (res) {
-        if (res && res.ok) cachePut(e.request, res);
-        return res;
-      }).catch(function () {
-        return caches.match('/admin/').then(function (shell) {
-          return shell || new Response('当前离线，请连接网络后重试', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-        });
-      });
-    }));
-    return;
-  }
-  e.respondWith(caches.match(e.request).then(function (hit) {
-    if (hit) return hit;
-    return fetch(e.request).then(function (res) {
-      if (res.ok) cachePut(e.request, res);
-      return res;
-    });
-  }));
+  e.waitUntil((self.caches ? caches.keys().then(function (ks) {
+    // 清掉任意遗留缓存（含本 SW 之前的各版本应用壳缓存）
+    return Promise.all(ks.map(function (k) { return caches.delete(k); }));
+  }) : Promise.resolve()).then(function () { return self.clients.claim(); }));
 });
 `
 
@@ -3753,7 +2831,7 @@ type gzipResponseWriter struct {
 func (g *gzipResponseWriter) WriteHeader(code int) {
 	if !g.decided {
 		g.decided = true
-		// 处理器已自行输出压缩内容（预压缩缓存）则直接透传，避免二次压缩
+		// 处理器已自行输出压缩内容则直接透传，避免二次压缩
 		if gzipCompressible(g.Header().Get("Content-Type")) && g.Header().Get("Content-Encoding") == "" {
 			h := g.Header()
 			h.Set("Content-Encoding", "gzip")
@@ -3815,36 +2893,69 @@ func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ---------- 预压缩 HTML 缓存 ----------
-// 后台/登录/启动页内容固定（仅随 PWA 开关产生 2 个变体），没必要每次请求都 gzip 78KB；
-// 首次请求时压缩并缓存，后续直接写字节，省去每请求 ~2-3ms CPU。
-var precompressedHTML sync.Map // key: 变体名 -> []byte（gzip 后）
+// ---------- 压缩输出 HTML ----------
+// 不做任何进程内缓存：每次请求现场 gzip（仅管理后台几处低频页面，CPU 开销可忽略）。
 
-// serveHTMLPrecompressed 输出（预压缩缓存的）HTML：客户端支持 gzip 时命中缓存直写。
-func serveHTMLPrecompressed(w http.ResponseWriter, r *http.Request, variant, html, contentType, cacheControl string) {
+// serveHTML 输出 HTML：客户端支持 gzip 时现场压缩后写出。
+func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheControl string) {
 	w.Header().Set("Content-Type", contentType)
 	if cacheControl != "" {
 		w.Header().Set("Cache-Control", cacheControl)
 	}
 	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		var data []byte
-		if v, ok := precompressedHTML.Load(variant); ok {
-			data = v.([]byte)
-		} else {
-			var buf bytes.Buffer
-			gz := gzip.NewWriter(&buf)
-			_, _ = gz.Write([]byte(html))
-			_ = gz.Close()
-			data = buf.Bytes()
-			precompressedHTML.Store(variant, data)
-		}
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, _ = gz.Write([]byte(html))
+		_ = gz.Close()
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Add("Vary", "Accept-Encoding")
-		_, _ = w.Write(data)
+		_, _ = w.Write(buf.Bytes())
 		return
 	}
 	_, _ = w.Write([]byte(html))
 }
+
+// ---------- 系统信息辅助 ----------
+
+// diskUsage 返回磁盘剩余/总量（仅 unix，用 syscall.Statfs；失败返回 0）
+type diskSpace struct{ free, total uint64 }
+
+func diskUsage(path string) (diskSpace, error) {
+var st syscall.Statfs_t
+if err := syscall.Statfs(path, &st); err != nil {
+	return diskSpace{}, err
+}
+return diskSpace{
+	free:  st.Bavail * uint64(st.Bsize),
+	total: st.Blocks * uint64(st.Bsize),
+}, nil
+}
+
+// appVersion 程序版本号（发版时改这里即可，后台「系统信息」会展示）
+const appVersionStr = "1.4.0"
+
+func appVersion() string { return appVersionStr }
+
+// blockedAll 五种拦截之和（调用方需自行持有 statsMu 或接受轻微误差）
+func blockedAll() int64 {
+statsMu.Lock()
+defer statsMu.Unlock()
+return stats.BlockedCN + stats.BlockedWhitelist + stats.BlockedBan + stats.BlockedRate + stats.BlockedUA
+}
+
+// activeSessionCount 当前未过期的后台登录会话数
+func activeSessionCount() int {
+now := time.Now()
+n := 0
+sessions.Range(func(_, v interface{}) bool {
+	if e, ok := v.(sessionEntry); ok && now.Before(e.Expires) {
+		n++
+	}
+	return true
+})
+return n
+}
+
 
 // adminHandler 注册 /admin 下全部路由（登录页、API、静态后台页）。
 func adminHandler() http.HandlerFunc {
@@ -3855,17 +2966,9 @@ func adminHandler() http.HandlerFunc {
 			http.Redirect(w, r, "/admin/", http.StatusFound)
 			return
 		}
-		pwaOn := currentCfg().PWA
-		html := strings.Replace(string(loginHTML), "<head>", "<head>\n"+pwaHeadExtra(pwaOn), 1)
-		if extra := pwaBodyExtra(pwaOn); extra != "" {
-			html = strings.Replace(html, "</body>", extra+"</body>", 1)
-		}
-		// 按 PWA 开关两个变体做预压缩缓存（登录页内容固定，无需每次压缩）
-		variant := "login-pwa-off"
-		if pwaOn {
-			variant = "login-pwa-on"
-		}
-		serveHTMLPrecompressed(w, r, variant, html, "text/html; charset=utf-8", "no-store")
+		html := strings.Replace(string(loginHTML), "<head>", "<head>\n"+pwaHeadExtra(), 1)
+		html = strings.Replace(html, "</body>", pwaBodyExtra()+"</body>", 1)
+		serveHTML(w, r, html, "text/html; charset=utf-8", "no-store")
 	})
 	mux.HandleFunc("/admin/api/captcha", func(w http.ResponseWriter, r *http.Request) {
 		ip := getClientIP(r)
@@ -3970,7 +3073,6 @@ func adminHandler() http.HandlerFunc {
 			http.Error(w, "提交的配置格式有误，请检查各项输入后重新保存", http.StatusBadRequest)
 			return
 		}
-		req.GeoAPIURL = strings.TrimSpace(req.GeoAPIURL)
 		oldCfg := currentCfg()
 		newCfg := &req
 		if err := saveConfig(newCfg); err != nil {
@@ -3991,6 +3093,90 @@ func adminHandler() http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
+	})
+// /admin/api/system：概览「系统信息」卡片的运行态数据（全部来自本进程与 os，不依赖外部命令）
+	mux.HandleFunc("/admin/api/system", func(w http.ResponseWriter, r *http.Request) {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+
+		// 构建信息：优先取 embed 的 buildinfo（Go 1.18+ 自动写入）
+		goVer := runtime.Version()
+		buildSum := ""
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if bi.GoVersion != "" {
+				goVer = bi.GoVersion
+			}
+			for _, st := range bi.Settings {
+				if st.Key == "vcs.revision" {
+					buildSum = st.Value
+				}
+			}
+		}
+		if len(buildSum) > 8 {
+			buildSum = buildSum[:8]
+		}
+
+		// 数据库文件大小与所在磁盘剩余空间
+		var dbSize int64
+		if fi, err := os.Stat(dbPath); err == nil {
+			dbSize = fi.Size()
+		}
+		var diskFree, diskTotal uint64
+		if du, err := diskUsage(filepath.Dir(dbPath)); err == nil {
+			diskFree, diskTotal = du.free, du.total
+		}
+
+		// 独立 IP 数（快速估算，避免再复制全量 map）
+		statsMu.Lock()
+		uniqueIPs := len(stats.IPCounts)
+		totalReqs := stats.TotalRequests
+		totalBytes := stats.TotalBytes
+		statsMu.Unlock()
+
+		// 命中率：允许的请求 / 总请求
+		allowRate := 0.0
+		if totalReqs > 0 {
+			allowRate = 100 * float64(totalReqs-blockedAll()) / float64(totalReqs)
+			if allowRate < 0 {
+				allowRate = 0
+			}
+		}
+
+		c := currentCfg()
+		resp := map[string]any{
+			"version":        appVersion(),
+			"go_version":     goVer,
+			"build_rev":      buildSum,
+			"os_arch":        runtime.GOOS + "/" + runtime.GOARCH,
+			"num_cpu":        runtime.NumCPU(),
+			"gomaxprocs":     runtime.GOMAXPROCS(0),
+			"goroutines":     runtime.NumGoroutine(),
+			"uptime_sec":     int64(time.Since(startedAt).Seconds()),
+			"mem_alloc":      ms.Alloc,
+			"mem_sys":        ms.Sys,
+			"mem_heap":       ms.HeapAlloc,
+			"mem_stack":      ms.StackInuse,
+			"heap_objects":   ms.HeapObjects,
+			"gc_count":       ms.NumGC,
+			"gc_pause_last":  ms.PauseNs[(ms.NumGC+255)%256],
+			"db_size":        dbSize,
+			"disk_free":      diskFree,
+			"disk_total":     diskTotal,
+			"port":           currentPort(),
+			"unique_ips":     uniqueIPs,
+			"total_requests": totalReqs,
+			"total_bytes":    totalBytes,
+			"allow_rate":     allowRate,
+			"whitelist":      len(c.Whitelist),
+			"ban_list":       len(c.BanList),
+			"rate_limit":     c.RateLimit,
+			"china_only":     c.ChinaOnly,
+			"auto_ban":       c.AutoBan,
+			"allowed_uas":    len(c.AllowedUAs),
+			"logins":         activeSessionCount(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/admin/api/traffic", func(w http.ResponseWriter, r *http.Request) {
 		// slim=1 轻量模式：概览页 5 秒轮询专用——trend 只含每日汇总（不带分时/主机/IP/国家明细），
@@ -4018,21 +3204,21 @@ func adminHandler() http.HandlerFunc {
 		}
 
 		type TrendItem struct {
-			Date         string           `json:"date"`
-			Requests     int64            `json:"requests"`
-			Bytes        int64            `json:"bytes"`
-			UpBytes      int64            `json:"up_bytes"`
-			DownBytes    int64            `json:"down_bytes"`
-			Blocked      int64            `json:"blocked"`
-			BlockedCN    int64            `json:"blocked_cn"`
-			BlockedWL    int64            `json:"blocked_whitelist"`
-			Hours        map[string]int64 `json:"hours,omitempty"`
-			HourBytes    map[string]int64 `json:"hour_bytes,omitempty"`
-			HourUpBytes  map[string]int64 `json:"hour_up_bytes,omitempty"`
+			Date      string           `json:"date"`
+			Requests  int64            `json:"requests"`
+			Bytes     int64            `json:"bytes"`
+			UpBytes   int64            `json:"up_bytes"`
+			DownBytes int64            `json:"down_bytes"`
+			Blocked   int64            `json:"blocked"`
+			BlockedCN int64            `json:"blocked_cn"`
+			BlockedWL int64            `json:"blocked_whitelist"`
+			Hours         map[string]int64 `json:"hours,omitempty"`
+			HourBytes     map[string]int64 `json:"hour_bytes,omitempty"`
+			HourUpBytes   map[string]int64 `json:"hour_up_bytes,omitempty"`
 			HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"`
-			Hosts        map[string]int64 `json:"hosts,omitempty"`
-			IPs          map[string]int64 `json:"ips,omitempty"`
-			Countries    map[string]int64 `json:"countries,omitempty"`
+			Hosts         map[string]int64 `json:"hosts,omitempty"`
+			IPs       map[string]int64 `json:"ips,omitempty"`
+			Countries map[string]int64 `json:"countries,omitempty"`
 		}
 		var trend []TrendItem
 		hostAll := map[string]int64{}
@@ -4041,11 +3227,16 @@ func adminHandler() http.HandlerFunc {
 				continue
 			}
 			if slim {
-				// 轻量模式：只带每日汇总数字，跳过全部明细复制（锁内 O(天) 而非 O(全明细)）
+				// 轻量模式：只带每日汇总 + 分时汇总（概览「单日」视图按 0~23 点画图，
+				// 缺了 hours/hour_*_bytes 就会退化成一条全 0 的直线）；IP/国家/主机明细仍跳过。
 				trend = append(trend, TrendItem{
 					Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
 					Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
 					BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
+					Hours:         hour24(d.Hours),
+					HourBytes:     hour24(d.HourBytes),
+					HourUpBytes:   hour24(d.HourUpBytes),
+					HourDownBytes: hour24(d.HourDownBytes),
 				})
 				continue
 			}
@@ -4068,8 +3259,8 @@ func adminHandler() http.HandlerFunc {
 			Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
 			BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
 			Hours: hoursCopy, HourBytes: hourBytesCopy,
-			HourUpBytes: hourUpCopy, HourDownBytes: hourDownCopy,
-			Hosts: hostsCopy, IPs: ipsCopy, Countries: ctryCopy,
+			HourUpBytes: hourUpCopy, HourDownBytes: hourDownCopy, Hosts: hostsCopy,
+			IPs: ipsCopy, Countries: ctryCopy,
 		})
 		}
 		sort.Slice(trend, func(i, j int) bool { return trend[i].Date < trend[j].Date })
@@ -4093,12 +3284,14 @@ func adminHandler() http.HandlerFunc {
 		todayUp, todayDown := stats.TodayUpBytes, stats.TodayDownBytes
 		cn, wl := stats.BlockedCN, stats.BlockedWhitelist
 		ban, rate, ua := stats.BlockedBan, stats.BlockedRate, stats.BlockedUA
+		schemaVersion := stats.SchemaVersion
 		ipUp := copyInt64Map(stats.IPUpBytes)
 		ipDown := copyInt64Map(stats.IPDownBytes)
 		pruneTopN(hostAll, 50)
 		statsMu.Unlock()
 
 		resp := map[string]any{
+			"schema_version": schemaVersion,
 			"total_requests": reqs, "total_bytes": byts,
 			"total_up_bytes": totalUp, "total_down_bytes": totalDown,
 			"today_date": today, "requests": reqs, "bytes": byts,
@@ -4123,109 +3316,6 @@ func adminHandler() http.HandlerFunc {
 			resp["host_counts"] = hostAll
 		}
 		_ = json.NewEncoder(w).Encode(resp)
-	})
-	mux.HandleFunc("/admin/api/live", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(liveSnapshot())
-	})
-	mux.HandleFunc("/admin/api/live/close", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		id := strings.TrimSpace(r.URL.Query().Get("id"))
-		if id == "" {
-			var body struct {
-				ID string `json:"id"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			id = strings.TrimSpace(body.ID)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if !liveKill(id) {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"ok":false,"error":"该连接已结束或不存在，可能刚刚已被断开"}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	})
-	// WebSocket 实时推送（约 500ms 一帧），失败时前端回退到 HTTP 轮询
-	mux.HandleFunc("/admin/api/live/ws", func(w http.ResponseWriter, r *http.Request) {
-		if !validSession(getSessionToken(r)) {
-			http.Error(w, "请先登录后再操作", http.StatusUnauthorized)
-			return
-		}
-		upgrader := websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				origin := r.Header.Get("Origin")
-				if origin == "" {
-					return true // 非浏览器或同端点
-				}
-				u, err := url.Parse(origin)
-				if err != nil {
-					return false
-				}
-				// 允许与当前 Host 一致，或反代场景下 Origin Host 与请求 Host 同站
-				reqHost := r.Host
-				if h, _, err := net.SplitHostPort(reqHost); err == nil {
-					reqHost = h
-				}
-				oh := u.Host
-				if h, _, err := net.SplitHostPort(oh); err == nil {
-					oh = h
-				}
-				return strings.EqualFold(oh, reqHost) || strings.EqualFold(u.Host, r.Host)
-			},
-			EnableCompression: true,
-		}
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		conn.SetPongHandler(func(string) error {
-			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-			return nil
-		})
-		// 读协程：消费客户端 ping/关闭，避免写阻塞
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-		ticker := time.NewTicker(500 * time.Millisecond)
-		pingTicker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		defer pingTicker.Stop()
-		writeJSON := func() error {
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			// 仅推活跃连接，历史由前端本页会话自行累计
-			return conn.WriteJSON(liveSnapshotActive())
-		}
-		if err := writeJSON(); err != nil {
-			return
-		}
-		for {
-			select {
-			case <-done:
-				return
-			case <-pingTicker.C:
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			case <-ticker.C:
-				if err := writeJSON(); err != nil {
-					return
-				}
-			}
-		}
 	})
 	mux.HandleFunc("/admin/api/blocks", func(w http.ResponseWriter, r *http.Request) {
 		limit := 1000
@@ -4341,44 +3431,50 @@ func adminHandler() http.HandlerFunc {
 			http.Error(w, "IP 地址格式无效，请输入合法的 IPv4/IPv6 地址", http.StatusBadRequest)
 			return
 		}
-		// 国家用本地库；详情每次现查，不缓存（避免旧数据）
-		code := countryOf(ip)
-		name := countryName(code)
+		code, name := ipLabelSync(ip)
+		// IP 归属查询：固定走 ip9.com.cn，失效自动回落 ip-api.com（见 geoFetch）
 		geo := geoEntry{}
-		if currentCfg().GeoAPI && !isSelfOrLocalIP(ip, code) {
-			v, err, _ := geoGroup.Do(ip, func() (interface{}, error) {
-				return geoFetch(ip)
-			})
-			if err == nil {
-				if e, ok := v.(geoEntry); ok {
-					geo = e
-				}
+		v, err, _ := geoGroup.Do(ip, func() (interface{}, error) {
+			geoMu.RLock()
+			cached, ok := geoMap[ip]
+			geoMu.RUnlock()
+			if ok && cached.Code != "??" && time.Now().Unix()-cached.At < 30*86400 {
+				return cached, nil
 			}
+			return geoFetch(ip)
+		})
+		if err == nil {
+			geo = v.(geoEntry)
+			geoMu.Lock()
+			geoMap[ip] = geo
+			geoMu.Unlock()
 		}
-		if geo.Code != "" && geo.Code != "??" {
+		if geo.Code != "" {
 			code = geo.Code
 			name = countryName(code)
 		}
 		locParts := []string{}
-		if geo.Name != "" {
-			locParts = append(locParts, geo.Name)
-		} else {
-			if name != "未知" {
-				locParts = append(locParts, name)
-			}
-			if geo.Region != "" {
-				locParts = append(locParts, geo.Region)
-			}
-			if geo.City != "" && geo.City != geo.Region {
-				locParts = append(locParts, geo.City)
-			}
+		if name != "未知" {
+			locParts = append(locParts, name)
+		}
+		if geo.Region != "" {
+			locParts = append(locParts, geo.Region)
+		}
+		if geo.City != "" && geo.City != geo.Region {
+			locParts = append(locParts, geo.City)
 		}
 		statsMu.Lock()
 		reqs := stats.IPCounts[ip]
 		bytes := stats.IPBytes[ip]
 		statsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ip": ip, "country": code, "country_name": name, "region": geo.Region, "city": geo.City, "location": strings.Join(locParts, " · "), "requests": reqs, "bytes": bytes})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ip": ip, "country": code, "country_name": name,
+			"region": geo.Region, "city": geo.City,
+			"isp": geo.ISP, "org": geo.Org, "as": geo.AS,
+			"location": strings.Join(locParts, " · "),
+			"requests": reqs, "bytes": bytes,
+		})
 	})
 	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ OldPass, NewPass string }
@@ -4456,14 +3552,15 @@ func adminHandler() http.HandlerFunc {
 		http.Redirect(w, r, "https://flagcdn.com/w40/"+code+".png", http.StatusFound)
 	})
 	// ---------- PWA 静态资源（免鉴权：图标/清单/Worker 不含敏感信息，且安装时浏览器可能无 Cookie 拉取）----------
+	// 图标本地不做任何缓存，直接 302 到源站。
 	mux.HandleFunc("/admin/logo.png", func(w http.ResponseWriter, r *http.Request) {
-		serveCachedIcon(w, r, &logoData, iconLogoURL)
+		redirectIcon(w, r, iconLogoURL)
 	})
 	mux.HandleFunc("/admin/icon-192.png", func(w http.ResponseWriter, r *http.Request) {
-		serveCachedIcon(w, r, &icon192Data, icon192URL)
+		redirectIcon(w, r, icon192URL)
 	})
 	mux.HandleFunc("/admin/icon-512.png", func(w http.ResponseWriter, r *http.Request) {
-		serveCachedIcon(w, r, &icon512Data, icon512URL)
+		redirectIcon(w, r, icon512URL)
 	})
 	mux.HandleFunc("/admin/manifest.webmanifest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
@@ -4472,26 +3569,17 @@ func adminHandler() http.HandlerFunc {
 	})
 	mux.HandleFunc("/admin/sw.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(swSource))
 	})
 	mux.HandleFunc("/admin/splash", func(w http.ResponseWriter, r *http.Request) {
-		// 预压缩缓存直写；允许 SW 缓存实现秒开，版本随二进制更新
-		serveHTMLPrecompressed(w, r, "splash", splashHTML, "text/html; charset=utf-8", "")
+		serveHTML(w, r, splashHTML, "text/html; charset=utf-8", "no-store")
 	})
 	mux.HandleFunc("/admin/api/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
-		pwaOn := currentCfg().PWA
-		html := strings.Replace(string(adminHTML), "<head>", "<head>\n"+pwaHeadExtra(pwaOn), 1)
-		if extra := pwaBodyExtra(pwaOn); extra != "" {
-			html = strings.Replace(html, "</body>", extra+"</body>", 1)
-		}
-		// 按 PWA 开关两个变体做预压缩缓存（78KB 页面无需每请求压缩）
-		variant := "admin-pwa-off"
-		if pwaOn {
-			variant = "admin-pwa-on"
-		}
-		serveHTMLPrecompressed(w, r, variant, html, "text/html; charset=utf-8", "no-cache")
+		html := strings.Replace(string(adminHTML), "<head>", "<head>\n"+pwaHeadExtra(), 1)
+		html = strings.Replace(html, "</body>", pwaBodyExtra()+"</body>", 1)
+		serveHTML(w, r, html, "text/html; charset=utf-8", "no-cache")
 	})
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -4509,8 +3597,9 @@ func adminHandler() http.HandlerFunc {
 // 打开 DB → 迁移旧 JSON → 加载配置/统计 → 启动后台协程 → 监听并阻塞等信号。
 func runServer(port int, adminUser, adminPass, dbFile string) {
 	// Transport 与配置无关，只在启动时创建一次（见 newTransport 上方说明）
-	proxyTr.v.Store(&retryTransport{base: newTransport()})
+	proxyTr.v.Store(newTransport())
 	var err error
+	dbPath = dbFile
 	db, err = bolt.Open(dbFile, 0600, &bolt.Options{Timeout: 3 * time.Second})
 	if err != nil {
 		log.Fatalf("无法打开数据库: %v", err)
@@ -4539,15 +3628,15 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				_ = bk.Put([]byte("admin_pass"), b)
 				_ = os.Rename(passPath, passPath+".bak")
 			}
-			geoPath := filepath.Join(filepath.Dir(dbFile), "geo_cache.json")
-			if b, err := os.ReadFile(geoPath); err == nil {
-				bk, _ := tx.CreateBucketIfNotExists([]byte("geo"))
-				_ = bk.Put([]byte("data"), b)
-				_ = os.Rename(geoPath, geoPath+".bak")
-			}
 		}
 		return nil
 	})
+
+	// 清理历史版本遗留在数据目录里的本地缓存文件（只保留 emby.db 这一份必要数据库）。
+	// 旧版曾把 geo 结果落盘成 geo_cache.json，现已改为纯内存，直接删除不再保留 .bak。
+	for _, legacy := range []string{"geo_cache.json", "geo_cache.json.bak", "stats.json.bak", "config.json.bak", "admin.pass.bak"} {
+		_ = os.Remove(filepath.Join(filepath.Dir(dbFile), legacy))
+	}
 
 	loadConfig()
 	// 密码：优先使用 DB 中的 bcrypt 哈希；兼容旧明文 admin_pass；无则用启动参数写入哈希
@@ -4586,28 +3675,18 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 
 	loadStats()
 	startStatsWorker()
-	startLiveRateSampler()
 	startStatsSaver()
 	detectSelfPublicIP()
-	// 图标改为启动时后台预热（favicon/Logo/PWA 图标）：
-	// 原实现 faviconOnce.Do 在【第一个请求的处理器里】同步外网 GET（4s 超时），
-	// 会把第一个请求卡住数秒。现在启动即拉取，处理器直接读内存。
-	go func() {
-		faviconData.Store(fetchIcon(iconFaviconURL))
-	}()
-	go func() {
-		logoData.Store(fetchIcon(iconLogoURL))
-		icon192Data.Store(fetchIcon(icon192URL))
-		icon512Data.Store(fetchIcon(icon512URL))
-	}()
-	defer func() { saveStatsOnce() }()
+	initSessionsCleanup()
+	// 图标不再预热/缓存：/favicon.ico 与 /admin/*.png 均直接 302 到源站
+	defer saveStatsOnce()
 
 	proxy := buildProxy(proxyTr)
-	// 代理主处理：静态资源 → ACL → 地区 → 解析目标 → 白名单 → 可选缓存 → 反代并记流量
+	// 代理主处理：静态资源 → ACL → 地区 → 解析目标 → 白名单 → 反代并记流量
+	// 上下行口径：up = 本机→客户端（statWriter），down = 上游→本机（upstreamBody）
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.png" || r.URL.Path == "/favicon.svg" {
-			// 读启动时预热的缓存；未预热完成则直接 302 到源站，不阻塞请求
-			serveCachedIcon(w, r, &faviconData, iconFaviconURL)
+			redirectIcon(w, r, iconFaviconURL)
 			return
 		}
 		if isBuiltinAssetPath(r.URL.Path) {
@@ -4680,48 +3759,26 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
-		// WebSocket 升级单独处理（Emby 实时/直播常用）
-		if isWebSocketRequest(r) {
-			recordRequestStart(ip, country, target.Host)
-			reqCtx, cancel := context.WithCancel(r.Context())
-			lc := liveStart(ip, country, target.Host, r.Method, r.URL.RequestURI())
-			lc.cancel = cancel
-			// 握手头计入
-			hs := estimateReqHeaderSize(r)
-			lc.Up.Add(hs)
-			liveUpSum.Add(hs)
-			defer func() {
-				cancel()
-				liveEnd(lc)
-				// WS 结束时把累计字节写入日统计
-				recordBytes(ip, lc.Up.Load(), lc.Down.Load())
-			}()
-			proxyWebSocket(w, r.WithContext(reqCtx), target, lc)
-			return
-		}
+		// CORS 跨域功能已移除：不再注入任何 Access-Control-* 响应头，
+		// 跨域预检（OPTIONS）按普通请求转发到上游，由上游自行决定如何响应。
+		// 注意：这会让部分依赖宽松 CORS 头的播放器无法跨域拉流，属预期行为。
 
 		recordRequestStart(ip, country, target.Host)
 
-		reqCtx, cancel := context.WithCancel(r.Context())
-		lc := liveStart(ip, country, target.Host, r.Method, r.URL.RequestURI())
-		lc.cancel = cancel
-		defer cancel()
-		defer liveEnd(lc)
+		// 请求级上下行计数器
+		upBytes := new(int64)   // 本机→客户端
+		downBytes := new(int64) // 上游→本机
 
-		sw := &statWriter{ResponseWriter: w, live: lc}
+		sw := &statWriter{ResponseWriter: w, up: upBytes}
+		var w2 http.ResponseWriter = sw
 
-		// downFromUp：从 Emby 原站下载的字节（服务器下行）
-		downFromUp := new(int64)
-		ctx := context.WithValue(reqCtx, targetCtxKey{}, target)
-		ctx = context.WithValue(ctx, upBytesCtxKey{}, downFromUp)
-		ctx = context.WithValue(ctx, liveCtxKey{}, lc)
+		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
+		ctx = context.WithValue(ctx, downBytesCtxKey{}, downBytes)
 
-		proxy.ServeHTTP(sw, r.WithContext(ctx))
+		proxy.ServeHTTP(w2, r.WithContext(ctx))
 
-		// 口径：上行=转发给用户，下行=从 Emby 原站下载
-		toClient := sw.bytes
-		fromOrigin := atomic.LoadInt64(downFromUp)
-		recordBytes(ip, toClient, fromOrigin)
+		// up = 本机→客户端；down = 上游→本机
+		recordBytes(ip, atomic.LoadInt64(upBytes), atomic.LoadInt64(downBytes))
 	})
 
 	adminSrv := adminHandler()
@@ -4730,11 +3787,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
-			active := liveActive.Load()
-			dropped := statDropped.Load()
-			dbOk := db != nil
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d,"active_conns":%d,"stat_dropped":%d,"db_ok":%t}`,
-				int64(time.Since(startedAt).Seconds()), active, dropped, dbOk)))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d}`, int64(time.Since(startedAt).Seconds()))))
 			return
 		}
 		if r.URL.Path == "/admin" {
@@ -4750,14 +3803,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	if c := currentCfg(); c.Port > 0 {
 		port = c.Port
 	}
-	srv := &http.Server{
-		Handler:           root,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       0, // 不限制，避免长视频被掐
-		WriteTimeout:      0, // 流式响应不设写超时
-		IdleTimeout:       180 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-	}
+	srv := &http.Server{Handler: root, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 32 << 10}
 	globalSrv = srv
 	if err := startListen(srv, port); err != nil {
 		log.Fatalf("监听失败: %v", err)
@@ -4788,7 +3834,6 @@ func main() {
 }
 
 GO_SOURCE
-
   cat > "$dir/admin.html" <<'ADMIN_HTML'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -4917,25 +3962,6 @@ th{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:12.5px;font-wei
 td{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:13.5px;color:var(--t2)}
 tbody tr:last-child td{border-bottom:0}
 tbody tr:hover td{background:#f8fafc}
-/* 实时监控 · 连接面板风格 */
-.live-conn-table{min-width:960px;font-size:13px}
-.live-conn-table th{padding:10px 12px;font-size:12px;font-weight:500;color:var(--t3)}
-.live-conn-table td{padding:10px 12px;font-size:13px;vertical-align:middle}
-.live-conn-table tbody tr.lv-active td{background:rgba(59,130,246,.03)}
-.live-conn-table .lv-host{font-family:var(--mono);font-weight:600;color:var(--t);word-break:break-all}
-.live-conn-table .lv-path{font-family:var(--mono);font-size:12px;color:var(--t3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:bottom}
-.live-conn-table .lv-rate{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
-.live-conn-table .lv-rate.on{color:var(--ok);font-weight:600}
-.live-conn-table .lv-bytes{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--t2)}
-.live-conn-table .lv-ago{color:var(--t3);white-space:nowrap;font-size:12.5px}
-.live-conn-table .lv-src{display:flex;flex-direction:column;gap:2px;min-width:0}
-.live-conn-table .lv-src .ip{font-family:var(--mono);color:var(--pd);font-weight:600}
-.live-conn-table .lv-src .rg{font-size:12px;color:var(--t3)}
-.lv-x{width:28px;height:28px;border:0;border-radius:8px;background:transparent;color:var(--t3);cursor:pointer;font-size:16px;line-height:1;display:inline-flex;align-items:center;justify-content:center;transition:.15s}
-.lv-x:hover{background:#fef2f2;color:var(--d)}
-.lv-x:disabled{opacity:.35;cursor:default;pointer-events:none}
-.lv-type{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:6px;background:#f1f5f9;font-size:12px;font-weight:500;color:var(--t2);white-space:nowrap}
-.lv-type.on{background:var(--ps);color:var(--pd)}
 .cell-v{display:inline}
 td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 /* 弹窗 */
@@ -4954,6 +3980,14 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .kk{width:70px;flex-shrink:0;color:var(--t3)}
 .kvv{flex:1;word-break:break-all;font-weight:500;color:var(--t)}
 .kvv.m{font-family:var(--mono);font-size:13px}
+/* 系统信息卡片 */
+.svg-title{font-size:11.5px;font-weight:600;letter-spacing:.4px;color:var(--t3);text-transform:uppercase;margin:2px 0 6px}
+.sv-list{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#f1f5f9;border:1px solid #f1f5f9;border-radius:10px;overflow:hidden}
+.sv-list + .svg-title{margin-top:18px}
+.kvr{display:flex;flex-direction:column;gap:3px;padding:9px 12px;background:#fff;font-size:13px;min-width:0}
+.kvl{color:var(--t3);font-size:12px;line-height:1.35}
+.kvv{font-weight:600;color:var(--t);word-break:break-all;line-height:1.45;font-variant-numeric:tabular-nums}
+@media(max-width:1000px){.sv-list{grid-template-columns:1fr}}
 
 /* --- 响应式适配 --- */
 @media(max-width:1024px){
@@ -5032,7 +4066,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <ul class="nav">
 <li><button class="nav-i on" data-t="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>概览</button></li>
 <li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量请求</button></li>
-<li><button class="nav-i" data-t="live"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>实时监控</button></li>
 <li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
@@ -5048,24 +4081,35 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </header>
 <div class="sc">
 <section id="overview" class="pg on">
-<div class="ch" style="margin-bottom:14px;justify-content:flex-start;">
+<div class="ch" style="margin-bottom:14px;justify-content:flex-start;flex-wrap:wrap;gap:10px">
   <div class="flt" id="ovRangeBar">
     <button class="filter on" data-r="today">今天</button>
     <button class="filter" data-r="yesterday">昨天</button>
     <button class="filter" data-r="7d">近 7 天</button>
     <button class="filter" data-r="30d">近 30 天</button>
     <button class="filter" data-r="all">全部</button>
+    <button class="filter" data-r="custom">自定义</button>
+  </div>
+  <div id="ovCustomBox" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+    <input type="date" id="ovFrom" class="inp m" style="width:auto;padding:8px 10px;font-size:13px">
+    <span style="color:var(--t3)">至</span>
+    <input type="date" id="ovTo" class="inp m" style="width:auto;padding:8px 10px;font-size:13px">
+    <button class="btn b s" id="ovApplyCustom" type="button">应用</button>
   </div>
 </div>
 <div class="sg">
-<div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">上行 <b id="ovUp">0 B</b> · 下行 <b id="ovDown">0 B</b></div></div>
+<div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">流量 <b id="ovBytes">0 B</b></div></div>
 <div class="stc g"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>平均每日请求</div><div class="sv" id="ovAvgReq">-</div><div class="ss">日均流量 <b id="ovAvgBytes">0 B</b></div></div>
 <div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">全部拦截类型</div></div>
 <div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
 </div>
+<div class="card" style="margin-bottom:22px">
+<div class="ch"><div><h2 class="ct" id="ovByteTitle">流量趋势</h2><div class="cd" id="ovByteDesc">按天统计上下行流量（上行=本机→客户端，下行=上游→本机）</div></div></div>
+<div style="position:relative;height:240px"><canvas id="miniByteChart"></canvas></div>
+</div>
 <div class="g3">
 <div>
-<div class="card" style="margin-bottom:22px;"><div class="ch"><div><h2 class="ct">请求趋势</h2></div></div><div style="position:relative;height:220px"><canvas id="miniTrendChart"></canvas></div></div>
+<div class="card" style="margin-bottom:22px;"><div class="ch"><div><h2 class="ct" id="ovReqTitle">请求趋势</h2><div class="cd" id="ovReqDesc">按天统计请求次数</div></div></div><div style="position:relative;height:220px"><canvas id="miniTrendChart"></canvas></div></div>
 <div class="card"><div class="ch"><div><h2 class="ct">系统信息</h2></div></div><div id="sysInfo"></div></div>
 </div>
 <div class="card"><div class="ch"><div><h2 class="ct">最新拦截</h2></div><button class="btn g s" data-goto="blocks">查看全部</button></div><div id="ovBlocks"></div></div>
@@ -5075,9 +4119,9 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="ch" style="margin-bottom:14px;justify-content:flex-start;flex-wrap:wrap;gap:10px">
   <div class="flt" id="tfRangeBar">
     <button class="filter on" data-r="today">今天</button>
+    <button class="filter" data-r="yesterday">昨天</button>
     <button class="filter" data-r="7d">近 7 天</button>
     <button class="filter" data-r="30d">近 30 天</button>
-    <button class="filter" data-r="365d">近一年</button>
     <button class="filter" data-r="all">全部</button>
     <button class="filter" data-r="custom">自定义</button>
   </div>
@@ -5090,7 +4134,12 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </div>
 <div class="sg" style="margin-bottom:18px">
   <div class="stc b"><div class="sl">区间请求</div><div class="sv" id="tfReq">-</div><div class="ss" id="tfReqHint">—</div></div>
-  <div class="stc g"><div class="sl">区间流量</div><div class="sv" id="tfBytes">-</div><div class="ss" id="tfBytesHint">下行 — · 上行 —</div></div>
+  <div class="stc g"><div class="sl">区间流量</div><div class="sv" id="tfBytes">-</div><div class="ss" id="tfBytesHint">—</div>
+    <div style="display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:8px;padding-top:8px;border-top:1px solid #f1f5f9;font-size:12px;color:var(--t3);white-space:nowrap">
+      <span>↑ 上行<b id="tfUp" style="color:var(--t);font-family:var(--mono);font-weight:600;margin-left:4px">-</b></span>
+      <span>↓ 下行<b id="tfDown" style="color:var(--t);font-family:var(--mono);font-weight:600;margin-left:4px">-</b></span>
+    </div>
+  </div>
   <div class="stc o"><div class="sl">独立 IP</div><div class="sv" id="tfIPs">-</div><div class="ss">当前筛选</div></div>
   <div class="stc r"><div class="sl">拦截次数</div><div class="sv" id="tfBlocked" style="color:var(--d)">-</div><div class="ss">当前筛选</div></div>
 </div>
@@ -5099,7 +4148,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div style="position:relative;height:260px"><canvas id="reqChart"></canvas></div>
 </div>
 <div class="card">
-<div class="ch"><div><h2 class="ct" id="tfByteTitle">上下行流量趋势</h2><div class="cd" id="tfByteDesc">蓝=下行 · 绿=上行</div></div></div>
+<div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">按天统计上下行流量（下行=上游→本机，上行=本机→客户端）</div></div></div>
 <div style="position:relative;height:260px"><canvas id="byteChart"></canvas></div>
 </div>
 <div class="card" style="margin-top:0">
@@ -5109,40 +4158,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="g2" style="margin-top:22px">
 <div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="ipDist"></div></div>
 <div class="card"><div class="ch"><div><h2 class="ct">地区来源分布</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="regionDist"></div></div>
-</div>
-</section>
-<section id="live" class="pg">
-<div class="sg" style="margin-bottom:18px">
-  <div class="stc b"><div class="sl">当前连接</div><div class="sv" id="lvActive">0</div><div class="ss">正在代理的请求</div></div>
-  <div class="stc g"><div class="sl">下行速率</div><div class="sv" id="lvDown">0 B/s</div><div class="ss">近 1 秒</div></div>
-  <div class="stc o"><div class="sl">上行速率</div><div class="sv" id="lvUp">0 B/s</div><div class="ss">近 1 秒</div></div>
-  <div class="stc r"><div class="sl">记录数</div><div class="sv" id="lvIPCount">0</div><div class="ss">本页累计连接</div></div>
-</div>
-<div class="card">
-  <div class="ch"><div><h2 class="ct">连接记录</h2><div class="cd">风格参考代理连接面板 · 离开本页即清空 · 可断开进行中的连接</div></div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span class="chip" id="lvRefreshHint" style="font-size:12px;color:var(--t3)">连接中…</span>
-      <button type="button" class="btn g s" id="lvClearBtn">清空本页记录</button>
-    </div>
-  </div>
-  <div class="table-wrap"><table class="live-conn-table"><thead><tr>
-    <th style="width:40px"></th>
-    <th>主机</th>
-    <th>类型</th>
-    <th>来源</th>
-    <th>路径</th>
-    <th>下载速度</th>
-    <th>上传速度</th>
-    <th>下载</th>
-    <th>上传</th>
-    <th>连接时间</th>
-  </tr></thead><tbody id="lvConnTable"></tbody></table></div>
-  <div id="lvConnPager" style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap;font-size:13px;color:var(--t2)"></div>
-</div>
-<div class="card">
-  <div class="ch"><div><h2 class="ct">按 IP 汇总</h2><div class="cd">基于本页累计记录</div></div></div>
-  <div class="table-wrap"><table><thead><tr><th>IP</th><th>地区</th><th>连接</th><th>下行</th><th>上行</th></tr></thead><tbody id="lvIPTable"></tbody></table></div>
-  <div id="lvIPPager" style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap;font-size:13px;color:var(--t2)"></div>
 </div>
 </section>
 <section id="blocks" class="pg">
@@ -5173,8 +4188,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
     <div class="card" style="margin-bottom:0;">
       <div class="ch"><div><h2 class="ct">基础服务设置</h2></div></div>
       <div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center"><input id="portInput" class="inp m" type="number" style="max-width:140px"><button class="btn b" id="savePort">保存并重启监听</button></div></div>
-      <div class="row"><div><div class="rl">PWA 模式</div><div class="rd">后台可安装到手机/电脑桌面，全屏运行并支持离线打开；保存后刷新页面生效</div></div><label class="sw"><input type="checkbox" id="pwaToggle"><span class="tr2"></span></label></div>
-      <div class="row" id="pwaInstallRow" style="display:none"><div><div class="rl">安装到主屏幕</div><div class="rd">安装后从桌面图标秒开启动页进入后台</div></div><button type="button" class="btn b s" id="pwaInstallBtn">安装应用</button></div>
+      <div class="row"><div><div class="rl">PWA 安装</div><div class="rd">后台已内置 PWA，可安装到手机/电脑桌面，全屏运行</div></div><button type="button" class="btn b s" id="pwaInstallBtn">安装应用</button></div>
     </div>
     
     <div class="card" style="border-color:#fecaca;margin-bottom:0;">
@@ -5207,14 +4221,40 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="mo" id="modal"><div class="mbox"><div class="mh"><h3 id="modalTitle">记录详情</h3><button class="mcl" id="modalClose">×</button></div><div class="mb" id="modalBody"></div></div></div>
 <script>
 /* ========== 管理后台前端逻辑 ==========
- * 页面：overview / traffic / live / blocks / settings
- * 实时监控：优先 WebSocket，失败回退轮询；离开页清空本页累计
+ * 页面：overview / traffic / blocks / settings
  * 时间：fmtBeijing → Asia/Shanghai；流量图大跨度按周/月聚合
+ * 上下行口径：下行=上游→本机，上行=本机→客户端
  */
-const state={port:0,labels:{},ovRange:'today',tfRange:'today',tfFrom:'',tfTo:''};
+const state={port:0,labels:{},ovRange:'today',ovFrom:'',ovTo:'',tfRange:'today',tfFrom:'',tfTo:'',schemaVersion:2,cfgCache:null};
 let ovTrendData=[];
 
 function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
+/* 字节坐标轴：先按数据最大值定一个统一单位，再在该单位下取整齐步长，
+   避免 Chart.js 自动步长造成「1000 B / 1.95 KB」这类同轴混排 */
+function bytesAxis(maxVal, tickCount){
+  const units=[1,1024,1048576,1073741824,1099511627776];
+  const names=['B','KB','MB','GB','TB'];
+  let hi=0;
+  while(hi<units.length-1 && maxVal/units[hi] >= 1024) hi++;
+  const scale=units[hi], label=names[hi];
+  const top=Math.max(maxVal,1)/scale;
+  const ticks=Math.max(2, Math.min(8, tickCount||5));
+  const raw=top/ticks;
+  const mag=Math.pow(10, Math.floor(Math.log10(raw||1)));
+  const norm=raw/(mag||1);
+  const stepN=(norm<=1?1:(norm<=2?2:(norm<=5?5:10)))*mag;
+  const fmt=n=>{
+    // 整数直接输出，小数保留 1~2 位，去掉尾随 0
+    const s=(Number.isInteger(n)? String(n) : (n>=10? n.toFixed(1) : n.toFixed(2)));
+    return (s.indexOf('.')>=0 ? s.replace(/0+$/,'').replace(/\.$/,'') : s) + ' ' + label;
+  };
+  return {
+    beginAtZero:true,
+    max: Math.ceil(top/stepN)*stepN*scale,
+    grid:{borderDash:[4,4]},
+    ticks:{stepSize: stepN*scale, maxTicksLimit: ticks+1, callback:v=>fmt(v/scale)}
+  };
+}
 /**
  * 统一按北京时间展示。
  * @param {string|Date} iso
@@ -5270,158 +4310,13 @@ function countryLabel(code){  if(!code) return '未知';
   return fallback[c] || code;
 }
 
-const pageTitles={overview:'概览',traffic:'流量请求',live:'实时监控',blocks:'拦截记录',settings:'网关设置'};
-/* ----- 实时监控会话 -----
- * liveSession.map：本页停留期间累计的连接（含已结束）
- * liveMode：ws | poll | idle；离开页 stopLiveTimers + resetLiveSession
- */
-let liveTimer=null;
-let liveTickTimer=null;
-let liveWS=null;
-let liveWSRetry=null;
+const pageTitles={overview:'概览',traffic:'流量请求',blocks:'拦截记录',settings:'网关设置'};
 let blocksTimer=null; // 拦截记录页轮询：停留期间每 5s 自动刷新，切走即清除
-let liveMode='idle'; // ws | poll | idle
-const liveSession={map:new Map(), connPage:1, ipPage:1, pageSize:20};
-function resetLiveSession(){liveSession.map.clear();liveSession.connPage=1;liveSession.ipPage=1}
-function setLiveHint(t){ const el=document.getElementById('lvRefreshHint'); if(el) el.textContent=t; }
-function stopLiveTimers(){
-  if(liveTimer){clearInterval(liveTimer);liveTimer=null}
-  if(liveTickTimer){clearInterval(liveTickTimer);liveTickTimer=null}
-  if(liveWSRetry){clearTimeout(liveWSRetry);liveWSRetry=null}
-  if(liveWS){
-    try{ liveWS.onclose=null; liveWS.onerror=null; liveWS.onmessage=null; liveWS.close(); }catch(e){}
-    liveWS=null;
-  }
-  liveMode='idle';
-}
-/** 进行中连接本地推算时长：只改 DOM 文案，避免整表 innerHTML */
-function tickLiveDurations(){
-  if(document.hidden) return;
-  const now=Date.now();
-  liveSession.map.forEach((v)=>{
-    if(!v||!v.active||!v.start) return;
-    const t=new Date(v.start).getTime();
-    if(isNaN(t)) return;
-    v.duration_ms=Math.max(0, now-t);
-  });
-  // 连接时间列（相对时间）+ title 时长
-  document.querySelectorAll('#lvConnTable tr.live-row[data-live-id]').forEach(tr=>{
-    const id=tr.getAttribute('data-live-id');
-    const row=liveSession.map.get(id);
-    if(!row||!row.active) return;
-    const agoEl=tr.querySelector('.lv-ago');
-    if(agoEl){
-      const next=fmtAgo(row.start);
-      if(agoEl.textContent!==next) agoEl.textContent=next;
-      agoEl.title=fmtBeijing(row.start,'full')+' · 时长 '+fmtDur(row.duration_ms||0);
-    }
-  });
-}
-/** 合并一帧监控数据：活跃覆盖；已结束仅更新本页已见 id；并估算单连接速率 */
-function applyLiveData(d){
-  if(!d||typeof d!=='object') return;
-  document.getElementById('lvActive').textContent=(d.active||0).toLocaleString();
-  document.getElementById('lvDown').textContent=fmtRate(d.down_bps||0);
-  document.getElementById('lvUp').textContent=fmtRate(d.up_bps||0);
-  const now=Date.now();
-  (d.connections||[]).forEach(c=>{
-    if(!c||!c.id) return;
-    const prev=liveSession.map.get(c.id);
-    let downRate=0, upRate=0;
-    if(prev && prev._sampleAt && c.active){
-      const dt=(now-(prev._sampleAt||now))/1000;
-      if(dt>0.05){
-        downRate=Math.max(0, ((c.down||0)-(prev.down||0))/dt);
-        upRate=Math.max(0, ((c.up||0)-(prev.up||0))/dt);
-      }else{
-        downRate=prev.downRate||0;
-        upRate=prev.upRate||0;
-      }
-    }else if(prev && !c.active){
-      downRate=0; upRate=0;
-    }
-    if(c.active){
-      let dur=c.duration_ms||0;
-      if(c.start){
-        const t=new Date(c.start).getTime();
-        if(!isNaN(t)) dur=Math.max(dur, now-t);
-      }
-      liveSession.map.set(c.id,{...c, duration_ms:dur, downRate, upRate, _sampleAt:now});
-    }else if(prev){
-      liveSession.map.set(c.id,{
-        ...prev, ...c, active:false, downRate:0, upRate:0,
-        up:Math.max(prev.up||0,c.up||0),
-        down:Math.max(prev.down||0,c.down||0),
-        duration_ms:Math.max(prev.duration_ms||0,c.duration_ms||0),
-        _sampleAt:now
-      });
-    }
-  });
-  const serverIds=new Set((d.connections||[]).map(c=>c.id));
-  liveSession.map.forEach((v,id)=>{
-    if(v.active && !serverIds.has(id)){
-      liveSession.map.set(id,{...v,active:false,downRate:0,upRate:0,ended:v.ended||fmtBeijing(new Date(),'full')});
-    }
-  });
-  renderLiveTables();
-}
-function startLivePoll(){
-  if(liveMode==='poll' && liveTimer) return;
-  liveMode='poll';
-  setLiveHint('轮询 · 约 0.8 秒');
-  loadLive();
-  if(liveTimer) clearInterval(liveTimer);
-  liveTimer=setInterval(()=>{if(!document.hidden)loadLive()},800);
-}
-function connectLiveWS(){
-  if(!window.WebSocket){ startLivePoll(); return; }
-  // 已有连接在连或已打开则不重复
-  if(liveWS && (liveWS.readyState===WebSocket.CONNECTING || liveWS.readyState===WebSocket.OPEN)) return;
-  const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
-  const url = proto + '//' + location.host + '/admin/api/live/ws';
-  setLiveHint('WebSocket 连接中…');
-  let ws;
-  try{ ws = new WebSocket(url); }catch(e){ startLivePoll(); return; }
-  liveWS = ws;
-  let opened=false;
-  ws.onopen = ()=>{
-    opened=true;
-    liveMode='ws';
-    setLiveHint('WebSocket · 实时');
-    // WS 模式下仍本地推算时长，秒数更顺滑
-    if(liveTimer){ clearInterval(liveTimer); liveTimer=null; }
-  };
-  ws.onmessage = (ev)=>{
-    try{
-      const d = JSON.parse(ev.data);
-      applyLiveData(d);
-    }catch(e){}
-  };
-  ws.onerror = ()=>{};
-  ws.onclose = ()=>{
-    liveWS=null;
-    if(liveMode==='idle') return; // 已离开监控页
-    // 断线：先试一次 HTTP，再退避重连 WS
-    setLiveHint('已断开，重连中…');
-    loadLive();
-    if(liveWSRetry) clearTimeout(liveWSRetry);
-    liveWSRetry=setTimeout(()=>{
-      if(liveMode==='idle') return;
-      connectLiveWS();
-    }, 1500);
-    // 重连前短暂轮询兜底
-    if(!liveTimer){
-      liveMode='poll';
-      liveTimer=setInterval(()=>{if(!document.hidden)loadLive()},800);
-    }
-  };
-}
 function switchTab(id){
   document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));
   document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));
   document.getElementById('pt').textContent=pageTitles[id]||'';
   if(window.innerWidth<=1024)closeSidebar();
-  stopLiveTimers();
   if(blocksTimer){clearInterval(blocksTimer);blocksTimer=null}
   if(id==='overview')loadOverview();
   if(id==='traffic')loadTraffic();
@@ -5429,13 +4324,6 @@ function switchTab(id){
     loadBlocks();
     // 停留在拦截记录页期间自动轮询，新拦截事件无需手动刷新即实时上屏
     blocksTimer=setInterval(()=>{if(!document.hidden)loadBlocks()},5000);
-  }
-  if(id==='live'){
-    resetLiveSession();
-    liveTickTimer=setInterval(tickLiveDurations,500);
-    connectLiveWS();
-  } else {
-    resetLiveSession();
   }
 }
 function openSidebar(){document.getElementById('sb').classList.add('open');document.getElementById('sbMask').classList.add('on')}
@@ -5445,15 +4333,6 @@ document.getElementById('sbMask').addEventListener('click',closeSidebar);
 
 document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
 document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
-// 连接表事件委托：避免每次 render 重新绑大量监听
-document.getElementById('lvConnTable')?.addEventListener('click',e=>{
-  const closeBtn=e.target.closest('[data-close-id]');
-  if(closeBtn){ closeLiveConn(closeBtn.getAttribute('data-close-id'), e); return; }
-  const tr=e.target.closest('tr.live-row[data-live-id]');
-  if(!tr) return;
-  const row=liveSession.map.get(tr.getAttribute('data-live-id'));
-  if(row) showLiveDetail(row);
-});
 
 function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portChip').textContent=':'+p}
 
@@ -5462,53 +4341,134 @@ async function loadConfig(){
     const r=await fetch('/admin/api/config',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const c=await r.json();applyPort(c.effective_port);
-    document.getElementById('chinaOnly').checked=!!c.china_only;document.getElementById('pwaToggle').checked=!!c.pwa;state.pwaOn=!!c.pwa;
+    document.getElementById('chinaOnly').checked=!!c.china_only;
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');document.getElementById('autoBan').checked=!!c.auto_ban;
     document.getElementById('rateLimit').value=c.rate_limit||0;document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
   }catch(e){console.error('loadConfig error:',e)}
 }
 
-let miniTrendChart=null,reqChart=null,byteChart=null,hostChart=null;
+let miniTrendChart=null,miniByteChart=null,reqChart=null,byteChart=null,hostChart=null;
 let trafficTrendData=[];
+
+/* 概览区间边界：与流量页同一套口径（北京时间，单日=分时，多日=按天） */
+function ovRangeBounds(){
+  const tStr=nowBeijingDateStr();
+  let from=null,to=tStr;
+  const r=state.ovRange;
+  if(r==='today'){from=tStr}
+  else if(r==='yesterday'){const y=beijingDateStrBefore(1);from=y;to=y}
+  else if(r==='7d'){from=beijingDateStrBefore(6)}
+  else if(r==='30d'){from=beijingDateStrBefore(29)}
+  else if(r==='all'){from=null;to=null}
+  else if(r==='custom'){
+    from=state.ovFrom||null;to=state.ovTo||null;
+    if(from&&to&&from>to){const x=from;from=to;to=x}
+  }
+  return {from,to,today:tStr};
+}
+/* 概览趋势数据按区间过滤 */
+function ovFilteredTrend(){
+  const {from,to}=ovRangeBounds();
+  return (ovTrendData||[]).filter(d=>{
+    if(!d||!d.date)return false;
+    if(from&&d.date<from)return false;
+    if(to&&d.date>to)return false;
+    return true;
+  }).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
+}
 
 function updateOvStats() {
   if (!ovTrendData.length) return;
-  const localISOTime = nowBeijingDateStr();
-  const bjNow = new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Shanghai'}));
-  const y = new Date(bjNow); y.setDate(bjNow.getDate()-1);
-  const yISOTime = fmtBeijing(y,'date');
-  const d7 = new Date(bjNow); d7.setDate(bjNow.getDate()-6);
-  const d7Str = fmtBeijing(d7,'date');
-  const d30 = new Date(bjNow); d30.setDate(bjNow.getDate()-29);
-  const d30Str = fmtBeijing(d30,'date');
-
-  let filterFn = () => true;
-  if (state.ovRange === 'today') filterFn = d => d.date === localISOTime;
-  else if (state.ovRange === 'yesterday') filterFn = d => d.date === yISOTime;
-  else if (state.ovRange === '7d') filterFn = d => d.date >= d7Str;
-  else if (state.ovRange === '30d') filterFn = d => d.date >= d30Str;
-  
-  const filtered = ovTrendData.filter(filterFn);
-  let reqs = 0, bytes = 0, up = 0, down = 0, bTotal = 0;
+  const {from,to}=ovRangeBounds();
+  const filtered = ovFilteredTrend();
+  let reqs = 0, bytes = 0, bTotal = 0;
   filtered.forEach(d => {
     reqs += d.requests || 0;
     bytes += d.bytes || 0;
-    up += d.up_bytes || 0;
-    down += d.down_bytes || 0;
+    // 优先用后端汇总字段（五种拦截之和）；旧数据无 blocked 字段时回退老两字段
     bTotal += (d.blocked != null) ? d.blocked : ((d.blocked_cn||0)+(d.blocked_whitelist||0));
   });
-  // 旧数据无 up/down 时，把合计当作下行
-  if (down === 0 && up === 0 && bytes > 0) down = bytes;
-  
+
   const days = filtered.length || 1;
   document.getElementById('ovReq').textContent = reqs.toLocaleString();
-  const ovDown = document.getElementById('ovDown');
-  const ovUp = document.getElementById('ovUp');
-  if (ovDown) ovDown.textContent = fmtBytes(down);
-  if (ovUp) ovUp.textContent = fmtBytes(up);
+  document.getElementById('ovBytes').textContent = fmtBytes(bytes);
   document.getElementById('ovAvgReq').textContent = Math.round(reqs/days).toLocaleString();
   document.getElementById('ovAvgBytes').textContent = fmtBytes(Math.round(bytes/days));
   document.getElementById('ovBlocked').textContent = bTotal.toLocaleString();
+
+  // 标题/说明随区间变化（单日给分时提示，多日给天数）
+  const single = !!from && from===to;
+  const dayName = state.ovRange==='yesterday' ? '昨日' : '今日';
+  // 多日：跨度按区间自然日算（与图上 X 轴一致），无数据的天按 0 计
+  let spanDays = filtered.length;
+  if(!single && from && to && to>=from){
+    const a=new Date(from+'T00:00:00'), b=new Date(to+'T00:00:00');
+    spanDays = Math.min(400, Math.round((b-a)/86400000)+1);
+  }
+  const spanHint = single ? (dayName + ' 分时') : (spanDays ? ('共 ' + spanDays + ' 天') : '暂无数据');
+  document.getElementById('ovReqDesc').textContent = single ? (dayName + ' 00:00–23:00 各时段请求数（北京时间）') : ('区间内每日请求次数 · ' + spanHint);
+  document.getElementById('ovByteDesc').textContent = single ? (dayName + ' 00:00–23:00 各时段上下行流量（上行=本机→客户端，下行=上游→本机）') : ('区间内每日上下行流量 · ' + spanHint);
+}
+
+/* 概览趋势：单日→0~23 点；多日→按天（过长则按周/月汇总） */
+function ovChartSeries(){
+  const {from,to}=ovRangeBounds();
+  const filtered=ovFilteredTrend();
+  const single = !!from && from===to;
+  const labels=[],reqs=[],ups=[],downs=[];
+  if(single){
+    const day=filtered[0]||{};
+    const hours=day.hours||{}, hourUp=day.hour_up_bytes||{}, hourDown=day.hour_down_bytes||{};
+    const hasHourly = Object.keys(hours).length || Object.keys(hourUp).length;
+    if(hasHourly){
+      for(let h=0;h<24;h++){
+        const k=String(h).padStart(2,'0');
+        labels.push(k+':00'); reqs.push(hours[k]||0);
+        ups.push(hourUp[k]||0); downs.push(hourDown[k]||0);
+      }
+      return {labels,reqs,ups,downs,gran:'hour'};
+    }
+    // 兼容：拿不到分时明细时（老数据/极简响应），退化为单点当日汇总，避免全 0 空图
+    labels.push((day.date||from||'').slice(5)||'当日');
+    reqs.push(day.requests||0);
+    ups.push(day.up_bytes||0); downs.push(day.down_bytes||0);
+    return {labels,reqs,ups,downs,gran:'day'};
+  }
+  const byDate={}; filtered.forEach(d=>{byDate[d.date]=d});
+  let days=Object.keys(byDate).sort();
+  // 补全区间内每个自然日（无数据填 0），否则「近 7 天」只有 1 天有记录时
+  // 图上只剩一个孤立圆点，看不出趋势
+  if(from&&to&&to>=from){
+    const a=new Date(from+'T00:00:00'), bEnd=new Date(to+'T00:00:00');
+    const cap=400; // 防止自定义超大区间生成过多点
+    let n=0; const full=[];
+    for(let t=new Date(a); t<=bEnd && n<cap; t.setDate(t.getDate()+1), n++) full.push(localDateStr(new Date(t)));
+    if(full.length) days=full;
+  }
+  if(!days.length) return {labels:[],reqs:[],ups:[],downs:[],gran:'day'};
+  const gran=pickGranularity(days.length);
+  if(gran==='day'){
+    days.forEach(date=>{
+      const d=byDate[date]||{};
+      labels.push(date); reqs.push(d.requests||0);
+      ups.push(d.up_bytes||0); downs.push(d.down_bytes||0);
+    });
+    return {labels,reqs,ups,downs,gran};
+  }
+  const buckets={},order=[];
+  days.forEach(date=>{
+    const key=gran==='week'?weekStartKey(date):monthKey(date);
+    if(!buckets[key]){buckets[key]={req:0,up:0,down:0};order.push(key);}
+    const d=byDate[date]||{};
+    buckets[key].req+=(d.requests||0);
+    buckets[key].up+=(d.up_bytes||0);
+    buckets[key].down+=(d.down_bytes||0);
+  });
+  order.forEach(key=>{
+    labels.push(key); reqs.push(buckets[key].req);
+    ups.push(buckets[key].up); downs.push(buckets[key].down);
+  });
+  return {labels,reqs,ups,downs,gran};
 }
 
 async function loadOverview(){
@@ -5519,31 +4479,110 @@ async function loadOverview(){
     const t=await r.json();
     document.getElementById('uniqueIPs').textContent=(t.unique_ips!=null?t.unique_ips:Object.keys(t.ip_counts||{}).length).toLocaleString();
     ovTrendData = t.trend || [];
-    renderMiniTrend(ovTrendData);
-    updateOvStats();
+    refreshOverview();
     
     // 概览只需最新几条拦截，limit=5 大幅减少轮询传输
     const r2=await fetch('/admin/api/blocks?limit=5',{cache:'no-store'});
     if(r2.ok){const b=await r2.json();renderOvBlocks(b.items||[]);}
     
     const r3=await fetch('/admin/api/config',{cache:'no-store'});
-    if(r3.ok){const c=await r3.json();renderSysInfo(c, t.uptime_sec||0);}
+    if(r3.ok){const c=await r3.json();state.cfgCache=c;}
+    let sys=null;
+    try{
+      const r4=await fetch('/admin/api/system',{cache:'no-store'});
+      if(r4.ok) sys=await r4.json();
+    }catch(e){}
+    renderSysInfo(sys, state.cfgCache||{}, sys&&sys.uptime_sec!=null?sys.uptime_sec:(t.uptime_sec||0));
   }catch(e){console.error('loadOverview error:',e)}
 }
 
-function renderSysInfo(c, uptime){
-  let fw = "已开启"; if(!c.ban_list?.length && !c.china_only && !c.rate_limit) fw="未启用";
-  const html = `
-  <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">运行时长</span><span>${Math.floor(uptime/3600)} 小时</span></div>
-  <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">访问防护</span><span style="color:var(--ok)">${fw}</span></div>
-  <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee"><span style="color:#94a3b8">域名白名单</span><span>${c.whitelist?.length||0} 个</span></div>
-  `;
-  document.getElementById('sysInfo').innerHTML = html;
+/* 系统信息卡片：进程运行态 + 网关配置 + 数据存储，三段分组展示 */
+function renderSysInfo(sys, c, uptime){
+  const box=document.getElementById('sysInfo');
+  if(!box) return;
+  const up = uptime!=null ? uptime : (sys && sys.uptime_sec) || 0;
+  const d=Math.floor(up/86400), h=Math.floor(up%86400/3600), m=Math.floor(up%3600/60);
+  const upStr = d>0 ? (d+' 天 '+h+' 小时') : (h>0 ? (h+' 小时 '+m+' 分') : (m+' 分钟'));
+
+  const kv=(k,v,color)=>`<div class="kvr"><span class="kvl">${k}</span><span class="kvv"${color?' style="color:'+color+'"':''}>${v}</span></div>`;
+  const group=(title,rows)=>{
+    // 奇数项补一个空白格，避免最后一行左侧单元格空出灰色底
+    const cells = rows.length%2 ? rows.concat(['<div class="kvr" style="background:#fff"></div>']) : rows;
+    return `<div class="svg-title">${title}</div><div class="sv-list">${cells.join('')}</div>`;
+  };
+
+  const sw = sys || {};
+  // 运行态
+  const run=[
+    kv('运行时长', upStr),
+    kv('版本', sw.version ? ('v'+esc(sw.version)) : '—'),
+    kv('监听端口', sw.port!=null ? (':'+sw.port) : ('—')),
+    kv('协程 / CPU', (sw.goroutines!=null? sw.goroutines : '—') + ' / ' + (sw.num_cpu!=null? sw.num_cpu : '—')),
+    kv('Go 运行时', (sw.go_version||'—') + (sw.os_arch? ' · '+sw.os_arch : '')),
+  ];
+  // 内存
+  const memPct = (sw.mem_sys && sw.mem_heap) ? Math.min(100, Math.round(sw.mem_heap/sw.mem_sys*100)) : 0;
+  const mem=[
+    kv('堆内存', fmtBytes(sw.mem_heap||0) + (sw.mem_heap? ` <span style="color:var(--t3);font-size:12px">(${memPct}% of ${fmtBytes(sw.mem_sys||0)})</span>` : '')),
+    kv('栈内存', fmtBytes(sw.mem_stack||0)),
+    kv('GC 次数', (sw.gc_count!=null? sw.gc_count : '—') + (sw.gc_pause_last? ` · 上次 ${(sw.gc_pause_last/1e6).toFixed(2)} ms` : '')),
+  ];
+  // 网关配置
+  const fw = (!c.ban_list?.length && !c.china_only && !c.rate_limit && !c.auto_ban) ? '未启用' : '已开启';
+  const fwColor = fw==='未启用' ? 'var(--t3)' : 'var(--ok)';
+  const cfg=[
+    kv('访问防护', fw, fwColor),
+    kv('域名白名单', (c.whitelist?.length||0) + ' 个'),
+    kv('IP 黑名单', (c.ban_list?.length||0) + ' 个'),
+    kv('限流', c.rate_limit ? (c.rate_limit+' 次/分钟') : '未设置'),
+    kv('仅限中国 IP', c.china_only ? '是' : '否'),
+    kv('UA 限制', (c.allowed_uas?.length||0) ? ((c.allowed_uas.length)+' 条规则') : '不限制'),
+    kv('在线会话', (sw.logins!=null? sw.logins : '—') + ' 个'),
+  ];
+  // 数据与磁盘
+  const diskFreePct = (sw.disk_total) ? Math.max(0, Math.round(sw.disk_free/sw.disk_total*100)) : 0;
+  const data=[
+    kv('数据库', fmtBytes(sw.db_size||0)),
+    kv('累计请求', (sw.total_requests!=null? Number(sw.total_requests).toLocaleString() : '—')),
+    kv('累计流量', fmtBytes(sw.total_bytes||0)),
+    kv('独立 IP', sw.unique_ips!=null? Number(sw.unique_ips).toLocaleString() : '—'),
+    kv('放通率', sw.allow_rate!=null? (sw.allow_rate.toFixed(1)+'%') : '—'),
+    kv('磁盘剩余', fmtBytes(sw.disk_free||0) + (sw.disk_total? ` <span style="color:var(--t3);font-size:12px">/ ${fmtBytes(sw.disk_total)}（剩 ${diskFreePct}%）</span>` : '')),
+  ];
+
+  box.innerHTML = group('运行状态', run) + group('内存 / 存储', mem) + group('网关配置', cfg) + group('数据统计', data);
 }
 
-function renderMiniTrend(trend){const cv=document.getElementById('miniTrendChart');if(!cv || typeof Chart==='undefined')return;const data=(trend||[]).slice(-7);if(!data.length)return;const labels=data.map(d=>(d.date||'').slice(5)),reqs=data.map(d=>d.requests||0);
-if(miniTrendChart){miniTrendChart.data.labels=labels;miniTrendChart.data.datasets[0].data=reqs;miniTrendChart.update('none');return}
-miniTrendChart=new Chart(cv,{type:'line',data:{labels,datasets:[{label:'请求',data:reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,tension:0.35,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{borderDash:[4,4]}}}}})}
+/* 概览两张图共用：按当前区间渲染请求趋势 + 流量趋势（上下行） */
+function renderOvCharts(){
+  if(typeof Chart==='undefined') return;
+  const v=ovChartSeries();
+
+  // --- 请求趋势 ---
+  const cvReq=document.getElementById('miniTrendChart');
+  if(cvReq && v.labels.length){
+    const cfg={type:'line',data:{labels:v.labels.map(l=>fmtAxisLabel(l,v.gran)),datasets:[
+      {label:'请求',data:v.reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,tension:0.35,pointRadius:v.gran==='hour'?0:3}
+    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(v.labels,v.gran)}}},scales:{x:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:chartTickLimit(v.labels.length,v.gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
+    miniTrendChart=upsertChart(miniTrendChart,cvReq,cfg);
+  }
+
+  // --- 流量趋势（上下行合计，单条平滑曲线）---
+  const cvByte=document.getElementById('miniByteChart');
+  if(cvByte && v.labels.length){
+    const tot=v.ups.map((u,i)=>(u||0)+(v.downs[i]||0));
+    const cfgByte={type:'line',data:{labels:v.labels.map(l=>fmtAxisLabel(l,v.gran)),datasets:[
+      {label:'流量',data:tot,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.12)',borderWidth:2,fill:true,tension:0.4,pointRadius:v.gran==='hour'?0:3,pointHoverRadius:5}
+    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(v.labels,v.gran),label:c=>'流量：'+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:chartTickLimit(v.labels.length,v.gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
+    miniByteChart=upsertChart(miniByteChart,cvByte,cfgByte);
+  }
+}
+
+/* 概览区间切换后统一刷新（统计 + 两张图） */
+function refreshOverview(){
+  updateOvStats();
+  renderOvCharts();
+}
 
 // esc：HTML 转义，防 XSS
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -5560,15 +4599,21 @@ function renderOvBlocks(items){
 function localDateStr(d){
   return fmtBeijing(d instanceof Date ? d : new Date(d), 'date');
 }
+/* 按北京时间取「今天往前 n 天」的日期字符串 */
+function beijingDateStrBefore(days){
+  const now = new Date();
+  const bj = new Date(now.getTime() + (now.getTimezoneOffset() + 480) * 60000);
+  bj.setDate(bj.getDate() - days);
+  return bj.getFullYear() + '-' + String(bj.getMonth()+1).padStart(2,'0') + '-' + String(bj.getDate()).padStart(2,'0');
+}
 function dateRangeBounds(){
-  const today=new Date();
   const tStr=nowBeijingDateStr();
   let from=null,to=tStr;
   const r=state.tfRange;
   if(r==='today'){from=tStr}
-  else if(r==='7d'){const d=new Date(today);d.setDate(today.getDate()-6);from=localDateStr(d)}
-  else if(r==='30d'){const d=new Date(today);d.setDate(today.getDate()-29);from=localDateStr(d)}
-  else if(r==='365d'){const d=new Date(today);d.setDate(today.getDate()-364);from=localDateStr(d)}
+  else if(r==='yesterday'){const y=beijingDateStrBefore(1);from=y;to=y}
+  else if(r==='7d'){from=beijingDateStrBefore(6)}
+  else if(r==='30d'){from=beijingDateStrBefore(29)}
   else if(r==='all'){from=null;to=null}
   else if(r==='custom'){
     from=state.tfFrom||null;to=state.tfTo||null;
@@ -5600,8 +4645,8 @@ function pickGranularity(dayCount){
 }
 function buildTrafficView(trend){
   const filtered=filterTrendByRange(trend);
-  const {from,to,today}=dateRangeBounds();
-  const isToday = state.tfRange === 'today' || (state.tfRange === 'custom' && from && to && from === to && from === today);
+  const {from,to}=dateRangeBounds();
+  const isToday = !!from && from === to;
   const labels=[],reqs=[],bytes=[],ups=[],downs=[];
   const ipMap={},ctryMap={},hostMap={};
   let totalReq=0,totalBytes=0,totalUp=0,totalDown=0,blocked=0,rawDayCount=0,gran='hour';
@@ -5613,19 +4658,19 @@ function buildTrafficView(trend){
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
     Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
   });
-  if(totalDown===0&&totalUp===0&&totalBytes>0) totalDown=totalBytes;
   if(isToday){
     gran='hour';
-    const day=filtered.find(d=>d.date===today)||filtered[0]||{hours:{},hour_bytes:{},hour_up_bytes:{},hour_down_bytes:{}};
+    const byDate={}; filtered.forEach(d=>{byDate[d.date]=d});
+    const day=byDate[from]||filtered[0]||{hours:{},hour_bytes:{}};
     const hours=day.hours||{}, hourBytes=day.hour_bytes||{};
     const hourUp=day.hour_up_bytes||{}, hourDown=day.hour_down_bytes||{};
     for(let h=0;h<24;h++){
       const key=String(h).padStart(2,'0');
-      labels.push(key+':00');
-      reqs.push(hours[key]||0);
-      bytes.push(hourBytes[key]||0);
-      ups.push(hourUp[key]||0);
-      downs.push(hourDown[key]||0);
+      const up=hourUp[key]||0, down=hourDown[key]||0;
+      labels.push(key+':00'); reqs.push(hours[key]||0);
+      // 真实分时：优先上下行明细，缺失时回落到合计
+      ups.push(up); downs.push(down);
+      bytes.push((up||down)?(up+down):(hourBytes[key]||0));
     }
     rawDayCount=1;
   }else{
@@ -5638,7 +4683,11 @@ function buildTrafficView(trend){
     rawDayCount=days.length||1;
     gran=pickGranularity(rawDayCount);
     if(gran==='day'){
-      days.forEach(date=>{ const d=byDate[date]||{}; labels.push(date); reqs.push(d.requests||0); bytes.push(d.bytes||0); ups.push(d.up_bytes||0); downs.push(d.down_bytes||0); });
+      days.forEach(date=>{
+        const d=byDate[date]||{};
+        labels.push(date); reqs.push(d.requests||0); bytes.push(d.bytes||0);
+        ups.push(d.up_bytes||0); downs.push(d.down_bytes||0);
+      });
     }else{
       const buckets={}, order=[];
       days.forEach(date=>{
@@ -5648,7 +4697,10 @@ function buildTrafficView(trend){
         buckets[key].req+=(d.requests||0); buckets[key].bytes+=(d.bytes||0);
         buckets[key].up+=(d.up_bytes||0); buckets[key].down+=(d.down_bytes||0);
       });
-      order.forEach(key=>{ labels.push(key); reqs.push(buckets[key].req); bytes.push(buckets[key].bytes); ups.push(buckets[key].up); downs.push(buckets[key].down); });
+      order.forEach(key=>{
+        labels.push(key); reqs.push(buckets[key].req); bytes.push(buckets[key].bytes);
+        ups.push(buckets[key].up); downs.push(buckets[key].down);
+      });
     }
   }
   const hostTop=Object.entries(hostMap).sort((a,b)=>b[1]-a[1]).slice(0,12);
@@ -5664,21 +4716,25 @@ function applyTrafficView(){
   const v=buildTrafficView(trafficTrendData);
   document.getElementById('tfReq').textContent=v.totalReq.toLocaleString();
   document.getElementById('tfBytes').textContent=fmtBytes(v.totalBytes);
+  const elUp=document.getElementById('tfUp'), elDown=document.getElementById('tfDown');
+  if(elUp) elUp.textContent=fmtBytes(v.totalUp);
+  if(elDown) elDown.textContent=fmtBytes(v.totalDown);
   document.getElementById('tfIPs').textContent=v.ipTotalUnique.toLocaleString();
   document.getElementById('tfBlocked').textContent=v.blocked.toLocaleString();
-  const granHint={hour:'今日分时段',day:'共 '+v.dayCount+' 天',week:'共 '+v.dayCount+' 天 · 按周汇总',month:'共 '+v.dayCount+' 天 · 按月汇总'};
+  const dayName=v.isToday?(state.tfRange==='yesterday'?'昨日':'今日'):'';
+  const granHint={hour:dayName+'分时段',day:'共 '+v.dayCount+' 天',week:'共 '+v.dayCount+' 天 · 按周汇总',month:'共 '+v.dayCount+' 天 · 按月汇总'};
   document.getElementById('tfReqHint').textContent=granHint[v.gran]||('共 '+v.dayCount+' 天');
-  document.getElementById('tfBytesHint').textContent='下行 '+fmtBytes(v.totalDown||0)+' · 上行 '+fmtBytes(v.totalUp||0);
+  document.getElementById('tfBytesHint').textContent=v.isToday?(dayName+'真实分时流量 · 上行+下行合计'):('日均 '+fmtBytes(Math.round(v.totalBytes/(v.dayCount||1)))+' · 上行+下行合计');
   const titleMap={hour:['请求量趋势（分时）','流量消耗趋势（分时）'],day:['请求量趋势','流量消耗趋势'],week:['请求量趋势（按周）','流量消耗趋势（按周）'],month:['请求量趋势（按月）','流量消耗趋势（按月）']};
-  const descMap={hour:['今天 00:00–23:00 各时段请求数（北京时间）','今天 00:00–23:00 各时段真实流量（北京时间）'],day:['筛选区间内每日请求次数（北京时间）','筛选区间内每日上下行流量（北京时间）'],week:['区间超过 60 天，已按周汇总','区间超过 60 天，已按周汇总流量'],month:['区间超过 180 天，已按月汇总','区间超过 180 天，已按月汇总流量']};
+  const descMap={hour:[dayName+' 00:00–23:00 各时段请求数（北京时间）',dayName+' 00:00–23:00 各时段上下行流量（上行=本机→客户端，下行=上游→本机）'],day:['筛选区间内每日请求次数（北京时间）','筛选区间内每日上下行流量（下行=上游→本机，上行=本机→客户端）'],week:['区间超过 60 天，已按周汇总','区间超过 60 天，已按周汇总流量'],month:['区间超过 180 天，已按月汇总','区间超过 180 天，已按月汇总流量']};
   const tt=titleMap[v.gran]||titleMap.day, dd=descMap[v.gran]||descMap.day;
   document.getElementById('tfReqTitle').textContent=tt[0];
   document.getElementById('tfReqDesc').textContent=dd[0];
   document.getElementById('tfByteTitle').textContent=tt[1];
   document.getElementById('tfByteDesc').textContent=dd[1];
-  document.getElementById('tfHostDesc').textContent=v.isToday?'今日访问量最高的上游主机':'当前范围内访问量最高的上游主机';
+  document.getElementById('tfHostDesc').textContent=v.isToday?(dayName+'访问量最高的上游主机'):'当前范围内访问量最高的上游主机';
   renderReqChart(v.labels,v.reqs,v.gran);
-  renderByteChart(v.labels,v.downs||v.bytes,v.ups||[],v.gran);
+  renderByteChart(v.labels,v.ups,v.downs,v.gran);
   renderHostChart(v.hostTop);
   renderIP(v.ipMap,{},v.ipTotalUnique,v.ipTopN);
   renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN);
@@ -5690,15 +4746,9 @@ async function loadTraffic(){
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
     if(t.country_labels) state.labels = t.country_labels;
+    state.schemaVersion = (t.schema_version!=null? t.schema_version : 2);
     trafficTrendData = t.trend || [];
     // 自定义日期输入默认最近 7 天
-    if(!state.tfFrom||!state.tfTo){
-      const today=new Date();
-      const d7=new Date(today);d7.setDate(today.getDate()-6);
-      const elF=document.getElementById('tfFrom'),elT=document.getElementById('tfTo');
-      if(elF&&!elF.value) elF.value=localDateStr(d7);
-      if(elT&&!elT.value) elT.value=localDateStr(today);
-    }
     applyTrafficView();
   }catch(e){console.error('loadTraffic error:',e)}
 }
@@ -5744,27 +4794,29 @@ function renderReqChart(labels,data,gran){
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  const cfg={type:'bar',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:gran==='hour'?'rgba(16,185,129,0.75)':'rgba(16,185,129,0.65)',borderWidth:1,borderRadius:dense?2:4,maxBarThickness:dense?10:28}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
+  const cfg={type:'line',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'请求数：'+Number(c.parsed.y||0).toLocaleString()}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
-function renderByteChart(labels,downData,upData,gran){
+function renderByteChart(labels,ups,downs,gran){
   const cv=document.getElementById('byteChart');if(!cv||typeof Chart==='undefined')return;
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  const pr=dense||gran==='hour'?0:(labels.length>20?2:3);
+  // 上下行合并展示：total = 上行 + 下行，一条平滑曲线
+  const tot=(labels||[]).map((_,i)=>((ups&&ups[i])||0)+((downs&&downs[i])||0));
   const cfg={type:'line',data:{labels:labs,datasets:[
-    {label:'下行',data:downData||[],borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.12)',fill:true,tension:0.3,pointRadius:pr,borderWidth:2,pointHoverRadius:4},
-    {label:'上行',data:upData||[],borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.08)',fill:true,tension:0.3,pointRadius:pr,borderWidth:2,pointHoverRadius:4}
-  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:true,position:'top'},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>c.dataset.label+' '+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{callback:v=>fmtBytes(v)}}}}};
+    {label:'流量',data:tot,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}
+  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'流量：'+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
 function renderHostChart(hostTop){
   const cv=document.getElementById('hostChart');if(!cv||typeof Chart==='undefined')return;
-  const labels=hostTop.map(([h])=>h.length>28?h.slice(0,26)+'…':h);
+  const labels=hostTop.map(([h])=>h.length>22?h.slice(0,20)+'…':h);
   const data=hostTop.map(([,n])=>n);
   if(!labels.length){labels.push('暂无数据');data.push(0)}
-  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(59,130,246,0.7)',borderRadius:4}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{font:{size:11}}}}}};
+  const dense=labels.length>24;
+  // 横向树状图：主机名较长，横条比折线更易读
+  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.75)',hoverBackgroundColor:'#8b5cf6',borderRadius:4,maxBarThickness:22}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:14,font:{size:11}}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
 }
 function renderIP(map,bytesMap,totalUnique,topN){
@@ -5794,30 +4846,6 @@ function renderRegion(map,totalUnique,topN){
   box.innerHTML=html;
 }
 
-async function showLiveDetail(c){
-  if(!c)return;
-  document.getElementById('modalTitle').textContent='连接详情';
-  const rows=[
-    ['状态',c.active?'进行中':'已结束',false],
-    ['IP',c.ip||'-',true],
-    ['地区',c.country_name||countryLabel(c.country)||'-',false],
-    ['上游主机',c.host||'-',true],
-    ['请求方法',c.method||'-',false],
-    ['访问路径',c.path||'-',true],
-    ['下行流量',fmtBytes(c.down||0),false],
-    ['上行流量',fmtBytes(c.up||0),false],
-    ['持续时长',fmtDur(c.duration_ms||0),false],
-    ['开始时间',fmtBeijing(c.start,'full'),false],
-  ];
-  if(c.ended) rows.push(['结束时间',fmtBeijing(c.ended,'full'),false]);
-  let html=rows.map(([k,v,m])=>'<div class="kv"><div class="kk">'+esc(k)+'</div><div class="kvv'+(m?' m':'')+'">'+esc(v)+'</div></div>').join('');
-  if(c.ip){
-    html+='<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn b s" id="liveToIpBtn">查看 IP 详情</button></div>';
-  }
-  document.getElementById('modalBody').innerHTML=html;
-  document.getElementById('modal').classList.add('on');
-  document.getElementById('liveToIpBtn')?.addEventListener('click',()=>showIPDetail(c.ip));
-}
 async function showIPDetail(ip){
   if(!ip)return;
   document.getElementById('modalTitle').textContent='IP 详情';
@@ -5834,119 +4862,6 @@ async function showIPDetail(ip){
   }catch(e){
     document.getElementById('modalBody').innerHTML='<div style="color:var(--d);font-size:13px">加载失败：'+esc(e.message||'未知错误')+'</div>';
   }
-}
-
-function fmtRate(b){if(!b||b<0)return '0 B/s';if(b<1024)return b+' B/s';if(b<1048576)return (b/1024).toFixed(1)+' KB/s';if(b<1073741824)return (b/1048576).toFixed(1)+' MB/s';return (b/1073741824).toFixed(2)+' GB/s'}
-function fmtDur(ms){ms=Math.max(0,Math.floor(ms||0));if(ms<1000)return ms+'ms';const s=Math.floor(ms/1000);if(s<60)return s+'s';const m=Math.floor(s/60),rs=s%60;if(m<60)return m+'m '+String(rs).padStart(2,'0')+'s';const h=Math.floor(m/60),rm=m%60;return h+'h '+String(rm).padStart(2,'0')+'m '+String(rs).padStart(2,'0')+'s'}
-/** 相对时间：几秒前 / 2分钟前 / 1小时前 */
-function fmtAgo(iso){
-  if(!iso) return '-';
-  const t=new Date(iso).getTime();
-  if(isNaN(t)) return '-';
-  const sec=Math.max(0,Math.floor((Date.now()-t)/1000));
-  if(sec<5) return '几秒前';
-  if(sec<60) return sec+'秒前';
-  if(sec<3600) return Math.floor(sec/60)+'分钟前';
-  if(sec<86400) return Math.floor(sec/3600)+'小时前';
-  return Math.floor(sec/86400)+'天前';
-}
-async function closeLiveConn(id, ev){
-  if(ev){ ev.stopPropagation(); ev.preventDefault(); }
-  if(!id) return;
-  try{
-    const r=await fetch('/admin/api/live/close?id='+encodeURIComponent(id),{method:'POST'});
-    const d=await r.json().catch(()=>({}));
-    if(!r.ok){ alert(d.error||'断开失败，该连接可能已结束'); return; }
-    const prev=liveSession.map.get(id);
-    if(prev) liveSession.map.set(id,{...prev,active:false,downRate:0,upRate:0,ended:fmtBeijing(new Date(),'full')});
-    renderLiveTables();
-  }catch(e){ alert('断开失败：网络异常，请稍后重试'); }
-}
-function livePagerHtml(prefix,page,total,pageSize){
-  const pages=Math.max(1,Math.ceil(total/pageSize));
-  const p=Math.min(Math.max(1,page),pages);
-  return `<span>共 ${total} 条 · 第 ${p}/${pages} 页</span><span style="display:flex;gap:8px">
-    <button type="button" class="btn g s" data-live-page="${prefix}" data-to="1" ${p<=1?'disabled':''}>首页</button>
-    <button type="button" class="btn g s" data-live-page="${prefix}" data-to="${p-1}" ${p<=1?'disabled':''}>上一页</button>
-    <button type="button" class="btn g s" data-live-page="${prefix}" data-to="${p+1}" ${p>=pages?'disabled':''}>下一页</button>
-    <button type="button" class="btn g s" data-live-page="${prefix}" data-to="${pages}" ${p>=pages?'disabled':''}>末页</button>
-  </span>`;
-}
-/** 渲染连接表（代理面板风格列）与按 IP 汇总；点击事件由 #lvConnTable 委托 */
-function renderLiveTables(){
-  const all=[...liveSession.map.values()];
-  all.sort((a,b)=>{
-    if(!!a.active!==!!b.active) return a.active?-1:1;
-    const ar=(a.downRate||0)+(a.upRate||0), br=(b.downRate||0)+(b.upRate||0);
-    if(ar!==br) return br-ar;
-    return (b.down||0)-(a.down||0);
-  });
-  const ps=liveSession.pageSize;
-  const total=all.length;
-  const pages=Math.max(1,Math.ceil(total/ps));
-  if(liveSession.connPage>pages) liveSession.connPage=pages;
-  const start=(liveSession.connPage-1)*ps;
-  const slice=all.slice(start,start+ps);
-  const ct=document.getElementById('lvConnTable');
-  if(!total){
-    ct.innerHTML='<tr class="emp-row"><td colspan="10"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">有代理请求后将在此累计展示</span></div></td></tr>';
-  }else{
-    ct.innerHTML=slice.map(c=>{
-      const path=(c.path||'').replace(/^\/https?:\/\/[^/]+/i,'')||'/';
-      const pathShort=path.length>48?path.slice(0,46)+'…':path;
-      const dRate=c.active?(c.downRate||0):0;
-      const uRate=c.active?(c.upRate||0):0;
-      const agoTitle=esc(fmtBeijing(c.start,'full')+(c.ended?' ~ '+fmtBeijing(c.ended,'full'):'')+' · 时长 '+fmtDur(c.duration_ms||0));
-      return `<tr class="live-row ${c.active?'lv-active':''}" data-live-id="${esc(c.id)}" style="cursor:pointer" title="点击查看详情">
-      <td data-label="操作"><span class="cell-v">${c.active?`<button type="button" class="lv-x" data-close-id="${esc(c.id)}" title="断开连接">×</button>`:'<button type="button" class="lv-x" disabled title="已结束">×</button>'}</span></td>
-      <td data-label="主机"><span class="cell-v lv-host">${esc(c.host||'-')}</span></td>
-      <td data-label="类型"><span class="cell-v"><span class="lv-type ${c.active?'on':''}" title="${esc(c.error||'')}">${esc(c.method||'GET')}${c.status?' '+c.status:''}${c.active?' · 进行中':' · 已结束'}${c.error?' · 失败':''}</span></span></td>
-      <td data-label="来源"><span class="cell-v"><span class="lv-src"><span class="ip">${esc(c.ip||'-')}</span><span class="rg">${esc(c.country_name||countryLabel(c.country))}</span></span></span></td>
-      <td data-label="路径"><span class="cell-v"><span class="lv-path" title="${esc(c.path||path)}">${esc(pathShort)}</span></span></td>
-      <td data-label="下载速度"><span class="cell-v lv-rate ${dRate>0?'on':''}">${fmtRate(dRate)}</span></td>
-      <td data-label="上传速度"><span class="cell-v lv-rate ${uRate>0?'on':''}">${fmtRate(uRate)}</span></td>
-      <td data-label="下载"><span class="cell-v lv-bytes">${fmtBytes(c.down||0)}</span></td>
-      <td data-label="上传"><span class="cell-v lv-bytes">${fmtBytes(c.up||0)}</span></td>
-      <td data-label="连接时间"><span class="cell-v lv-ago" title="${agoTitle}">${fmtAgo(c.start)}</span></td>
-    </tr>`;
-    }).join('');
-  }
-  document.getElementById('lvConnPager').innerHTML=livePagerHtml('conn',liveSession.connPage,total,ps);
-  document.getElementById('lvIPCount').textContent=total.toLocaleString();
-
-  const ipAgg={};
-  all.forEach(c=>{
-    const k=c.ip||'';
-    if(!ipAgg[k]) ipAgg[k]={ip:k,country:c.country,country_name:c.country_name,conns:0,up:0,down:0};
-    ipAgg[k].conns++; ipAgg[k].up+=c.up||0; ipAgg[k].down+=c.down||0;
-  });
-  const ips=Object.values(ipAgg).sort((a,b)=>b.down-a.down);
-  const ipTotal=ips.length;
-  const ipPages=Math.max(1,Math.ceil(ipTotal/ps));
-  if(liveSession.ipPage>ipPages) liveSession.ipPage=ipPages;
-  const ipStart=(liveSession.ipPage-1)*ps;
-  const ipSlice=ips.slice(ipStart,ipStart+ps);
-  const it=document.getElementById('lvIPTable');
-  if(!ipTotal){
-    it.innerHTML='<tr class="emp-row"><td colspan="5"><div class="emp"><b>暂无数据</b></div></td></tr>';
-  }else{
-    it.innerHTML=ipSlice.map(c=>`<tr>
-      <td data-label="IP"><span class="cell-v mono ip-link" data-ip="${esc(c.ip)}" style="color:var(--pd);cursor:pointer;text-decoration:underline">${esc(c.ip)}</span></td>
-      <td data-label="地区"><span class="cell-v">${esc(c.country_name||countryLabel(c.country))}</span></td>
-      <td data-label="连接"><span class="cell-v">${c.conns||0}</span></td>
-      <td data-label="下行"><span class="cell-v mono">${fmtBytes(c.down||0)}</span></td>
-      <td data-label="上行"><span class="cell-v mono">${fmtBytes(c.up||0)}</span></td>
-    </tr>`).join('');
-    it.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
-  }
-  document.getElementById('lvIPPager').innerHTML=livePagerHtml('ip',liveSession.ipPage,ipTotal,ps);
-}
-async function loadLive(){
-  try{
-    const r=await fetch('/admin/api/live',{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    applyLiveData(await r.json());
-  }catch(e){console.error('loadLive',e)}
 }
 
 async function loadBlocks(){
@@ -5996,28 +4911,13 @@ async function loadBlocks(){
 
 function collect(){
   const raw=parseInt(document.getElementById('portInput').value,10);
-  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),enable_cache:false,cors:false,pwa:document.getElementById('pwaToggle').checked}
+  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),auto_ban:document.getElementById('autoBan').checked,rate_limit:parseInt(document.getElementById('rateLimit').value,10)||0,allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean)}
 }
 async function save(){
   try{
     const r=await fetch('/admin/api/save',{method:'POST',body:JSON.stringify(collect())});
     if(!r.ok)throw new Error(await r.text());
     const c=await r.json();applyPort(c.effective_port);
-    // 开启 PWA 模式时：提示是否把启动页安装到主屏幕/桌面（安装后桌面图标秒开）
-    const nowOn=document.getElementById('pwaToggle').checked;
-    if(nowOn && !state.pwaOn){
-      state.pwaOn=true;
-      if(confirm('PWA 模式已开启！\n\n是否把启动页安装到主屏幕/桌面？\n\n· 安装后桌面会出现 Emby Proxy 图标\n· 点击图标从快速启动页直接进入后台\n· 需刷新页面后弹出安装提示')){ 
-        sessionStorage.setItem('pwaInstallAsk','1');
-        location.reload();
-        return;
-      }
-    }else if(!nowOn && state.pwaOn){
-      state.pwaOn=false;
-      alert('PWA 模式已关闭，页面即将刷新生效');
-      location.reload();
-      return;
-    }
     alert('配置已保存并即时生效');
   }catch(e){alert('保存失败：'+(e.message||'未知错误'))}
 }
@@ -6047,7 +4947,23 @@ document.getElementById('ovRangeBar').addEventListener('click', e => {
   if (!btn) return;
   document.querySelectorAll('#ovRangeBar .filter').forEach(b => b.classList.toggle('on', b === btn));
   state.ovRange = btn.dataset.r;
-  updateOvStats();
+  const box=document.getElementById('ovCustomBox');
+  if(box) box.style.display = state.ovRange==='custom' ? 'flex' : 'none';
+  if(state.ovRange==='custom'){
+    // 首次切到自定义：预填最近 7 天，避免空输入框
+    const fEl=document.getElementById('ovFrom'), tEl=document.getElementById('ovTo');
+    if(fEl && !fEl.value) fEl.value=beijingDateStrBefore(6);
+    if(tEl && !tEl.value) tEl.value=nowBeijingDateStr();
+    if(state.ovFrom&&state.ovTo) refreshOverview();
+  }else{
+    refreshOverview();
+  }
+});
+document.getElementById('ovApplyCustom')?.addEventListener('click',()=>{
+  const f=document.getElementById('ovFrom').value||'', t=document.getElementById('ovTo').value||'';
+  if(!f||!t){alert('请选择开始和结束日期');return}
+  state.ovFrom=f; state.ovTo=t;
+  refreshOverview();
 });
 
 document.getElementById('tfRangeBar').addEventListener('click', e => {
@@ -6057,28 +4973,20 @@ document.getElementById('tfRangeBar').addEventListener('click', e => {
   state.tfRange = btn.dataset.r;
   const box=document.getElementById('tfCustomBox');
   if(box) box.style.display = state.tfRange==='custom' ? 'flex' : 'none';
-  if(state.tfRange!=='custom') applyTrafficView();
-});
-document.getElementById('tfApplyCustom')?.addEventListener('click',()=>{
-  state.tfFrom=document.getElementById('tfFrom').value||'';
-  state.tfTo=document.getElementById('tfTo').value||'';
-  if(!state.tfFrom||!state.tfTo){alert('请选择开始和结束日期');return}
+  if(state.tfRange==='custom'){
+    // 首次切到自定义：预填最近 7 天，避免空输入框
+    const fEl=document.getElementById('tfFrom'), tEl=document.getElementById('tfTo');
+    if(fEl && !fEl.value) fEl.value=beijingDateStrBefore(6);
+    if(tEl && !tEl.value) tEl.value=nowBeijingDateStr();
+    if(state.tfFrom&&state.tfTo){applyTrafficView();return}
+  }
   applyTrafficView();
 });
-
-document.getElementById('lvClearBtn')?.addEventListener('click',()=>{
-  if(!confirm('清空本页累计的连接记录？'))return;
-  resetLiveSession();
-  renderLiveTables();
-});
-document.addEventListener('click',e=>{
-  const btn=e.target.closest('[data-live-page]');
-  if(!btn)return;
-  const to=parseInt(btn.getAttribute('data-to'),10);
-  if(!to||to<1)return;
-  if(btn.getAttribute('data-live-page')==='conn') liveSession.connPage=to;
-  else liveSession.ipPage=to;
-  renderLiveTables();
+document.getElementById('tfApplyCustom')?.addEventListener('click',()=>{
+  const f=document.getElementById('tfFrom').value||'', t=document.getElementById('tfTo').value||'';
+  if(!f||!t){alert('请选择开始和结束日期');return}
+  state.tfFrom=f; state.tfTo=t;
+  applyTrafficView();
 });
 
 document.getElementById('modalClose').addEventListener('click',()=>document.getElementById('modal').classList.remove('on'));
@@ -6102,15 +5010,10 @@ document.getElementById('logoutBtn')?.addEventListener('click', async () => {
 });
 
 /* ----- PWA 安装提示 -----
- * 浏览器满足安装条件（PWA 开启 + SW 就绪）时触发 beforeinstallprompt；
- * · 设置页出现“安装应用”按钮，随时可安装；
- * · 若刚开启 PWA（sessionStorage 标记，刷新后），自动弹出系统安装对话框，
- *   询问“是否把启动页添加到主屏幕/桌面”。 */
+ * PWA 恒为开启（内置 manifest + Service Worker）：浏览器满足安装条件时触发
+ * beforeinstallprompt，设置页的“安装应用”按钮即可随时安装；
+ * 已作为独立应用运行时按钮自动隐藏。 */
 let pwaInstallPrompt=null;
-function showInstallBtn(){
-  const row=document.getElementById('pwaInstallRow');
-  if(row) row.style.display='flex';
-}
 async function pwaInstall(){
   if(!pwaInstallPrompt){
     alert('当前浏览器暂未就绪或已安装。\n提示：可使用浏览器的“添加到主屏幕/安装应用”菜单功能手动安装。');
@@ -6121,7 +5024,6 @@ async function pwaInstall(){
     const choice=await pwaInstallPrompt.userChoice;
     if(choice&&choice.outcome==='accepted'){
       alert('安装成功！\n桌面/主屏幕已出现 Emby Proxy 图标，点击即可从快速启动页进入后台。');
-      document.getElementById('pwaInstallRow').style.display='none';
     }
   }catch(e){}
   pwaInstallPrompt=null;
@@ -6129,25 +5031,11 @@ async function pwaInstall(){
 window.addEventListener('beforeinstallprompt',e=>{
   e.preventDefault();
   pwaInstallPrompt=e;
-  // PWA 开启状态才显示安装入口（关闭时浏览器也不会触发该事件，双保险）
-  if(document.getElementById('pwaToggle')&&document.getElementById('pwaToggle').checked) showInstallBtn();
-  // 刚开启 PWA 并刷新进来：自动弹出系统级“添加到主屏幕”提示
-  if(sessionStorage.getItem('pwaInstallAsk')==='1'){
-    sessionStorage.removeItem('pwaInstallAsk');
-    setTimeout(()=>{ if(pwaInstallPrompt) pwaInstall(); },600);
-  }
 });
 window.addEventListener('appinstalled',()=>{
   pwaInstallPrompt=null;
-  const row=document.getElementById('pwaInstallRow');
-  if(row) row.style.display='none';
 });
 document.getElementById('pwaInstallBtn')?.addEventListener('click',pwaInstall);
-// 已作为独立应用运行时隐藏安装入口
-if(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches){
-  const row=document.getElementById('pwaInstallRow');
-  if(row) row.style.display='none';
-}
 
 loadConfig();
 // Chart.js 使用 defer 异步加载：先并行下载，等就绪后再拉概览（趋势图依赖）；
@@ -6221,10 +5109,9 @@ build_binary() {
     cd "$BUILD_TMPDIR"
     export GOTOOLCHAIN=auto GOFLAGS=-mod=mod
     go mod init emby-proxy >/dev/null 2>&1 || true
-    go get "github.com/phuslu/iploc@v1.0.1" >/dev/null 2>&1 || true
-    go get "go.etcd.io/bbolt@v1.3.11" >/dev/null 2>&1 || true
+    go get "github.com/phuslu/iploc@${IPLOC_VERSION}" >/dev/null 2>&1 || true
+    go get "go.etcd.io/bbolt@latest" >/dev/null 2>&1 || true
     go get "golang.org/x/sync/singleflight@v0.10.0" >/dev/null 2>&1 || true
-    go get "github.com/gorilla/websocket@v1.5.3" >/dev/null 2>&1 || true
     go get "golang.org/x/crypto/bcrypt@v0.31.0" >/dev/null 2>&1 || true
     go mod tidy >/dev/null 2>&1 || die "依赖解析失败（可设 GOPROXY=https://goproxy.cn,direct 后重试）"
   )
@@ -6488,7 +5375,7 @@ cmd_menu() {
     case "$choice" in
       1) menu_install_flow || true; press_enter ;;
       2) printf '\n'; if [[ ! -f "$UNIT_FILE" ]] && ! has_binary; then warn "还没有安装"; sleep 1; continue; fi; ( cmd_update ) || warn "更新失败"; press_enter ;;
-      3) printf '\n'; if ! has_install; then warn "当前没有安装"; sleep 1; continue; fi; warn "卸载会删除：服务、程序、配置、管理密码、统计数据、地区缓存"; if ! ask_yes "   $C_R❯$C_0 输入 y 确认: [y/N]"; then info "已取消"; sleep 1; continue; fi; ( cmd_uninstall --yes ) || warn "卸载出错"; press_enter ;;
+      3) printf '\n'; if ! has_install; then warn "当前没有安装"; sleep 1; continue; fi; warn "卸载会删除：服务、程序、配置、管理密码、统计数据"; if ! ask_yes "   $C_R❯$C_0 输入 y 确认: [y/N]"; then info "已取消"; sleep 1; continue; fi; ( cmd_uninstall --yes ) || warn "卸载出错"; press_enter ;;
       4) printf '\n'; cmd_status; press_enter ;;
       5) printf '\n'; log_tail; press_enter ;;
       0|q|Q|exit|quit) printf '\n'; info "已退出"; return 0 ;;
