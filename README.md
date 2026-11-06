@@ -178,16 +178,27 @@ http://<代理主机>:8520/https://emby.example.com:8096/web/index.html
 若前面还有 Nginx，且要使用管理端 WebSocket，需开启 Upgrade，例如：
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:8520;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 86400;
-}
+    location / {
+        proxy_pass http://127.0.0.1:8520;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # 媒体流：关掉缓冲，避免二次攒包
+        proxy_buffering         off;
+        proxy_request_buffering off;
+
+        proxy_read_timeout  86400;
+        proxy_send_timeout  86400;
+
+        client_max_body_size 0;
+    }
 ```
 
 本服务仅在直连方为回环/私网时信任 `X-Forwarded-For` / `X-Real-IP`。
