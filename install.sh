@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Emby 路径反代 v2.1 — 一键安装 / 管理脚本
+# Emby 路径反代 v2.2.0 — 一键安装 / 管理脚本
 # =============================================================================
 #
 # 功能概览
@@ -67,7 +67,7 @@ require_systemd() {
 
 usage() {
   cat <<EOF
-Emby 路径反代 v2.1 一键安装
+Emby 路径反代 v2.2.0 一键安装
   sudo $0 [menu|install|update|uninstall|status|start|stop|restart]
 EOF
 }
@@ -167,7 +167,7 @@ write_go_source() {
   package main
 
 /*
-Emby 路径反代 v2.1服务（单文件）
+Emby 路径反代 v2.2.0服务（单文件）
 
 访问模型
   客户端请求：  GET /https://emby.example.com:8096/web/index.html
@@ -1007,6 +1007,13 @@ func getNetSpeed() netSpeed {
 }
 
 var wsUpgrader = websocket.Upgrader{
+	// 后台实时监控是单向小包推送（服务端→浏览器，每秒一帧），
+	// 默认 4KB 读缓冲对“只发不收”的场景属于纯浪费，调小到 1KB；
+	// 写缓冲保持 4KB 以合并一帧内的多次小写入，避免逐条 syscall。
+	ReadBufferSize:  1024,
+	WriteBufferSize: 4096,
+	// 不做 per-message 压缩：帧很小，压缩收益抵不过 CPU 开销
+	EnableCompression: false,
 	CheckOrigin: func(r *http.Request) bool {
 		// 仅允许同源，降低 CSRF / 跨站连接风险
 		origin := r.Header.Get("Origin")
@@ -1456,26 +1463,63 @@ func startStatsSaver() {
 	}()
 }
 
-// getClientIP 取客户端 IP。仅当直连方为 loopback/私网时才信任 X-Forwarded-For / X-Real-IP。
+// getClientIP 取客户端 IP。
+//
+// 安全模型：
+//  1. 直连方（RemoteAddr）不是 loopback/私网时，它是唯一可信来源，直接返回，
+//     完全忽略请求头——否则任何公网客户端都能靠伪造 XFF 冒充任意 IP。
+//  2. 直连方是 loopback/私网时，说明前面有反代（Nginx/宝塔/1Panel 等）。
+//     此时 X-Forwarded-For 形如 "客户端, 代理1, 代理2"，**左侧内容可被客户端完全伪造**，
+//     必须从右往左逐跳回溯：跳过所有可信（私网/loopback）代理，取第一个不可信地址。
+//     例：真实客户端 1.2.3.4 经 Nginx 转发并伪造 XFF，到达时头为 "9.9.9.9, 1.2.3.4"
+//     —— 左侧 9.9.9.9 是伪造值，从右往左第一个不可信地址才是 1.2.3.4。
+//  3. 全部为可信地址（如健康检查、本机管理）时，回退到 X-Real-IP（由反代 302 覆盖写入，
+//     客户端无法伪造），最后回退到直连地址。
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	ip := net.ParseIP(host)
-	trusted := ip != nil && (ip.IsLoopback() || ip.IsPrivate())
-	if trusted {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i > 0 {
-				return strings.TrimSpace(xff[:i])
+	peer := net.ParseIP(host)
+	// 直连方不可信（公网直连）：不采信任何转发头
+	if peer == nil || !isTrustedProxy(peer) {
+		return host
+	}
+
+	// 有反代：从右往左找第一个不可信地址
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			s := strings.TrimSpace(parts[i])
+			if s == "" {
+				continue
 			}
-			return strings.TrimSpace(xff)
+			p := net.ParseIP(s)
+			if p == nil {
+				// 非法值：不再向左回溯（左侧更不可信），直接中断
+				break
+			}
+			if !isTrustedProxy(p) {
+				return s
+			}
 		}
-		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			return strings.TrimSpace(xri)
+	}
+
+	// 兜底：X-Real-IP 由反代写入（proxy_set_header 会覆盖客户端原值）
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		if p := net.ParseIP(xri); p != nil && !isTrustedProxy(p) {
+			return xri
 		}
 	}
 	return host
+}
+
+// isTrustedProxy 判断地址是否属于可信反代（loopback / 私网 / 链路本地）。
+// 说明：这里用「地址段」而非「精确 IP 列表」，覆盖同机、Docker 网桥、
+// 内网反代集群等常见拓扑；代价是内网内任意主机都被视为可信，
+// 因此 VPS 必须禁止外部直接访问内网网段（云厂商默认已隔离）。
+func isTrustedProxy(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 var selfPublicIP atomic.Value
@@ -2673,7 +2717,11 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 //   ErrorHandler   上游失败时返回统一错误页
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: tr, FlushInterval: 15 * time.Millisecond, BufferPool: proxyBufPool,
+		// FlushInterval = 0：不做定时强制 flush，由底层 bufio 写满自然下发。
+		// 这样下游读取慢时写操作会阻塞，形成真实背压，上游随之被按住；
+		// 而流式响应（ContentLength == -1，媒体流/SSE）标准库会自动用 -1 立即 flush，
+		// 播放不会因为该设置变卡。
+		Transport: tr, FlushInterval: 0, BufferPool: proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
 			if !ok || t == nil {
@@ -2685,7 +2733,20 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			pr.Out.URL.RawPath = ""
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 			pr.Out.Host = t.Host
-			pr.SetXForwarded()
+			// 转发头必须由本机重写，不能沿用 pr.SetXForwarded()：
+			// 它会把 Out 上已存在的（客户端伪造的）X-Forwarded-For 原样拼在前面，
+			// 使伪造链路直达上游。这里先清空，再用已校验的客户端 IP 重新写入。
+			outIP := getClientIP(pr.In)
+			pr.Out.Header.Del("X-Forwarded-For")
+			pr.Out.Header.Del("X-Real-IP")
+			pr.Out.Header.Del("Forwarded")
+			pr.Out.Header.Set("X-Forwarded-For", outIP)
+			pr.Out.Header.Set("X-Real-IP", outIP)
+			if pr.In.TLS == nil {
+				pr.Out.Header.Set("X-Forwarded-Proto", "http")
+			} else {
+				pr.Out.Header.Set("X-Forwarded-Proto", "https")
+			}
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
 			// 请求体不做上下行统计（客户端上传量不属于上下行定义）
 		},
@@ -2755,7 +2816,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v2.1管理控制台",
+		"description":      "Emby 路径反代 v2.2.0管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -2968,7 +3029,7 @@ return diskSpace{
 }
 
 // appVersion 程序版本号（发版时改这里即可，后台「系统信息」会展示）
-const appVersionStr = "2.0.0"
+const appVersionStr = "2.2.0"
 
 func appVersion() string { return appVersionStr }
 
@@ -3551,7 +3612,14 @@ func adminHandler() http.HandlerFunc {
 		}
 		statsMu.Lock()
 		reqs := stats.IPCounts[ip]
-		bytes := stats.IPBytes[ip]
+		// 被拦截的 IP 请求不会进入代理统计，IPCounts 恒为 0；
+		// 从拦截事件中统计该 IP 的拦截次数（仅限保留的最近事件窗口内）。
+		blocked := 0
+		for _, ev := range stats.Blocks {
+			if ev.IP == ip {
+				blocked++
+			}
+		}
 		statsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -3559,7 +3627,7 @@ func adminHandler() http.HandlerFunc {
 			"region": geo.Region, "city": geo.City,
 			"isp": geo.ISP, "org": geo.Org, "as": geo.AS,
 			"location": strings.Join(locParts, " · "),
-			"requests": reqs, "bytes": bytes,
+			"requests": reqs, "blocked": blocked,
 		})
 	})
 	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
@@ -4050,14 +4118,13 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .kk{width:70px;flex-shrink:0;color:var(--t3)}
 .kvv{flex:1;word-break:break-all;font-weight:500;color:var(--t)}
 .kvv.m{font-family:var(--mono);font-size:13px}
-/* 系统信息卡片 */
-.svg-title{font-size:11.5px;font-weight:600;letter-spacing:.4px;color:var(--t3);text-transform:uppercase;margin:2px 0 6px}
-.sv-list{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#f1f5f9;border:1px solid #f1f5f9;border-radius:10px;overflow:hidden}
-.sv-list + .svg-title{margin-top:18px}
-.kvr{display:flex;flex-direction:column;gap:3px;padding:9px 12px;background:#fff;font-size:13px;min-width:0}
-.kvl{color:var(--t3);font-size:12px;line-height:1.35}
-.kvv{font-weight:600;color:var(--t);word-break:break-all;line-height:1.45;font-variant-numeric:tabular-nums}
-@media(max-width:1000px){.sv-list{grid-template-columns:1fr}}
+/* --- 系统信息卡片 --- */
+.svg-title{font-size:11.5px;font-weight:600;letter-spacing:.4px;color:var(--t3);text-transform:uppercase;margin:0 0 8px}
+.sv-list + .svg-title{margin-top:16px}
+.kvr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px dashed var(--bd);font-size:13px;min-width:0}
+.kvr:last-child{border-bottom:0}
+.kvl{color:var(--t3);font-size:12.5px;flex-shrink:0;line-height:1.4}
+.kvv{font-weight:600;color:var(--t);text-align:right;min-width:0;word-break:break-word;line-height:1.4;font-variant-numeric:tabular-nums}
 
 /* --- 响应式适配 --- */
 @media(max-width:1024px){
@@ -4672,12 +4739,12 @@ async function loadOverview(){
       const r4=await fetch('/admin/api/system',{cache:'no-store'});
       if(r4.ok) sys=await r4.json();
     }catch(e){}
-    renderSysInfo(sys, state.cfgCache||{}, sys&&sys.uptime_sec!=null?sys.uptime_sec:(t.uptime_sec||0));
+    renderSysInfo(sys, sys&&sys.uptime_sec!=null?sys.uptime_sec:(t.uptime_sec||0));
   }catch(e){console.error('loadOverview error:',e)}
 }
 
-/* 系统信息卡片：进程运行态 + 网关配置 + 数据存储，三段分组展示 */
-function renderSysInfo(sys, c, uptime){
+/* 系统信息卡片：仅保留运维最关心的少量指标，单列紧凑排布 */
+function renderSysInfo(sys, uptime){
   const box=document.getElementById('sysInfo');
   if(!box) return;
   const up = uptime!=null ? uptime : (sys && sys.uptime_sec) || 0;
@@ -4685,51 +4752,24 @@ function renderSysInfo(sys, c, uptime){
   const upStr = d>0 ? (d+' 天 '+h+' 小时') : (h>0 ? (h+' 小时 '+m+' 分') : (m+' 分钟'));
 
   const kv=(k,v,color)=>`<div class="kvr"><span class="kvl">${k}</span><span class="kvv"${color?' style="color:'+color+'"':''}>${v}</span></div>`;
-  const group=(title,rows)=>{
-    // 奇数项补一个空白格，避免最后一行左侧单元格空出灰色底
-    const cells = rows.length%2 ? rows.concat(['<div class="kvr" style="background:#fff"></div>']) : rows;
-    return `<div class="svg-title">${title}</div><div class="sv-list">${cells.join('')}</div>`;
-  };
+  const group=(title,rows)=>`<div class="svg-title">${title}</div><div class="sv-list">${rows.join('')}</div>`;
 
   const sw = sys || {};
-  // 运行态
   const run=[
     kv('运行时长', upStr),
-    kv('版本', sw.version ? ('v'+esc(sw.version)) : '—'),
-    kv('监听端口', sw.port!=null ? (':'+sw.port) : ('—')),
-    kv('协程 / CPU', (sw.goroutines!=null? sw.goroutines : '—') + ' / ' + (sw.num_cpu!=null? sw.num_cpu : '—')),
-    kv('Go 运行时', (sw.go_version||'—') + (sw.os_arch? ' · '+sw.os_arch : '')),
-  ];
-  // 内存
-  const memPct = (sw.mem_sys && sw.mem_heap) ? Math.min(100, Math.round(sw.mem_heap/sw.mem_sys*100)) : 0;
-  const mem=[
-    kv('堆内存', fmtBytes(sw.mem_heap||0) + (sw.mem_heap? ` <span style="color:var(--t3);font-size:12px">(${memPct}% of ${fmtBytes(sw.mem_sys||0)})</span>` : '')),
-    kv('栈内存', fmtBytes(sw.mem_stack||0)),
-    kv('GC 次数', (sw.gc_count!=null? sw.gc_count : '—') + (sw.gc_pause_last? ` · 上次 ${(sw.gc_pause_last/1e6).toFixed(2)} ms` : '')),
-  ];
-  // 网关配置
-  const fw = (!c.ban_list?.length && !c.china_only) ? '未启用' : '已开启';
-  const fwColor = fw==='未启用' ? 'var(--t3)' : 'var(--ok)';
-  const cfg=[
-    kv('访问防护', fw, fwColor),
-    kv('域名白名单', (c.whitelist?.length||0) + ' 个'),
-    kv('IP 黑名单', (c.ban_list?.length||0) + ' 个'),
-    kv('仅限中国 IP', c.china_only ? '是' : '否'),
-    kv('UA 限制', (c.allowed_uas?.length||0) ? ((c.allowed_uas.length)+' 条规则') : '不限制'),
+    kv('监听端口', sw.port!=null ? (':'+sw.port) : '—'),
+    kv('内存占用', fmtBytes(sw.mem_heap||0)),
     kv('在线会话', (sw.logins!=null? sw.logins : '—') + ' 个'),
   ];
-  // 数据与磁盘
-  const diskFreePct = (sw.disk_total) ? Math.max(0, Math.round(sw.disk_free/sw.disk_total*100)) : 0;
-  const data=[
+  const diskPct = sw.disk_total ? Math.max(0, Math.round(sw.disk_free/sw.disk_total*100)) : 0;
+  const env=[
+    kv('版本', sw.version ? ('v'+esc(sw.version)) : '—'),
+    kv('运行环境', (sw.go_version||'—') + (sw.os_arch? ' · '+esc(sw.os_arch) : '')),
     kv('数据库', fmtBytes(sw.db_size||0)),
-    kv('累计请求', (sw.total_requests!=null? Number(sw.total_requests).toLocaleString() : '—')),
-    kv('累计流量', fmtBytes(sw.total_bytes||0)),
-    kv('独立 IP', sw.unique_ips!=null? Number(sw.unique_ips).toLocaleString() : '—'),
-    kv('放通率', sw.allow_rate!=null? (sw.allow_rate.toFixed(1)+'%') : '—'),
-    kv('磁盘剩余', fmtBytes(sw.disk_free||0) + (sw.disk_total? ` <span style="color:var(--t3);font-size:12px">/ ${fmtBytes(sw.disk_total)}（剩 ${diskFreePct}%）</span>` : '')),
+    kv('磁盘剩余', fmtBytes(sw.disk_free||0) + (sw.disk_total? ` <span style="color:var(--t3);font-weight:500">${diskPct}%</span>` : '')),
   ];
 
-  box.innerHTML = group('运行状态', run) + group('内存 / 存储', mem) + group('网关配置', cfg) + group('数据统计', data);
+  box.innerHTML = group('运行状态', run) + group('环境', env);
 }
 
 /* 概览两张图共用：按当前区间渲染请求趋势 + 流量趋势（上下行） */
@@ -5036,7 +5076,13 @@ async function showIPDetail(ip){
     if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
     const d=JSON.parse(txt);
     const loc=d.location||d.country_name||'未知';
-    const rows=[['IP',d.ip,true],['位置',loc,false],['请求次数',(d.requests||0).toLocaleString()+' 次',false],['流量',fmtBytes(d.bytes||0),false]];
+    let cntRow;
+    if((d.requests||0)>0){
+      cntRow=['请求次数',d.requests.toLocaleString()+' 次',false];
+    }else{
+      cntRow=['拦截次数',(d.blocked||0).toLocaleString()+' 次',false];
+    }
+    const rows=[['IP',d.ip,true],['位置',loc,false],cntRow];
     document.getElementById('modalBody').innerHTML=rows.map(([k,v,m])=>'<div class="kv"><div class="kk">'+esc(k)+'</div><div class="kvv'+(m?' m':'')+'">'+esc(v)+'</div></div>').join('');
   }catch(e){
     document.getElementById('modalBody').innerHTML='<div style="color:var(--d);font-size:13px">加载失败：'+esc(e.message||'未知错误')+'</div>';
@@ -5502,7 +5548,7 @@ menu_banner() {
   local ip ep svc bt W
   ip="$(local_ip)"; ep="$(effective_port)"; svc="$(svc_state_colored)"; bt="$(build_time)"; W="$(term_cols)"
   printf '\n%s%s%s\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
-  printf '  %s⚡ Emby 路径反代 v2.1%s  %s·%s  %s管理菜单%s\n' "$C_B" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
+  printf '  %s⚡ Emby 路径反代 v2.2.0%s  %s·%s  %s管理菜单%s\n' "$C_B" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
   printf '%s%s%s\n\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
   printf '   %s服务%s   %s\n' "$C_D" "$C_0" "$svc"
   printf '   %s端口%s   %s:%s%s\n' "$C_D" "$C_0" "$C_C" "$ep" "$C_0"
