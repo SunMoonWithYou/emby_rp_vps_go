@@ -842,6 +842,62 @@ var statChan = make(chan statEvent, 10000)
 var concurrent atomic.Int64
 var liveClients atomic.Int32
 
+// ---------- 端口级流量计数 ----------
+// /proc/net/dev 只能按网卡统计，同一网卡上其他进程的流量无法剔除，
+// 导致后台显示的“流量”远大于本服务实际转发量。
+// 改为在转发链路上自行计数：只有真正经过本服务的字节才计入，
+// 与整机网卡、其他进程彻底无关，跨平台且零依赖。
+type portTraffic struct {
+	down atomic.Int64 // 上游→本机（下行，从源站读到的字节）
+	up   atomic.Int64 // 本机→客户端（上行）
+}
+
+var traffic portTraffic
+
+// countingReader 包装响应体，读取时累计下行字节。
+// 反代是边读边写的同步拷贝，读多少基本等于写给客户端多少。
+type countingReader struct{ r io.Reader }
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		traffic.down.Add(int64(n))
+	}
+	return n, err
+}
+
+// countingWriter 包装 ResponseWriter，写出时累计上行字节。
+type countingWriter struct {
+	http.ResponseWriter
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	if n > 0 {
+		traffic.up.Add(int64(n))
+	}
+	return n, err
+}
+
+// Flush 透传，保证 FlushInterval 逻辑与 SSE 场景不被包装破坏
+func (c *countingWriter) Flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// netSpeedWake 用于唤醒空闲期长睡的采样器：
+// 有人打开实时监控时立刻投递信号，采样器不必等长睡结束就能马上采集一次，
+// 避免“刚进页面要等几分钟才出数”。带缓冲 1，重复投递不会阻塞。
+var netSpeedWake = make(chan struct{}, 1)
+
+func wakeNetSpeedSampler() {
+	select {
+	case netSpeedWake <- struct{}{}:
+	default:
+	}
+}
+
 type liveEvent struct {
 	Time    string `json:"time"`
 	IP      string `json:"ip"`
@@ -926,43 +982,17 @@ var (
 	curNetSpeed netSpeed
 )
 
-func readNetBytes() (rx, tx int64) {
-	f, err := os.Open("/proc/net/dev")
-	if err != nil {
-		return 0, 0
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for i := 0; i < 2 && sc.Scan(); i++ {
-	}
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.Contains(line, ":") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		iface := strings.TrimSpace(parts[0])
-		if iface == "lo" || iface == "" {
-			continue
-		}
-		fields := strings.Fields(parts[1])
-		if len(fields) < 9 {
-			continue
-		}
-		r, _ := strconv.ParseInt(fields[0], 10, 64)
-		t, _ := strconv.ParseInt(fields[8], 10, 64)
-		rx += r
-		tx += t
-	}
-	return rx, tx
-}
+// 说明：不再保留 readNetBytes（/proc/net/dev 整机网卡统计）。
+// 该口径会把同机其他进程的流量一并计入，与“本服务转发量”严重不符，
+// 现统一改用 traffic 计数器（见 portTraffic）在转发链路上精确累计。
 
 func startNetSpeedSampler() {
 	go func() {
 		var lastRx, lastTx int64
 		var lastT time.Time
 		for {
-			rx, tx := readNetBytes()
+			// 只统计经过本服务的端口流量，不再读整机网卡
+			rx, tx := traffic.down.Load(), traffic.up.Load()
 			now := time.Now()
 			if !lastT.IsZero() {
 				dt := now.Sub(lastT).Seconds()
@@ -975,26 +1005,50 @@ func startNetSpeedSampler() {
 					if dTx < 0 {
 						dTx = 0
 					}
-					rxBps := int64(float64(dRx) / dt)
-					txBps := int64(float64(dTx) / dt)
-					netSpeedMu.Lock()
-					curNetSpeed = netSpeed{RxBps: rxBps, TxBps: txBps}
-					netSpeedMu.Unlock()
-					// 写入流量统计：tx=上行（本机→客户端），rx=下行（上游→本机）
-					if dRx > 0 || dTx > 0 {
+					// 仅在有实时客户端时才更新“瞬时速率”。
+					// 空闲期采样间隔长达 5 分钟，若也写入，页面上会显示一个
+					// 跨 5 分钟的平均值，与真实瞬时网速完全对不上。
+					// 另外要求 dt <= 10s：刚从长睡被唤醒时 dt 可能是几分钟，
+					// 这一次算出来的是长周期均值，跳过不写，等下一秒的 1 秒窗口。
+					if liveClients.Load() > 0 && dt <= 10 {
+						rxBps := int64(float64(dRx) / dt)
+						txBps := int64(float64(dTx) / dt)
+						netSpeedMu.Lock()
+						curNetSpeed = netSpeed{RxBps: rxBps, TxBps: txBps}
+						netSpeedMu.Unlock()
+					}
+					// 流量累计：
+					// 端口计数下 down（上游→本机）与 up（本机→客户端）是同一份数据的
+					// 两端，相加即为重复计算。这里只上报 down 作为真实业务流量，
+					// up 置 0，使 total = down 等于实际转发字节数。
+					if dRx > 0 {
 						select {
-						case statChan <- statEvent{UpBytes: dTx, DownBytes: dRx, Bytes: dTx + dRx}:
+						case statChan <- statEvent{DownBytes: dRx, Bytes: dRx}:
 						default:
 						}
 					}
 				}
 			}
 			lastRx, lastTx, lastT = rx, tx, now
-			// 有人看实时监控时 1 秒一次，平时 1 分钟一次
+
+			// 有人看实时监控：1 秒一次，保证数字实时跳动。
+			// 无人观看：5 分钟一次，省电省 IO，流量累计不丢（只是粒度变粗）。
+			var nap time.Duration
 			if liveClients.Load() > 0 {
-				time.Sleep(time.Second)
+				nap = time.Second
 			} else {
-				time.Sleep(time.Minute)
+				nap = 5 * time.Minute
+			}
+			if nap == time.Second {
+				time.Sleep(nap)
+				continue
+			}
+			// 长睡期间可被“有人打开监控”唤醒，醒来后立即补测一次
+			timer := time.NewTimer(nap)
+			select {
+			case <-timer.C:
+			case <-netSpeedWake:
+				timer.Stop()
 			}
 		}
 	}()
@@ -1005,6 +1059,484 @@ func getNetSpeed() netSpeed {
 	defer netSpeedMu.RUnlock()
 	return curNetSpeed
 }
+
+// ---------- 测速链接 ----------
+// 后台生成一次性/限次测速链接：/speed/<token>，下载 N 次后自动失效。
+// 令牌仅存内存（重启清空，属临时性质，无需落盘）。
+type speedToken struct {
+	Token   string
+	MaxUses int
+	Uses    atomic.Int64
+	Created string
+}
+
+var speedTokens sync.Map // token -> *speedToken
+
+// 测速链接有效期：创建 7 天后自动过期（惰性校验 + 定时清理）
+const speedTokenValidity = 7 * 24 * time.Hour
+
+func speedTokenExpired(st *speedToken) bool {
+	t, err := time.Parse(time.RFC3339, st.Created)
+	if err != nil {
+		return false // 老数据解析失败则不过期，保持兼容
+	}
+	return time.Since(t) > speedTokenValidity
+}
+
+// startSpeedTokenCleaner 每小时清理一次已过期 7 天的测速链接
+func startSpeedTokenCleaner() {
+	go func() {
+		for {
+			time.Sleep(time.Hour)
+			deleted := false
+			speedTokens.Range(func(k, v any) bool {
+				if speedTokenExpired(v.(*speedToken)) {
+					speedTokens.Delete(k)
+					deleted = true
+				}
+				return true
+			})
+			if deleted {
+				saveSpeedTokens()
+			}
+		}
+	}()
+}
+
+// ---------- 测速链接持久化（bolt 落盘，重启不丢失） ----------
+
+// saveSpeedTokens 全量保存当前链接到 bolt（链接数量少，全量写开销可忽略）
+func saveSpeedTokens() {
+	type tokRec struct {
+		Token   string `json:"token"`
+		MaxUses int    `json:"max_uses"`
+		Uses    int64  `json:"uses"`
+		Created string `json:"created"`
+	}
+	var list []tokRec
+	speedTokens.Range(func(_, v any) bool {
+		st := v.(*speedToken)
+		list = append(list, tokRec{st.Token, st.MaxUses, st.Uses.Load(), st.Created})
+		return true
+	})
+	raw, _ := json.Marshal(list)
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("speed_tokens"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("data"), raw)
+	})
+}
+
+// loadSpeedTokens 启动时从 bolt 恢复链接（含已用次数）
+func loadSpeedTokens() {
+	_ = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("speed_tokens"))
+		if b == nil {
+			return nil
+		}
+		raw := b.Get([]byte("data"))
+		if raw == nil {
+			return nil
+		}
+		var list []struct {
+			Token   string `json:"token"`
+			MaxUses int    `json:"max_uses"`
+			Uses    int64  `json:"uses"`
+			Created string `json:"created"`
+		}
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return nil
+		}
+		for _, t := range list {
+			st := &speedToken{Token: t.Token, MaxUses: t.MaxUses, Created: t.Created}
+			st.Uses.Store(t.Uses)
+			speedTokens.Store(t.Token, st)
+		}
+		return nil
+	})
+}
+
+// ---------- 测速结果历史（bolt 落盘，最多保留 100 条） ----------
+type speedResult struct {
+	Time     string  `json:"time"`
+	Token    string  `json:"token"`
+	IP       string  `json:"ip"`
+	PingMS   float64 `json:"ping_ms"`
+	JitterMS float64 `json:"jitter_ms"`
+	DownMbps float64 `json:"down_mbps"`
+	UpMbps   float64 `json:"up_mbps"`
+}
+
+var (
+	speedResults   []speedResult
+	speedResultsMu sync.Mutex
+)
+
+const maxSpeedResults = 100
+
+func loadSpeedResults() {
+	speedResults = nil
+	_ = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("speed_results"))
+		if b == nil {
+			return nil
+		}
+		var list []speedResult
+		if raw := b.Get([]byte("data")); raw != nil {
+			if err := json.Unmarshal(raw, &list); err == nil {
+				speedResults = list
+			}
+		}
+		return nil
+	})
+}
+
+func appendSpeedResult(r speedResult) {
+	speedResultsMu.Lock()
+	speedResults = append(speedResults, r)
+	if len(speedResults) > maxSpeedResults {
+		speedResults = speedResults[len(speedResults)-maxSpeedResults:]
+	}
+	snap := make([]speedResult, len(speedResults))
+	copy(snap, speedResults)
+	speedResultsMu.Unlock()
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("speed_results"))
+		if err != nil {
+			return err
+		}
+		raw, _ := json.Marshal(snap)
+		return b.Put([]byte("data"), raw)
+	})
+}
+
+// serveSpeedTest 处理测速链接：
+//   GET /speed/<token>       测速页面（占用一次使用次数）
+//   GET /speed/<token>/dl    测速数据流（不计次数，仅页面会话内使用）
+func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/speed/")
+	if rest == "" {
+		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已失效。")
+		return
+	}
+	// 数据流端点：/speed/<token>/dl
+	if strings.HasSuffix(rest, "/dl") {
+		tok := strings.TrimSuffix(rest, "/dl")
+		// 允许“当前会话”：打开页面已消耗 1 次，Uses==MaxUses 时页面测速仍在进行，
+		// 不能拒绝（否则限 1 次的链接打开页面后测速恒为 0）；仅当超出后才失效。
+		if v, ok := speedTokens.Load(tok); !ok || v.(*speedToken).Uses.Load() > int64(v.(*speedToken).MaxUses) || speedTokenExpired(v.(*speedToken)) {
+			http.Error(w, "链接已失效", http.StatusGone)
+			return
+		}
+		sizeMB := int64(1024)
+		if s := r.URL.Query().Get("size"); s != "" {
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil && n >= 1 && n <= 1024 {
+				sizeMB = n
+			}
+		}
+		total := sizeMB << 20
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		buf := make([]byte, 256<<10)
+		for remain := total; remain > 0; {
+			n := int64(len(buf))
+			if remain < n {
+				n = remain
+			}
+			if _, err := w.Write(buf[:n]); err != nil {
+				return // 客户端停止读取（测速结束）即退出
+			}
+			remain -= n
+		}
+		return
+	}
+
+	// 上传测速端点：/speed/<token>/up（丢弃数据，仅统计字节数）
+	if strings.HasSuffix(rest, "/up") {
+		tok := strings.TrimSuffix(rest, "/up")
+		if v, ok := speedTokens.Load(tok); !ok || v.(*speedToken).Uses.Load() > int64(v.(*speedToken).MaxUses) || speedTokenExpired(v.(*speedToken)) {
+			http.Error(w, "链接已失效", http.StatusGone)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "方法不支持", http.StatusMethodNotAllowed)
+			return
+		}
+		// 上限 512MB，防止滥用；边读边丢弃，不落盘不驻留
+		body := http.MaxBytesReader(w, r.Body, 512<<20)
+		buf := make([]byte, 64<<10)
+		var n int64
+		for {
+			m, err := body.Read(buf)
+			if m > 0 {
+				n += int64(m)
+				traffic.up.Add(int64(m)) // 计入端口上行流量
+			}
+			if err != nil {
+				break
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"received": n})
+		return
+	}
+
+	// 测速结果上报：/speed/<token>/report（页面测完自动上报）
+	if strings.HasSuffix(rest, "/report") {
+		tok := strings.TrimSuffix(rest, "/report")
+		if v, ok := speedTokens.Load(tok); !ok || speedTokenExpired(v.(*speedToken)) {
+			http.Error(w, "链接已失效", http.StatusGone)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "方法不支持", http.StatusMethodNotAllowed)
+			return
+		}
+		var rep struct {
+			Ping   float64 `json:"ping"`
+			Jitter float64 `json:"jitter"`
+			Down   float64 `json:"down"`
+			Up     float64 `json:"up"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&rep); err != nil || rep.Down < 0 || rep.Down > 1e6 || rep.Up < 0 || rep.Up > 1e6 {
+			http.Error(w, "数据格式有误", http.StatusBadRequest)
+			return
+		}
+		appendSpeedResult(speedResult{
+			Time: beijingRFC3339(nowBeijing()), Token: tok, IP: getClientIP(r),
+			PingMS: rep.Ping, JitterMS: rep.Jitter, DownMbps: rep.Down, UpMbps: rep.Up,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+		return
+	}
+
+	// 测速页面
+	tok := rest
+	if strings.Contains(tok, "/") {
+		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已失效。")
+		return
+	}
+	v, ok := speedTokens.Load(tok)
+	if !ok {
+		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已被删除。")
+		return
+	}
+	st := v.(*speedToken)
+	if speedTokenExpired(st) {
+		serveError(w, http.StatusGone, "链接已过期", "该测速链接已超过 7 天有效期，请联系管理员重新生成。")
+		return
+	}
+	if st.Uses.Load() >= int64(st.MaxUses) {
+		serveError(w, http.StatusGone, "链接已失效", "该测速链接的可用次数已用完，请联系管理员重新生成。")
+		return
+	}
+	st.Uses.Add(1)
+	go saveSpeedTokens() // 异步落盘，不阻塞页面响应
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(strings.ReplaceAll(speedtestHTML, "__TOKEN__", tok)))
+}
+
+// speedtestHTML 测速页：输入令牌后渲染，自动完成延迟→下载测速，仪表盘样式。
+const speedtestHTML = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>测速</title><style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--ok:#10b981;--r:16px}
+body{min-height:100dvh;background:linear-gradient(180deg,#f0f7ff 0%,var(--bg) 60%);color:var(--t);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:24px;padding:44px 40px;max-width:480px;width:100%;box-shadow:0 8px 40px -8px rgba(15,23,42,.10);text-align:center}
+.gauge{position:relative;width:240px;height:240px;margin:0 auto}
+.gauge svg{transform:rotate(-90deg)}
+.gauge .track{stroke:#eef2f7}
+.gauge .bar{stroke:var(--p);stroke-linecap:round;transition:stroke-dashoffset .25s ease,stroke .3s}
+.gauge .txt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.gauge .val{font-size:44px;font-weight:800;letter-spacing:-1px;font-variant-numeric:tabular-nums;line-height:1.05}
+.gauge .unit{font-size:13px;color:var(--t3);margin-top:2px}
+.phase{margin-top:22px;font-size:14px;font-weight:600;color:var(--t2);min-height:22px}
+.sub{font-size:12.5px;color:var(--t3);margin-top:4px;min-height:18px}
+.btn{margin-top:28px;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:13px 34px;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;border:0;color:#fff;background:var(--p);box-shadow:0 4px 14px rgba(59,130,246,.35);transition:.2s;font-family:inherit}
+.btn:hover{background:var(--pd)}
+.btn:disabled{opacity:.5;cursor:default;box-shadow:none}
+.foot{margin-top:26px;font-size:12px;color:var(--t3)}
+.grade{display:inline-block;padding:3px 12px;border-radius:99px;font-size:12.5px;font-weight:600;margin-top:10px}
+.g-g{background:#ecfdf5;color:var(--ok)}.g-m{background:#fffbeb;color:#d97706}.g-b{background:#fef2f2;color:#ef4444}
+.done{margin-top:14px}
+.dt{font-size:14px;font-weight:600;color:var(--t2)}
+.dico{width:52px;height:52px;border-radius:50%;background:var(--ok);display:flex;align-items:center;justify-content:center;margin:0 auto 14px;box-shadow:0 6px 20px rgba(16,185,129,.35);animation:pop .45s cubic-bezier(.34,1.56,.64,1)}
+@keyframes pop{0%{transform:scale(.3);opacity:0}100%{transform:scale(1);opacity:1}}
+.srow{display:flex;justify-content:center;gap:56px;margin-top:18px}
+.sc .sl{font-size:12.5px;font-weight:700;letter-spacing:.4px;color:var(--t2);display:flex;align-items:center;gap:6px;justify-content:center}
+.sc .sl .u{font-weight:400;color:var(--t3)}
+.sc .sv{font-size:42px;font-weight:700;letter-spacing:-1px;font-variant-numeric:tabular-nums;line-height:1.15;margin-top:4px}
+.sc .sv.d{color:var(--pd)}.sc .sv.u{color:var(--ok)}
+.smini{display:flex;justify-content:center;gap:28px;margin-top:14px;font-size:13px;color:var(--t3)}
+.smini b{color:var(--t);font-weight:600;font-variant-numeric:tabular-nums}
+.ic{display:inline-flex;width:16px;height:16px;border-radius:50%;align-items:center;justify-content:center;vertical-align:-3px;margin-right:4px}
+.ic svg{width:9px;height:9px}
+.ic-red{background:#fee2e2}.ic-red svg path{stroke:#ef4444}
+.ic-green{background:#d1fae5}.ic-green svg path{stroke:#10b981}
+</style></head><body><div class="card">
+<div class="gauge" id="gauge">
+<svg width="240" height="240" viewBox="0 0 240 240">
+<circle class="track" cx="120" cy="120" r="104" fill="none" stroke-width="14"/>
+<circle class="bar" id="gbar" cx="120" cy="120" r="104" fill="none" stroke-width="14" stroke-dasharray="653.4" stroke-dashoffset="653.4"/>
+</svg>
+<div class="txt"><div class="val" id="gval">--</div><div class="unit" id="gunit">Mbps</div></div>
+</div>
+<div class="phase" id="phase">准备就绪</div>
+<div class="sub" id="sub"></div>
+<div class="done" id="done" style="display:none">
+<div class="dico"><svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M4 12.5l5 5L20 6.5" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+<div class="dt">测速完成 · 结果已记录 <span class="grade" id="dGrade" style="margin-top:0"></span></div>
+<div class="srow">
+<div class="sc"><div class="sl"><span class="ic ic-red"><svg viewBox="0 0 10 10" fill="none"><path d="M5 1v6M2.5 4.5L5 7l2.5-2.5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>DOWNLOAD <span class="u">Mbps</span></div><div class="sv d" id="sDown">-</div></div>
+<div class="sc"><div class="sl"><span class="ic ic-green"><svg viewBox="0 0 10 10" fill="none"><path d="M5 9V3M2.5 5.5L5 3l2.5 2.5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>UPLOAD <span class="u">Mbps</span></div><div class="sv u" id="sUp">-</div></div>
+</div>
+<div class="smini"><span><span class="ic ic-red"><svg viewBox="0 0 10 10" fill="none"><path d="M5 1v6M2.5 4.5L5 7l2.5-2.5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Ping <b id="sPing">-</b> ms</span><span><span class="ic ic-green"><svg viewBox="0 0 10 10" fill="none"><path d="M2 5h6M5 2v6" stroke-width="1.4" stroke-linecap="round"/></svg></span>抖动 <b id="sJit">-</b> ms</span></div>
+</div>
+<button class="btn" id="go">开始测速</button>
+<div class="foot">本页占用 1 次测速次数 · 结果仅供参考</div>
+</div>
+<script>
+const TOKEN='__TOKEN__', DL='/speed/'+TOKEN+'/dl';
+const CIRC=653.4, MAX_DISPLAY=1000; // 仪表满刻度 Mbps
+const $=id=>document.getElementById(id);
+let running=false;
+function setGauge(mbps){
+  const pct=Math.min(1,mbps/MAX_DISPLAY);
+  $('gbar').style.strokeDashoffset=CIRC*(1-pct*0.75); // 最大到 3/4 圈更有冲刺感
+  $('gval').textContent=mbps>=100?Math.round(mbps):mbps.toFixed(1);
+}
+function grade(m){return m>=200?['g-g','极佳']:m>=50?['g-g','良好']:m>=20?['g-m','一般']:['g-b','较差']}
+async function pingTest(){
+  const times=[];
+  for(let i=0;i<4;i++){
+    const t0=performance.now();
+    await fetch(DL+'?size=1',{cache:'no-store'});
+    times.push(performance.now()-t0);
+  }
+  times.sort((a,b)=>a-b);
+  return {ping:Math.round(times[0]), jit:Math.round(times[2]-times[0])};
+}
+async function downTest(seconds){
+  const deadline=performance.now()+seconds*1000;
+  let bytes=0, winBytes=0, winT0=performance.now(), live=0, peak=0, downErr=null;
+  const pump=async(id)=>{
+    while(performance.now()<deadline){
+      try{
+        const resp=await fetch(DL+'?size=1024&t='+Math.random(),{cache:'no-store'});
+        if(!resp.ok) throw new Error('数据流 HTTP '+resp.status);
+        const rd=resp.body.getReader();
+        for(;;){
+          const {done,value}=await rd.read();
+          if(done)break;
+          bytes+=value.byteLength; winBytes+=value.byteLength;
+          const dt=performance.now()-winT0;
+          if(dt>=500){
+            live=winBytes*8/(dt/1000)/1e6;
+            peak=Math.max(peak,live); setGauge(live);
+            winBytes=0; winT0=performance.now();
+          }
+        }
+      }catch(e){
+        if(!downErr) downErr=e.message||'网络错误';
+        break;
+      }
+    }
+  };
+  await pump(1); // 单线程测试
+  if(bytes===0){
+    const msg=downErr||'未收到数据';
+    if(/410/.test(msg)) throw new Error('链接已失效，请重新生成测速链接');
+    throw new Error(msg);
+  }
+  const secs=(performance.now()-(deadline-seconds*1000))/1000;
+  return {mbps:bytes*8/secs/1e6, peak};
+}
+
+async function upTest(seconds){
+  const t0=performance.now(), deadline=t0+seconds*1000;
+  // 8MB 随机块：随机内容防止中间层压缩，预生成一次反复使用；
+  // 用 XHR 的 upload.onprogress 逐块回报已发字节，仪表才能平滑跳动
+  const chunk=new Uint8Array(8*1048576);
+  for(let off=0;off<chunk.length;off+=65536){
+    crypto.getRandomValues(chunk.subarray(off,Math.min(off+65536,chunk.length)));
+  }
+  let upErr=null, done=false, total=0;
+  const send=()=>{
+    return new Promise((res)=>{
+      const xhr=new XMLHttpRequest();
+      xhr._last=0;
+      xhr.open('POST','/speed/'+TOKEN+'/up');
+      xhr.setRequestHeader('Content-Type','application/octet-stream');
+      xhr.upload.onprogress=e=>{ total+=e.loaded-xhr._last; xhr._last=e.loaded; };
+      const fin=()=>{ xhr._last=0; res(); };
+      xhr.onload=fin; xhr.onerror=fin; xhr.ontimeout=fin; xhr.onabort=fin;
+      xhr.send(chunk);
+    });
+  };
+  const worker=async()=>{
+    while(!done && !upErr && performance.now()<deadline){
+      try{ await send(); }catch(e){ if(!upErr)upErr=e.message||'网络错误'; }
+    }
+  };
+  const meter=setInterval(()=>{
+    const el=(performance.now()-t0)/1000;
+    if(el>0) setGauge(total*8/el/1e6);
+  },250);
+  await worker(); // 单线程测试
+  done=true; clearInterval(meter);
+  const secs=(performance.now()-t0)/1000;
+  if(total===0){
+    const msg=upErr||'未发出数据';
+    if(/410/.test(msg)) throw new Error('链接已失效，请重新生成测速链接');
+    throw new Error(msg);
+  }
+  return {mbps:total*8/secs/1e6};
+}
+$('go').addEventListener('click',async()=>{
+  if(running)return; running=true;
+  $('go').disabled=true; $('done').style.display='none';
+  $('gauge').style.display=''; $('phase').style.display=''; $('sub').style.display='';
+  $('gbar').style.stroke='var(--p)';
+  try{
+    $('phase').textContent='正在测延迟…'; $('sub').textContent=''; setGauge(0);
+    const {ping,jit}=await pingTest();
+    $('phase').textContent='正在测下载…'; $('sub').textContent='单线程下载测试，约 10 秒';
+    const t0=performance.now();
+    const timer=setInterval(()=>{
+      const el=(performance.now()-t0)/1000;
+      $('sub').textContent='已进行 '+Math.min(10,el).toFixed(0)+' 秒 / 10 秒';
+    },250);
+    const {mbps}=await downTest(10);
+    clearInterval(timer);
+    setGauge(mbps);
+    $('phase').textContent='正在测上传…'; $('sub').textContent='单线程上传测试，约 8 秒';
+    const {mbps:upMbps}=await upTest(8);
+    const [gc,gt]=grade(mbps);
+    $('gbar').style.stroke=gc==='g-g'?'var(--ok)':gc==='g-m'?'#f59e0b':'var(--d)';
+    $('phase').innerHTML='测速完成 <span class="grade '+gc+'">'+gt+'</span>';
+    $('sub').textContent='';
+    try{ await fetch('/speed/'+TOKEN+'/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:ping,jitter:jit,down:mbps,up:upMbps})}); }catch(e){}
+    // 完成态：隐藏仪表（避免误读为实时速率），按 Speedtest 风格展示结果
+    $('gauge').style.display='none'; $('phase').style.display='none'; $('sub').style.display='none';
+    $('dGrade').className='grade '+gc; $('dGrade').textContent=gt;
+    const fmt=v=>v>=100?Math.round(v).toString():v.toFixed(2);
+    $('sDown').textContent=fmt(mbps); $('sUp').textContent=fmt(upMbps);
+    $('sPing').textContent=Math.round(ping); $('sJit').textContent=Math.round(jit);
+    $('done').style.display='block';
+  }catch(e){
+    $('phase').textContent='测速失败'; $('sub').textContent=(e&&e.message)||'网络错误';
+  }
+  $('go').disabled=false; $('go').textContent='再测一次'; running=false;
+});
+</script></body></html>`
 
 var wsUpgrader = websocket.Upgrader{
 	// 后台实时监控是单向小包推送（服务端→浏览器，每秒一帧），
@@ -2751,7 +3283,14 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			// 请求体不做上下行统计（客户端上传量不属于上下行定义）
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// 纯透传：不包装响应体
+			// 响应体包一层计数 Reader：仅统计真正经过本服务的下行字节。
+			// 不改变传输语义（纯流式透传，不缓冲、不预读）。
+			if resp.Body != nil {
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{&countingReader{r: resp.Body}, resp.Body}
+			}
 			upHost := ""
 			if resp.Request != nil && resp.Request.URL != nil {
 				upHost = resp.Request.URL.Host
@@ -3287,6 +3826,8 @@ func adminHandler() http.HandlerFunc {
 		}
 		defer conn.Close()
 		liveClients.Add(1)
+		// 立即唤醒采样器：否则它会睡满 5 分钟空闲周期，页面长时间没有网速数据
+		wakeNetSpeedSampler()
 		defer func() {
 			if liveClients.Add(-1) == 0 {
 				clearLive()
@@ -3658,6 +4199,77 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
+	// 测速链接管理：列出 / 生成 / 删除
+	mux.HandleFunc("/admin/api/speed-tokens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			type tokView struct {
+				Token   string `json:"token"`
+				URL     string `json:"url"`
+				MaxUses int    `json:"max_uses"`
+				Uses    int64  `json:"uses"`
+				Created string `json:"created"`
+				Expired bool   `json:"expired"`
+			}
+			var list []tokView
+			speedTokens.Range(func(_, v any) bool {
+				st := v.(*speedToken)
+				list = append(list, tokView{st.Token, "/speed/" + st.Token, st.MaxUses, st.Uses.Load(), st.Created, speedTokenExpired(st)})
+				return true
+			})
+			sort.Slice(list, func(i, j int) bool { return list[i].Created > list[j].Created })
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": list})
+			return
+		}
+		if r.Method == http.MethodPost {
+			var req struct {
+				Uses   int `json:"uses"`
+				Action string `json:"action"`
+				Token  string `json:"token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, `{"error":"请求格式有误"}`, http.StatusBadRequest)
+				return
+			}
+			if req.Action == "delete" {
+				speedTokens.Delete(req.Token)
+				saveSpeedTokens()
+				recordAudit(getClientIP(r), "speed_delete", req.Token)
+				_, _ = w.Write([]byte(`{"ok":true}`))
+				return
+			}
+			if req.Uses < 1 || req.Uses > 10000 {
+				http.Error(w, `{"error":"次数需在 1–10000 之间"}`, http.StatusBadRequest)
+				return
+			}
+			tok := randToken(12)
+			st := &speedToken{Token: tok, MaxUses: req.Uses, Created: beijingRFC3339(nowBeijing())}
+			speedTokens.Store(tok, st)
+			saveSpeedTokens()
+			recordAudit(getClientIP(r), "speed_create", fmt.Sprintf("%s x%d", tok, req.Uses))
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "token": tok, "url": "/speed/" + tok, "max_uses": req.Uses})
+			return
+		}
+		http.Error(w, "方法不支持", http.StatusMethodNotAllowed)
+	})
+
+	// 测速结果历史（最新在前，最多 100 条）
+	mux.HandleFunc("/admin/api/speed-results", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			http.Error(w, "方法不支持", http.StatusMethodNotAllowed)
+			return
+		}
+		speedResultsMu.Lock()
+		list := make([]speedResult, len(speedResults))
+		copy(list, speedResults)
+		speedResultsMu.Unlock()
+		for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+			list[i], list[j] = list[j], list[i]
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": list, "total": len(list)})
+	})
+
 	mux.HandleFunc("/admin/api/clear-stats", func(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
 		stats = emptyStats()
@@ -3844,6 +4456,9 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	setAdminCred(adminUser, finalHash)
 
 	loadStats()
+	loadSpeedResults()
+	loadSpeedTokens()
+	startSpeedTokenCleaner()
 	startStatsWorker()
 	startStatsSaver()
 
@@ -3915,7 +4530,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		concurrent.Add(1)
 		defer concurrent.Add(-1)
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
-		proxy.ServeHTTP(w, r.WithContext(ctx))
+		// 包一层计数 Writer 统计上行字节（本机→客户端）。
+		// Hijack 场景（如内部 WebSocket 升级）不经过这里，但媒体流均为普通 HTTP，
+		// 其计数落点就是客户端的 TCP 写出。
+		proxy.ServeHTTP(&countingWriter{ResponseWriter: w}, r.WithContext(ctx))
 		pushLiveEvent(ip, country, target.Host, r.URL.Path)
 	})
 
@@ -3934,6 +4552,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		if strings.HasPrefix(r.URL.Path, "/admin/") {
 			adminGz.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/speed/") {
+			serveSpeedTest(w, r)
 			return
 		}
 		proxyHandler(w, r)
@@ -4255,6 +4877,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量请求</button></li>
 <li><button class="nav-i" data-t="realtime"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>实时监控</button></li>
 <li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
+<li><button class="nav-i" data-t="speedm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>测速管理</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
 <div class="sb-f" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
@@ -4292,7 +4915,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
 </div>
 <div class="card" style="margin-bottom:22px">
-<div class="ch"><div><h2 class="ct" id="ovByteTitle">流量趋势</h2><div class="cd" id="ovByteDesc">整机端口流量（含本机其他进程，仅供参考；上行=发送，下行=接收）</div></div></div>
+<div class="ch"><div><h2 class="ct" id="ovByteTitle">流量趋势</h2><div class="cd" id="ovByteDesc">仅统计经本服务转发的内容流量（不含系统与其他进程）</div></div></div>
 <div style="position:relative;height:240px"><canvas id="miniByteChart"></canvas></div>
 </div>
 <div class="g3">
@@ -4336,7 +4959,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div style="position:relative;height:260px"><canvas id="reqChart"></canvas></div>
 </div>
 <div class="card">
-<div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">整机端口流量（含本机其他进程，仅供参考；上行=发送，下行=接收）</div></div></div>
+<div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">仅统计经本服务转发的内容流量（不含系统与其他进程）</div></div></div>
 <div style="position:relative;height:260px"><canvas id="byteChart"></canvas></div>
 </div>
 <div class="card" style="margin-top:0">
@@ -4352,8 +4975,8 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="sg" style="margin-bottom:18px">
   <div class="stc b"><div class="sl">当前并发</div><div class="sv" id="rtConc">-</div><div class="ss">正在处理的请求</div></div>
   <div class="stc g"><div class="sl">每秒请求</div><div class="sv" id="rtRps">-</div><div class="ss">最近 1 秒</div></div>
-  <div class="stc o"><div class="sl">↓ 接收</div><div class="sv" id="rtRx">-</div><div class="ss">端口速率</div></div>
-  <div class="stc r"><div class="sl">↑ 发送</div><div class="sv" id="rtTx">-</div><div class="ss">端口速率</div></div>
+  <div class="stc o"><div class="sl">↓ 接收</div><div class="sv" id="rtRx">-</div><div class="ss">转发速率</div></div>
+  <div class="stc r"><div class="sl">↑ 发送</div><div class="sv" id="rtTx">-</div><div class="ss">转发速率</div></div>
 </div>
 <div class="card">
 <div class="ch"><div><h2 class="ct">实时请求流</h2><div class="cd" id="rtStatus">进入页面才开始收集，退出即清空</div></div></div>
@@ -4382,6 +5005,27 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
 </div>
 </section>
+<section id="speedm" class="pg">
+<div class="g2">
+  <div style="display:flex;flex-direction:column;gap:24px;">
+    <div class="card" style="margin-bottom:0;">
+      <div class="ch"><div><h2 class="ct">测速链接</h2><div class="cd">生成可视化测速页链接，可限制使用次数</div></div></div>
+      <div class="fi"><label class="fl">可使用次数</label>
+        <div style="display:flex;gap:12px;align-items:center">
+          <input id="spdUses" class="inp m" type="number" min="1" max="10000" value="5" style="max-width:120px">
+          <button class="btn b" id="spdCreate">生成链接</button>
+        </div>
+      </div>
+      <div id="spdList" style="display:grid;gap:10px"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:0;">
+    <div class="ch"><div><h2 class="ct">测速结果</h2><div class="cd">最多保留最近 100 条，重启不丢失</div></div></div>
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th><th>延迟</th><th>抖动</th><th>下载</th><th>上传</th><th>评级</th></tr></thead><tbody id="spdResBody"></tbody></table></div>
+  </div>
+</div>
+</section>
 <section id="settings" class="pg">
 <div class="g2">
   <div style="display:flex;flex-direction:column;gap:24px;">
@@ -4390,6 +5034,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
       <div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center"><input id="portInput" class="inp m" type="number" style="max-width:140px"><button class="btn b" id="savePort">保存并重启监听</button></div></div>
       <div class="row"><div><div class="rl">PWA 安装</div><div class="rd">后台已内置 PWA，可安装到手机/电脑桌面，全屏运行</div></div><button type="button" class="btn b s" id="pwaInstallBtn">安装应用</button></div>
     </div>
+
     
     <div class="card" style="border-color:#fecaca;margin-bottom:0;">
       <div class="ch"><div><h2 class="ct" style="color:var(--d)">安全设置</h2></div></div>
@@ -4508,7 +5153,7 @@ function countryLabel(code){  if(!code) return '未知';
   return fallback[c] || code;
 }
 
-const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',settings:'网关设置'};
+const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',speedm:'测速管理',settings:'网关设置'};
 let blocksTimer=null, realtimeWS=null;
 function clearRealtimeUI(){
   const ids=['rtConc','rtRps','rtRx','rtTx'];
@@ -4526,6 +5171,8 @@ function switchTab(id){
   if(id==='overview')loadOverview();
   if(id==='traffic')loadTraffic();
   if(id==='realtime') connectRealtime();
+  if(id==='speedm'){loadSpeedTokens();loadSpeedResults();}
+  if(id==='settings')loadSpeedTokens();
   if(id==='blocks'){
     loadBlocks();
     blocksTimer=setInterval(()=>{if(!document.hidden)loadBlocks()},5000);
@@ -5267,6 +5914,95 @@ window.addEventListener('appinstalled',()=>{
   pwaInstallPrompt=null;
 });
 document.getElementById('pwaInstallBtn')?.addEventListener('click',pwaInstall);
+
+/* ---------- 测速链接 ---------- */
+let spdPage=1;const SPD_PAGE_SIZE=5;
+async function loadSpeedTokens(){
+  const box=document.getElementById('spdList');
+  if(!box)return;
+  try{
+    const r=await fetch('/admin/api/speed-tokens',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const t=await r.json();
+    const items=t.items||[];
+    if(!items.length){spdPage=1;box.innerHTML='<div style="font-size:12.5px;color:var(--t3)">暂无测速链接。生成后打开 /speed/xxx 即是测速页（仪表盘样式），每次打开占用 1 次，用完自动失效；创建 7 天后也会自动过期删除。</div>';return}
+    const pages=Math.max(1,Math.ceil(items.length/SPD_PAGE_SIZE));
+    if(spdPage>pages)spdPage=pages;
+    const pageItems=items.slice((spdPage-1)*SPD_PAGE_SIZE,spdPage*SPD_PAGE_SIZE);
+    let html=pageItems.map(it=>{
+      const used=it.uses>=it.max_uses;
+      const dead=it.expired||used;
+      const pct=it.max_uses?Math.round(it.uses/it.max_uses*100):0;
+      const state=it.expired?'<span style="color:var(--d)">已过期（7 天）</span>':used?'<span style="color:var(--d)">已失效</span>':'使用中';
+      return `<div style="border:1px solid var(--bd);border-radius:12px;padding:12px 14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <code style="font-size:12.5px;color:var(--pd);word-break:break-all">${location.origin}/speed/${it.token}</code>
+          <div style="display:flex;gap:8px;flex-shrink:0">
+            <button class="btn g s" onclick="copySpeedUrl('${it.token}')">复制</button>
+            <button class="btn d s" onclick="delSpeedToken('${it.token}')">删除</button>
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:var(--t3)">
+          <span>${state} · ${it.uses}/${it.max_uses} 次 · ${esc(it.created)}</span>
+          <span>${pct}%</span>
+        </div>
+        <div style="height:4px;background:#f1f5f9;border-radius:2px;margin-top:6px;overflow:hidden"><i style="display:block;height:100%;width:${pct}%;background:${dead?'var(--d)':'var(--ok)'}"></i></div>
+      </div>`;
+    }).join('');
+    if(pages>1){
+      html+=`<div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:12.5px;color:var(--t3)">
+        <button class="btn g s" ${spdPage<=1?'disabled style="opacity:.5;cursor:not-allowed"':''} onclick="spdGo(${spdPage-1})">上一页</button>
+        <span>第 ${spdPage} / ${pages} 页 · 共 ${items.length} 条</span>
+        <button class="btn g s" ${spdPage>=pages?'disabled style="opacity:.5;cursor:not-allowed"':''} onclick="spdGo(${spdPage+1})">下一页</button>
+      </div>`;
+    }
+    box.innerHTML=html;
+  }catch(e){box.innerHTML='<div style="color:var(--d);font-size:12.5px">加载失败：'+esc(e.message)+'</div>'}
+}
+function spdGo(p){spdPage=p;loadSpeedTokens();}
+async function createSpeedToken(){
+  const uses=parseInt(document.getElementById('spdUses').value,10)||5;
+  try{
+    const r=await fetch('/admin/api/speed-tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uses})});
+    const t=await r.json();
+    if(!r.ok)throw new Error(t.error||('HTTP '+r.status));
+    spdPage=1;loadSpeedTokens();
+  }catch(e){alert('生成失败：'+e.message)}
+}
+async function delSpeedToken(tok){
+  await fetch('/admin/api/speed-tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',token:tok})});
+  loadSpeedTokens();
+}
+function copySpeedUrl(tok){
+  const url=location.origin+'/speed/'+tok;
+  (navigator.clipboard?navigator.clipboard.writeText(url):Promise.reject()).then(()=>{}).catch(()=>{
+    const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();
+  });
+}
+document.getElementById('spdCreate')?.addEventListener('click',createSpeedToken);
+
+async function loadSpeedResults(){
+  const tb=document.getElementById('spdResBody');
+  if(!tb)return;
+  try{
+    const r=await fetch('/admin/api/speed-results',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const t=await r.json();
+    const items=t.items||[];
+    const cnt=document.getElementById('spdResCount');
+    if(cnt)cnt.textContent='共 '+t.total+' 条 · 最多保留 100 条 · 重启不丢失';
+    if(!items.length){tb.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--t3);padding:18px 0">暂无测速记录，生成链接测速后自动记录</td></tr>';return}
+    const grade=m=>m>=200?['g-g','极佳']:m>=50?['g-g','良好']:m>=20?['g-m','一般']:['g-b','较差'];
+    tb.innerHTML=items.map(it=>{
+      const [gc,gt]=grade(it.down_mbps);
+      const dt=(it.time||'').replace('T',' ').slice(0,19);
+      return `<tr><td data-label="时间">${esc(dt)}</td><td data-label="IP"><span class="cell-v mono ip-link" data-ip="${esc(it.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600">${esc(it.ip)}</span></td><td data-label="延迟"><span class="cell-v">${it.ping_ms.toFixed(0)} ms</span></td><td data-label="抖动"><span class="cell-v">${it.jitter_ms.toFixed(0)} ms</span></td><td data-label="下载"><span class="cell-v"><b>${it.down_mbps>=100?Math.round(it.down_mbps):it.down_mbps.toFixed(1)}</b> Mbps</span></td><td data-label="上传"><span class="cell-v"><b>${it.up_mbps>=100?Math.round(it.up_mbps):(it.up_mbps||0).toFixed(1)}</b> Mbps</span></td><td data-label="评级"><span class="cell-v"><span class="grade ${gc}" style="margin-top:0">${gt}</span></span></td></tr>`;
+    }).join('');
+    tb.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
+  }catch(e){
+    tb.innerHTML='<tr><td colspan="7" style="color:var(--d)">加载失败：'+esc(e.message||'')+'</td></tr>';
+  }
+}
 
 loadConfig();
 // Chart.js 使用 defer 异步加载：先并行下载，等就绪后再拉概览（趋势图依赖）；
