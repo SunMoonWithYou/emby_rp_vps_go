@@ -425,6 +425,10 @@ type Config struct {
 	AutoBan     bool     `json:"auto_ban"`     // 触发地区拦截时自动写入黑名单
 	RateLimit   int      `json:"rate_limit"`   // 每 IP 每分钟请求上限，0=关闭
 	AllowedUAs  []string `json:"allowed_uas"`  // UA 关键字白名单，空=不限制
+	ReportURL   string   `json:"report_url"`   // 数据上报接收地址，空=不上报
+	ReportToken string   `json:"report_token"` // Bearer Token，空=不带鉴权头
+	ReportOn    bool     `json:"report_on"`    // 是否开启每小时上报
+	ReportNote  string   `json:"report_note"`  // 服务器备注，随上报携带
 	// 说明：CORS 与 PWA 已固化为程序常量（CORS 关闭、PWA 常开），不再作为可配置项，
 	// 也不再出现在后台设置中；旧数据库里遗留的 cors/pwa 字段会被自动忽略。
 }
@@ -1210,6 +1214,412 @@ func appendSpeedResult(r speedResult) {
 		raw, _ := json.Marshal(snap)
 		return b.Put([]byte("data"), raw)
 	})
+}
+
+// ---------- 每小时数据上报（POST JSON + Bearer，失败本地排队重试） ----------
+//
+// 口径：每批 = 上一个统计周期的增量（当前累计 - 上次快照），
+// 服务器端自行按小时累加汇总。快照持久化到 bolt，重启不丢、不重不漏。
+
+// reportSnap 上次上报时的日累计快照（含三张明细 map，用于差分出周期增量）
+type reportSnap struct {
+	Date       string           `json:"date"`
+	At         string           `json:"at"` // 快照时间 RFC3339
+	Requests   int64            `json:"requests"`
+	Up         int64            `json:"up"`
+	Down       int64            `json:"down"`
+	BlockedCN  int64            `json:"blocked_cn"`
+	BlockedWL  int64            `json:"blocked_wl"`
+	BlockedBan int64            `json:"blocked_ban"`
+	BlockedRate int64           `json:"blocked_rate"`
+	BlockedUA  int64            `json:"blocked_ua"`
+	Hosts      map[string]int64 `json:"hosts,omitempty"`
+	IPs        map[string]int64 `json:"ips,omitempty"`
+	Countries  map[string]int64 `json:"countries,omitempty"`
+}
+
+func satSub(a, b int64) int64 {
+	if a > b {
+		return a - b
+	}
+	return 0
+}
+
+// mapDelta 计算累计 map 的周期增量（cur-prev，负值与零值丢弃）
+func mapDelta(cur, prev map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(cur))
+	for k, v := range cur {
+		if d := v - prev[k]; d > 0 {
+			out[k] = d
+		}
+	}
+	return out
+}
+
+// reportPayload 上报体：单个统计周期的增量
+type reportPayload struct {
+	BatchID      string `json:"batch_id"`    // 批次唯一 ID（node_key+周期起点），接收端可幂等去重
+	NodeKey      string `json:"node_key"`    // 节点唯一标识（首次启动自动生成，持久化）
+	Node         string `json:"node"`        // 节点名称（本机公网 IP 或主机名）
+	Note         string `json:"note"`        // 服务器备注（后台配置）
+	Version      string `json:"version"`     // 程序版本
+	PeriodStart  string `json:"period_start"` // 统计周期起点（北京时间 RFC3339）
+	PeriodEnd    string `json:"period_end"`   // 统计周期终点
+	PeriodDate   string `json:"period_date"`  // 周期归属日期（YYYY-MM-DD，便于查询/归档）
+	PeriodHour   string `json:"period_hour"`  // 周期归属小时（两位 HH，如 "14" 表示 14 点档）
+	ReportedAt   string `json:"reported_at"`  // 上报时间
+	Requests     int64  `json:"requests"`     // 周期内请求数
+	UpBytes      int64  `json:"up_bytes"`     // 周期内上行
+	DownBytes    int64  `json:"down_bytes"`   // 周期内下行
+	Blocked      int64  `json:"blocked"`      // 周期内拦截总数
+	BlockedCN    int64  `json:"blocked_cn"`
+	BlockedBan   int64  `json:"blocked_ban"`
+	BlockedRate  int64  `json:"blocked_rate"`
+	BlockedUA    int64  `json:"blocked_ua"`
+	BlockedWL    int64  `json:"blocked_whitelist"`
+	Hosts        map[string]int64 `json:"hosts,omitempty"`     // 周期内上游主机请求增量（Top100）
+	IPs          map[string]int64 `json:"ips,omitempty"`       // 周期内客户端 IP 请求增量（Top100）
+	Countries    map[string]int64 `json:"countries,omitempty"` // 周期内国家/地区增量（中文名）
+	QueueDepth   int    `json:"queue_depth"` // 上报时积压批次数
+}
+
+var reportQueueMu sync.Mutex
+
+// buildCurrentSnap 生成当前日累计快照（含三张明细 map）
+func buildCurrentSnap() reportSnap {
+	statsMu.Lock()
+	s := stats
+	statsMu.Unlock()
+	now := nowBeijing()
+	date := beijingDate(now)
+	sn := reportSnap{Date: date, At: beijingRFC3339(now)}
+	if d := s.Daily[date]; d != nil {
+		sn.Requests, sn.Up, sn.Down = d.Requests, d.UpBytes, d.DownBytes
+		sn.BlockedCN, sn.BlockedWL, sn.BlockedBan = d.BlockedCN, d.BlockedWL, d.BlockedBan
+		sn.BlockedRate, sn.BlockedUA = d.BlockedRate, d.BlockedUA
+		// map 为值引用，必须在锁内整体拷贝
+		ensureDayMaps(d)
+		sn.Hosts = copyInt64Map(d.Hosts)
+		sn.IPs = copyInt64Map(d.IPs)
+		sn.Countries = copyInt64Map(d.Countries)
+	}
+	return sn
+}
+
+// loadReportSnaps / saveReportSnaps 整点快照链（bolt 持久化，保留最近 3 份）
+func loadReportSnaps() []reportSnap {
+	var list []reportSnap
+	_ = db.View(func(tx *bolt.Tx) error {
+		if b := tx.Bucket([]byte("report_queue")); b != nil {
+			if raw := b.Get([]byte("snaps")); raw != nil {
+				_ = json.Unmarshal(raw, &list)
+			}
+		}
+		return nil
+	})
+	return list
+}
+
+func saveReportSnaps(list []reportSnap) {
+	raw, _ := json.Marshal(list)
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("report_queue"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("snaps"), raw)
+	})
+}
+
+// startHourlySnapshotWorker 每个整点过 2 秒保存一份日累计快照。
+// 相邻两份快照的差分 = 恰好上一个完整自然小时（如 3 点存的两份差出 2 点档）。
+func startHourlySnapshotWorker() {
+	go func() {
+		for {
+			now := nowBeijing()
+			next := now.Truncate(time.Hour).Add(2 * time.Second)
+			if !next.After(now) {
+				next = next.Add(time.Hour)
+			}
+			time.Sleep(time.Until(next))
+			reportQueueMu.Lock()
+			snaps := loadReportSnaps()
+			snaps = append(snaps, buildCurrentSnap())
+			if len(snaps) > 3 {
+				snaps = snaps[len(snaps)-3:]
+			}
+			saveReportSnaps(snaps)
+			reportQueueMu.Unlock()
+		}
+	}()
+}
+
+// payloadFromDelta 由两份快照差分构造上报体
+func payloadFromDelta(base, cur reportSnap) reportPayload {
+	p := reportPayload{
+		NodeKey:    getNodeKey(),
+		Node:       detectNodeName(),
+		Note:       cfgPtr.Load().ReportNote,
+		Version:    appVersionStr,
+		ReportedAt: beijingRFC3339(nowBeijing()),
+		QueueDepth: len(loadReportQueue()),
+	}
+	p.PeriodStart, p.PeriodEnd = base.At, cur.At
+	p.PeriodDate, p.PeriodHour = base.Date, beijingHour(parseRFC3339(base.At))
+	p.Requests = satSub(cur.Requests, base.Requests)
+	p.UpBytes = satSub(cur.Up, base.Up)
+	p.DownBytes = satSub(cur.Down, base.Down)
+	p.BlockedCN = satSub(cur.BlockedCN, base.BlockedCN)
+	p.BlockedWL = satSub(cur.BlockedWL, base.BlockedWL)
+	p.BlockedBan = satSub(cur.BlockedBan, base.BlockedBan)
+	p.BlockedRate = satSub(cur.BlockedRate, base.BlockedRate)
+	p.BlockedUA = satSub(cur.BlockedUA, base.BlockedUA)
+	p.Blocked = p.BlockedCN + p.BlockedWL + p.BlockedBan + p.BlockedRate + p.BlockedUA
+	// 三张明细的周期增量：hosts/ips 取请求量 Top100，国家转中文名
+	p.Hosts = mapDelta(cur.Hosts, base.Hosts)
+	pruneTopN(p.Hosts, 100)
+	p.IPs = mapDelta(cur.IPs, base.IPs)
+	pruneTopN(p.IPs, 100)
+	ctryDelta := mapDelta(cur.Countries, base.Countries)
+	if len(ctryDelta) > 0 {
+		p.Countries = make(map[string]int64, len(ctryDelta))
+		for code, v := range ctryDelta {
+			name := countryName(code)
+			p.Countries[name] += v
+		}
+	}
+	p.BatchID = p.NodeKey + "-" + p.PeriodDate + "-" + p.PeriodHour
+	return p
+}
+
+// lastFullHourReport 取最近两个整点快照的差分 = 上一个完整自然小时的增量。
+// 快照不足两份（刚安装的第一个小时）返回 ok=false。
+// 停机恢复后相邻快照间隔可能大于 1 小时，差分会把积压时段合并成一批补报。
+func lastFullHourReport() (reportPayload, bool) {
+	snaps := loadReportSnaps()
+	if len(snaps) < 2 {
+		// 兜底：快照不足时立刻补齐——补出的两份快照严格对齐「上一个完整自然小时」：
+		// 基准零值快照标为上上个整点（如 14:00），当前日累计快照标为上个整点（如 15:00），
+		// 差分即 14→15 点档。手动上传时无需等满一个小时，立即就能拿到可上报的数据。
+		now := nowBeijing()
+		lastFull := now.Truncate(time.Hour)
+		prevFull := lastFull.Add(-time.Hour)
+		base := reportSnap{Date: beijingDate(prevFull), At: beijingRFC3339(prevFull)}
+		cur := buildCurrentSnap()
+		cur.At = beijingRFC3339(lastFull)
+		list := append(snaps, base, cur)
+		if len(list) > 3 {
+			list = list[len(list)-3:]
+		}
+		saveReportSnaps(list)
+		snaps = list
+	}
+	if len(snaps) < 2 {
+		return reportPayload{}, false
+	}
+	return payloadFromDelta(snaps[len(snaps)-2], snaps[len(snaps)-1]), true
+}
+
+func parseRFC3339(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
+}
+
+// detectNodeName 节点标识：优先本机公网 IP，其次主机名
+func detectNodeName() string {	if ip, _ := selfPublicIP.Load().(string); ip != "" {
+		return ip
+	}
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "unknown"
+}
+
+var nodeKeyCache atomic.Value // string
+
+// getNodeKey 节点唯一 Key：首次调用自动生成（24 位随机串），存入 bolt 永久保留，
+// 重启/重装程序不变（除非删除数据库文件），用于接收端区分不同服务器
+func getNodeKey() string {
+	if v, _ := nodeKeyCache.Load().(string); v != "" {
+		return v
+	}
+	var key string
+	_ = db.View(func(tx *bolt.Tx) error {
+		if b := tx.Bucket([]byte("auth")); b != nil {
+			if k := b.Get([]byte("node_key")); k != nil {
+				key = string(k)
+			}
+		}
+		return nil
+	})
+	if key == "" {
+		key = randToken(24)
+		_ = db.Update(func(tx *bolt.Tx) error {
+			b, err := tx.CreateBucketIfNotExists([]byte("auth"))
+			if err != nil {
+				return err
+			}
+			return b.Put([]byte("node_key"), []byte(key))
+		})
+	}
+	nodeKeyCache.Store(key)
+	return key
+}
+
+// ---------- 上报队列（bolt 持久化，重启后继续补传） ----------
+
+const maxReportQueue = 24 // 最多积压 24 批（约一天）
+
+type queuedReport struct {
+	ID      string `json:"id"`
+	Payload []byte `json:"payload"`
+	Created string `json:"created"`
+	Attempts int   `json:"attempts"`
+	LastErr  string `json:"last_err,omitempty"`
+}
+
+func loadReportQueue() []queuedReport {
+	var list []queuedReport
+	_ = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("report_queue"))
+		if b == nil {
+			return nil
+		}
+		if raw := b.Get([]byte("data")); raw != nil {
+			_ = json.Unmarshal(raw, &list)
+		}
+		return nil
+	})
+	return list
+}
+
+func saveReportQueue(list []queuedReport) {
+	raw, _ := json.Marshal(list)
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("report_queue"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("data"), raw)
+	})
+}
+
+// sendOnce 单次 HTTP 投递，成功返回 nil
+func sendOnce(url, token string, body []byte) error {
+	_, _, err := sendOnceResp(url, token, body)
+	return err
+}
+
+// sendOnceResp 同 sendOnce，但额外返回接收端的状态码与响应片段（手动上报回显用）
+func sendOnceResp(url, token string, body []byte) (int, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "emby-proxy/"+appVersionStr)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := reportClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, string(respBody), fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp.StatusCode, string(respBody), nil
+}
+
+var reportClient = &http.Client{Timeout: 25 * time.Second}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// flushReportQueue 依序补传队列；遇到失败即停止（保证顺序）
+func flushReportQueue() {
+	c := cfgPtr.Load()
+	if c == nil || c.ReportURL == "" {
+		return
+	}
+	reportQueueMu.Lock()
+	defer reportQueueMu.Unlock()
+	list := loadReportQueue()
+	if len(list) == 0 {
+		return
+	}
+	keep := list[:0]
+	stopped := false
+	for _, it := range list {
+		if stopped {
+			keep = append(keep, it)
+			continue
+		}
+		if err := sendOnce(c.ReportURL, c.ReportToken, it.Payload); err != nil {
+			it.Attempts++
+			it.LastErr = err.Error()
+			keep = append(keep, it)
+			stopped = true
+			continue
+		}
+	}
+	saveReportQueue(keep)
+}
+
+// enqueueAndSend 取上一完整自然小时的增量：入队 → 投递
+func enqueueAndSend() {
+	c := cfgPtr.Load()
+	if c == nil || c.ReportURL == "" || !c.ReportOn {
+		return
+	}
+	p, ok := lastFullHourReport()
+	if !ok {
+		return // 快照不足（刚安装的第一个小时），下个整点起正常上报
+	}
+	raw, _ := json.Marshal(p)
+
+	reportQueueMu.Lock()
+	list := loadReportQueue()
+	list = append(list, queuedReport{ID: p.BatchID, Payload: raw, Created: p.ReportedAt})
+	if len(list) > maxReportQueue {
+		list = list[len(list)-maxReportQueue:]
+	}
+	saveReportQueue(list)
+	reportQueueMu.Unlock()
+
+	// 立刻尝试投递，失败留待下一轮补传
+	flushReportQueue()
+}
+
+// startReportWorker 每个整点过 5 秒上报一次「上一个自然小时」的增量
+// （差分基于上次上报快照，整点触发使 period 边界对齐自然小时）；
+// 另有协程每 10 分钟补传失败数据
+func startReportWorker() {
+	go func() {
+		for {
+			now := nowBeijing()
+			next := now.Truncate(time.Hour).Add(5 * time.Second)
+			if !next.After(now) {
+				next = next.Add(time.Hour)
+			}
+			time.Sleep(time.Until(next))
+			enqueueAndSend()
+		}
+	}()
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			flushReportQueue()
+		}
+	}()
 }
 
 // serveSpeedTest 处理测速链接：
@@ -4270,6 +4680,83 @@ func adminHandler() http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": list, "total": len(list)})
 	})
 
+	// 数据上报：POST {"action":"test"} 立即上报一次并返回投递结果
+	mux.HandleFunc("/admin/api/report", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"方法不支持"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		c := cfgPtr.Load()
+		if c == nil || c.ReportURL == "" {
+			http.Error(w, `{"error":"尚未配置上报地址"}`, http.StatusBadRequest)
+			return
+		}
+		// 查询队列状态
+		var req struct {
+			Action string `json:"action"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&req)
+		if req.Action == "flush" {
+			flushReportQueue()
+		}
+		if req.Action == "clear" {
+			// 清空整点快照链（不影响排队中的待重试批次），
+			// 清空后到下一个整点会重新开始记录
+			_ = db.Update(func(tx *bolt.Tx) error {
+				if b := tx.Bucket([]byte("report_queue")); b != nil {
+					return b.Delete([]byte("snaps"))
+				}
+				return nil
+			})
+			recordAudit(getClientIP(r), "report_clear", "清空上报快照")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+		}
+		if req.Action == "status" || req.Action == "flush" {
+			q := loadReportQueue()
+			out := make([]map[string]any, 0, len(q))
+			for _, it := range q {
+				out = append(out, map[string]any{"id": it.ID, "created": it.Created, "attempts": it.Attempts, "last_err": it.LastErr})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"queue": out, "depth": len(q), "url": c.ReportURL, "on": c.ReportOn})
+			return
+		}
+		// 手动上报与自动上报完全同口径：都取上一个完整自然小时的快照差分。
+		// 失败则入队补传，保证数据不丢
+		p, ok := lastFullHourReport()
+		if !ok {
+			http.Error(w, `{"error":"上个小时的快照还没生成（服务刚启动不足一小时），到下一个整点后再试"}`, http.StatusBadRequest)
+			return
+		}
+		raw, _ := json.Marshal(p)
+		status, respBody, err := sendOnceResp(c.ReportURL, c.ReportToken, raw)
+		recordAudit(getClientIP(r), "report_test", c.ReportURL)
+		if err != nil {
+			reportQueueMu.Lock()
+			list := loadReportQueue()
+			list = append(list, queuedReport{ID: p.BatchID, Payload: raw, Created: p.ReportedAt, Attempts: 1, LastErr: err.Error()})
+			if len(list) > maxReportQueue {
+				list = list[len(list)-maxReportQueue:]
+			}
+			saveReportQueue(list)
+			reportQueueMu.Unlock()
+		}
+		// 无论成败都回显：发送的数据 + 接收端返回，便于后台核对
+		var payloadObj any
+		_ = json.Unmarshal(raw, &payloadObj)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":          err == nil,
+			"payload":     payloadObj,
+			"resp_status": status,
+			"resp_body":   respBody,
+			"error":       errString(err),
+			"queued":      err != nil,
+		})
+		return
+	})
+
 	mux.HandleFunc("/admin/api/clear-stats", func(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
 		stats = emptyStats()
@@ -4463,6 +4950,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	startStatsSaver()
 
 	startNetSpeedSampler()
+	startHourlySnapshotWorker()
+	startReportWorker()
 	detectSelfPublicIP()
 	initSessionsCleanup()
 	startGeoDBUpdater() // 定时更新本地 IP 库
@@ -5009,7 +5498,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="g2">
   <div style="display:flex;flex-direction:column;gap:24px;">
     <div class="card" style="margin-bottom:0;">
-      <div class="ch"><div><h2 class="ct">测速链接</h2><div class="cd">生成可视化测速页链接，可限制使用次数</div></div></div>
+      <div class="ch"><div><h2 class="ct">测速链接</h2><div class="cd">生成可视化测速页链接（类似 Speedtest），可限制使用次数</div></div></div>
       <div class="fi"><label class="fl">可使用次数</label>
         <div style="display:flex;gap:12px;align-items:center">
           <input id="spdUses" class="inp m" type="number" min="1" max="10000" value="5" style="max-width:120px">
@@ -5056,6 +5545,21 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
     <div class="fi"><label class="fl">域名白名单</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
     <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
+  </div>
+  <div class="card" style="margin-bottom:0;grid-column:1/-1;">
+    <div class="ch"><div><h2 class="ct">数据上报</h2><div class="hint" style="margin-top:4px">每小时向指定接口 POST 一次当日汇总（JSON + Bearer Token），失败自动排队重试，重启不丢</div></div>
+      <label class="sw"><input type="checkbox" id="reportOn"><span class="tr2"></span></label>
+    </div>
+    <div class="fi"><label class="fl">接收地址</label><div class="hint" style="margin-bottom:8px">留空则不上报，例如 https://api.example.com/collect</div><input id="reportUrl" class="inp m" type="url" placeholder="https://api.example.com/collect"></div>
+    <div class="fi"><label class="fl">Bearer Token</label><div class="hint" style="margin-bottom:8px">留空则不带 Authorization 头</div><input id="reportToken" class="inp m" type="text" placeholder="可选"></div>
+    <div class="fi"><label class="fl">服务器备注</label><div class="hint" style="margin-bottom:8px">随每批数据一起上报，用于在接收端区分多台服务器，如「香港节点」「家里宽带」</div><input id="reportNote" class="inp m" type="text" maxlength="60" placeholder="可选，如：香港节点"></div>
+    <div class="acts" style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn b" id="saveReport">保存上报配置</button>
+      <button class="btn g" id="testReport">立即上报一次</button>
+      <button class="btn g" id="reportStatus">查看队列</button>
+      <button class="btn g" id="reportClear">清空快照</button>
+    </div>
+    <div id="reportMsg" style="margin-top:12px;font-size:12.5px;color:var(--t3);word-break:break-all"></div>
   </div>
 </div>
 </section>
@@ -5238,6 +5742,10 @@ async function loadConfig(){
     document.getElementById('chinaOnly').checked=!!c.china_only;
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');
     document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
+    const ro=document.getElementById('reportOn');if(ro)ro.checked=!!c.report_on;
+    const ru=document.getElementById('reportUrl');if(ru)ru.value=c.report_url||'';
+    const rt=document.getElementById('reportToken');if(rt)rt.value=c.report_token||'';
+    const rn=document.getElementById('reportNote');if(rn)rn.value=c.report_note||'';
   }catch(e){console.error('loadConfig error:',e)}
 }
 
@@ -5783,7 +6291,11 @@ async function loadBlocks(){
 
 function collect(){
   const raw=parseInt(document.getElementById('portInput').value,10);
-  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean)}
+  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),
+    report_on:!!document.getElementById('reportOn')?.checked,
+    report_url:(document.getElementById('reportUrl')?.value||'').trim(),
+    report_token:(document.getElementById('reportToken')?.value||'').trim(),
+    report_note:(document.getElementById('reportNote')?.value||'').trim()}
 }
 async function save(){
   try{
@@ -5794,6 +6306,60 @@ async function save(){
   }catch(e){alert('保存失败：'+(e.message||'未知错误'))}
 }
 document.getElementById('savePort').addEventListener('click',save);document.getElementById('saveAll').addEventListener('click',save);
+
+/* ===== 数据上报 ===== */
+function reportMsg(t,color){const el=document.getElementById('reportMsg');if(el){el.textContent=t;el.style.color=color||'var(--t3)'}}
+document.getElementById('saveReport')?.addEventListener('click',async()=>{
+  const url=(document.getElementById('reportUrl')?.value||'').trim();
+  if(url && !/^https?:\/\//i.test(url)){reportMsg('地址需以 http:// 或 https:// 开头','var(--d)');return}
+  await save();
+  reportMsg('上报配置已保存'+(document.getElementById('reportOn')?.checked?'，将每小时上报':'（当前未开启）'),'var(--ok)');
+  setTimeout(()=>reportMsg(''),4000);
+});
+document.getElementById('testReport')?.addEventListener('click',async()=>{
+  reportMsg('正在上报…');
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'test'})});
+    const d=await r.json().catch(()=>({}));
+    if(d && d.payload!==undefined){
+      // 弹窗展示完整回显：发送数据 + 接收端返回
+      const head=d.ok
+        ?'<div style="color:var(--ok);font-weight:600;margin-bottom:10px">✓ 上报成功（HTTP '+d.resp_status+'）</div>'
+        :'<div style="color:var(--d);font-weight:600;margin-bottom:10px">✗ 上报失败：'+esc(d.error||'')+'<br><span style="font-weight:400;color:var(--t3)">数据已存入队列，稍后自动重试；接收端返回如下</span></div>';
+      document.getElementById('modalTitle').textContent='上报回显';
+      document.getElementById('modalBody').innerHTML=head
+        +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">发送的数据</div>'
+        +'<pre style="background:#f8fafc;border:1px solid var(--bd);border-radius:8px;padding:10px;font-size:11.5px;line-height:1.5;overflow:auto;max-height:300px;white-space:pre-wrap;word-break:break-all">'+esc(JSON.stringify(d.payload,null,2))+'</pre>'
+        +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin:10px 0 4px">接收端返回（HTTP '+d.resp_status+'）</div>'
+        +'<pre style="background:#f8fafc;border:1px solid var(--bd);border-radius:8px;padding:10px;font-size:11.5px;line-height:1.5;overflow:auto;max-height:160px;white-space:pre-wrap;word-break:break-all">'+esc(d.resp_body||'（空）')+'</pre>';
+      document.getElementById('modal').classList.add('on');
+      reportMsg(d.ok?'上报成功，详见弹窗':'上报失败，详见弹窗',d.ok?'var(--ok)':'var(--d)');
+    }else{
+      reportMsg(d.error||('HTTP '+r.status),'var(--d)');
+    }
+  }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
+});
+document.getElementById('reportStatus')?.addEventListener('click',async()=>{
+  reportMsg('查询中…');
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'status'})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){reportMsg(d.error||'查询失败','var(--d)');return}
+    if(!d.depth){reportMsg('队列为空，无积压数据（地址：'+(d.url||'未配置')+'）','var(--ok)');return}
+    reportMsg('积压 '+d.depth+' 批：'+d.queue.map(q=>q.id+'（重试'+q.attempts+'次'+(q.last_err?'，'+q.last_err:'')+'）').join('；'),'var(--w)');
+  }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
+});
+
+document.getElementById('reportClear')?.addEventListener('click',async()=>{
+  if(!confirm('确定清空上报快照链？清空后：手动上报会立即补建新快照重新开始，整点自动上报从下一个整点起恢复正常。排队中未发出的数据不受影响。'))return;
+  reportMsg('清空中…');
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear'})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){reportMsg(d.error||'清空失败','var(--d)');return}
+    reportMsg('快照已清空，到整点后会重新开始记录','var(--ok)');
+  }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
+});
 
 document.getElementById('changePassBtn').addEventListener('click',async()=>{
   const o=document.getElementById('oldPass').value,n=document.getElementById('newPass').value;
