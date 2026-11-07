@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Emby 路径反代 v2.2.0 — 一键安装 / 管理脚本
+# Emby 路径反代 — 一键安装 / 管理脚本
+#   版本号统一由下方 APP_VERSION 定义（紧跟 set -euo pipefail），只改那一处。
 # =============================================================================
 #
 # 功能概览
@@ -21,6 +22,17 @@
 #
 # =============================================================================
 set -euo pipefail
+
+# =============================================================================
+#  ★★★ 版本号 —— 本脚本唯一的版本定义，改这里就够了 ★★★
+#
+#  改完执行：  bash $0 update
+#  会同步到：  用法说明 / 菜单横幅 / 后台界面标题 / 编译进二进制的 appVersion
+#              / PWA manifest 描述 / 源码注释头
+#  同时源码哈希会变化，所以 update 一定会重新编译，不会命中缓存跳过。
+# =============================================================================
+APP_VERSION="3.0.0"
+# =============================================================================
 
 # ---------- 默认路径与版本（可通过 install 参数覆盖端口/路径等）----------
 SERVICE_NAME="emby-proxy"
@@ -67,7 +79,7 @@ require_systemd() {
 
 usage() {
   cat <<EOF
-Emby 路径反代 v2.2.0 一键安装
+Emby 路径反代 v${APP_VERSION} 一键安装
   sudo $0 [menu|install|update|uninstall|status|start|stop|restart]
 EOF
 }
@@ -164,7 +176,7 @@ ensure_go() {
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
-  package main
+package main
 
 /*
 Emby 路径反代 v2.2.0服务（单文件）
@@ -200,11 +212,11 @@ Emby 路径反代 v2.2.0服务（单文件）
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
-	"compress/gzip"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -231,15 +243,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/phuslu/iploc"
 	"github.com/gorilla/websocket"
+	"github.com/phuslu/iploc"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sync/singleflight"
 )
 
-//go:embed admin.html
 // adminHTML 为管理后台单页（构建时由脚本写入同目录 admin.html 后 embed）
+//
+//go:embed admin.html
 var adminHTML []byte
 
 // 上下文键：在 ReverseProxy.Rewrite 中取回目标 URL
@@ -247,6 +260,9 @@ type targetCtxKey struct{}
 
 var httpPorts = map[string]bool{"80": true, "8080": true, "8000": true, "8008": true, "8081": true, "8088": true, "8888": true, "3000": true, "5000": true, "7001": true, "8090": true, "8096": true, "9000": true, "9090": true, "9200": true, "10000": true, "15672": true}
 
+// schemeForPort 按端口推断上游协议。
+// 443/8443/8920/9443 视为 TLS 端口；httpPorts 表内的常见明文端口用 http；
+// 其余保守回落 https —— 宁可握手失败，也不把明文请求发到需要 TLS 的服务上。
 func schemeForPort(port string) string {
 	if port == "" || port == "443" || port == "8443" || port == "8920" || port == "9443" {
 		return "https"
@@ -256,6 +272,9 @@ func schemeForPort(port string) string {
 	}
 	return "https"
 }
+
+// schemeForAuthority 从 authority（可能带 userinfo、可能是 IPv6 方括号形式）中取出端口，
+// 再交给 schemeForPort 推断协议；未写端口时按 https 处理。
 func schemeForAuthority(authority string) string {
 	host := authority
 	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
@@ -271,6 +290,9 @@ func schemeForAuthority(authority string) string {
 	}
 	return schemeForPort(port)
 }
+
+// splitAuthority 把 "host:port/path" 拆成 authority 与 path 两段。
+// path 保留前导斜杠，没有路径时返回空串。
 func splitAuthority(s string) (authority, path string) {
 	if i := strings.IndexByte(s, '/'); i >= 0 {
 		return s[:i], s[i:]
@@ -280,6 +302,9 @@ func splitAuthority(s string) (authority, path string) {
 
 var builtinAssets = map[string]bool{"favicon.ico": true, "favicon.png": true, "favicon.svg": true, "favicon-16x16.png": true, "favicon-32x32.png": true, "favicon-96x96.png": true, "apple-touch-icon.png": true, "apple-touch-icon-precomposed.png": true, "robots.txt": true, "sitemap.xml": true, "browserconfig.xml": true, "manifest.json": true, "site.webmanifest": true, "humans.txt": true, "security.txt": true, "crossdomain.xml": true, "app-ads.txt": true}
 
+// isBuiltinAssetPath 判断请求路径是否属于浏览器/爬虫的常见静态资源探测
+// （favicon、robots.txt、.well-known/* 等）。这类请求不应被当成反代目标转发，
+// 否则会被解析成一个不存在的主机名并产生大量无意义的拦截记录。
 func isBuiltinAssetPath(p string) bool {
 	p = strings.TrimPrefix(p, "/")
 	if p == "" {
@@ -346,12 +371,16 @@ func writePage(w http.ResponseWriter, status int, iconClass, icon, title, desc, 
 	_, _ = w.Write([]byte(html))
 }
 
+// serveHome 根路径的健康检查页：只说明服务在跑，并给出管理后台入口，
+// 不暴露任何版本号以外的内部信息。
 func serveHome(w http.ResponseWriter, r *http.Request) {
 	extra := `<div class="acts" style="margin-top:8px"><a class="btn g" href="/admin/">管理</a></div>`
 	writePage(w, http.StatusOK, "", "", "",
 		"服务运行中。", extra)
 }
 
+// serveError 输出统一风格的错误页：按状态码挑选图标与配色，
+// body 文本只描述现象与建议，不携带上游地址、错误栈等技术细节。
 func serveError(w http.ResponseWriter, status int, title, message string) {
 	iconClass, icon := "red", "✕"
 	switch status {
@@ -444,9 +473,17 @@ var beijingLoc = func() *time.Location {
 	return loc
 }()
 
+// nowBeijing 返回当前北京时间。全项目的日期分桶与对外时间展示都以它为准，
+// 避免服务器所在时区不同导致「今天」错位。
 func nowBeijing() time.Time { return time.Now().In(beijingLoc) }
+
+// beijingDate 格式化为北京时间日期 YYYY-MM-DD，作为 Daily 统计的分桶键。
 func beijingDate(t time.Time) string { return t.In(beijingLoc).Format("2006-01-02") }
+
+// beijingHour 格式化为北京时间小时 HH（00-23），作为分时统计的键。
 func beijingHour(t time.Time) string { return t.In(beijingLoc).Format("15") }
+
+// beijingRFC3339 格式化为 RFC3339，用于对外输出的时间字段。
 func beijingRFC3339(t time.Time) string { return t.In(beijingLoc).Format(time.RFC3339) }
 
 var (
@@ -464,7 +501,7 @@ var (
 // 不再在本地缓存图标：一律 302 到源站，由浏览器自行缓存（省去进程内的图标副本与启动预热请求）。
 const (
 	iconFaviconURL = "https://i.ibb.co/H9QXXb8/emby-rp-icon.jpg"      // 网页 favicon（32x32）
-	iconLogoURL    = "https://i.ibb.co/KxByc0q8/emby-rp-logo.png"    // 品牌 Logo（512x512）
+	iconLogoURL    = "https://i.ibb.co/KxByc0q8/emby-rp-logo.png"     // 品牌 Logo（512x512）
 	icon192URL     = "https://i.ibb.co/84fwCqPj/emby-rp-logo-192.png" // PWA 192x192
 	icon512URL     = "https://i.ibb.co/RkTFtq4n/emby-rp-logo-512.png" // PWA 512x512
 )
@@ -474,6 +511,8 @@ func redirectIcon(w http.ResponseWriter, r *http.Request, src string) {
 	http.Redirect(w, r, src, http.StatusFound)
 }
 
+// currentCfg 读取当前配置的原子快照。未初始化时返回零值 Config，
+// 调用方无需判空，避免热路径上反复出现 nil 检查。
 func currentCfg() *Config {
 	if p := cfgPtr.Load(); p != nil {
 		return p
@@ -484,13 +523,16 @@ func currentCfg() *Config {
 // compiledACL 由 rebuildACL 在配置加载/保存时生成，供每个请求快速检查，
 // 避免在热路径上反复 net.ParseCIDR 与 strings.ToLower。
 type compiledACL struct {
-	exactBan map[string]struct{}
-	cidrs    []*net.IPNet
+	exactBan  map[string]struct{}
+	cidrs     []*net.IPNet
 	uaNeedles []string // 已小写；空 = 不限制
 }
 
 var aclPtr atomic.Pointer[compiledACL]
 
+// rebuildACL 把配置里的黑名单与 UA 白名单预编译成查表结构，
+// 写入 aclPtr 供每个请求无锁读取。配置加载/保存后调用一次即可。
+// 编译时统一做 TrimSpace 与小写，避免请求热路径上重复处理。
 func rebuildACL(c *Config) {
 	a := &compiledACL{exactBan: map[string]struct{}{}}
 	if c == nil {
@@ -518,12 +560,18 @@ func rebuildACL(c *Config) {
 	}
 	aclPtr.Store(a)
 }
+
+// currentACL 读取已编译的 ACL 快照；尚未编译时返回空规则（即不拦截任何请求），
+// 保证启动早期也不会因 nil 解引用崩溃。
 func currentACL() *compiledACL {
 	if p := aclPtr.Load(); p != nil {
 		return p
 	}
 	return &compiledACL{exactBan: map[string]struct{}{}}
 }
+
+// isBannedIP 判断 IP 是否命中黑名单：先查精确匹配表，再逐个比对 CIDR 段。
+// 精确表是 map 查找，绝大多数请求只走这一步。
 func isBannedIP(ipStr string, clientIP net.IP) bool {
 	a := currentACL()
 	if _, ok := a.exactBan[ipStr]; ok {
@@ -539,6 +587,9 @@ func isBannedIP(ipStr string, clientIP net.IP) bool {
 	}
 	return false
 }
+
+// uaAllowed 判断 UA 是否命中白名单关键字（子串、忽略大小写）。
+// 白名单为空表示不限制，直接放行。
 func uaAllowed(ua string) bool {
 	a := currentACL()
 	if len(a.uaNeedles) == 0 {
@@ -553,8 +604,12 @@ func uaAllowed(ua string) bool {
 	return false
 }
 
+// currentPort 返回当前实际监听端口（受 listenMu 保护，保存配置后可能热切换）。
 func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPort }
 
+// startListen 在指定端口启动监听并把连接交给 srv 处理，用于端口热切换。
+// 新旧监听的替换是「先起新的、再关旧的」：新端口监听失败时直接返回错误，
+// 旧监听保持不动，配置回滚也不会把服务弄断。
 func startListen(srv *http.Server, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -576,6 +631,8 @@ func startListen(srv *http.Server, port int) error {
 	return nil
 }
 
+// loadConfig 从 bolt 的 config bucket 读取配置到内存，并重建 ACL。
+// 库里没有配置时使用默认值，随后由调用方决定是否落盘。
 func loadConfig() {
 	c := &Config{}
 	if db != nil {
@@ -592,6 +649,9 @@ func loadConfig() {
 	cfgPtr.Store(c)
 	rebuildACL(c)
 }
+
+// saveConfig 把配置写入 bolt 并同步刷新内存快照与编译后的 ACL。
+// 写库失败时直接返回错误，不更新内存——避免出现「界面显示已保存、重启后丢失」。
 func saveConfig(c *Config) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -610,7 +670,8 @@ func saveConfig(c *Config) error {
 	return err
 }
 
-
+// normalizeHost 去掉端口与首尾空白，得到小写主机名，用于白名单比较。
+// IPv6 方括号形式会先去掉方括号。
 func normalizeHost(hostport string) string {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
@@ -621,6 +682,8 @@ func normalizeHost(hostport string) string {
 
 var multiSuffix = map[string]bool{"co.uk": true, "org.uk": true, "me.uk": true, "ac.uk": true, "gov.uk": true, "ltd.uk": true, "plc.uk": true, "net.uk": true, "sch.uk": true, "com.cn": true, "net.cn": true, "org.cn": true, "gov.cn": true, "edu.cn": true, "ac.cn": true, "com.tw": true, "org.tw": true, "net.tw": true, "idv.tw": true, "com.hk": true, "org.hk": true, "net.hk": true, "edu.hk": true, "gov.hk": true, "co.jp": true, "or.jp": true, "ne.jp": true, "ac.jp": true, "go.jp": true, "co.kr": true, "or.kr": true, "com.au": true, "net.au": true, "org.au": true, "com.br": true, "com.sg": true, "com.my": true, "co.in": true, "com.tr": true, "com.ru": true, "com.mx": true, "com.ar": true, "co.nz": true, "co.za": true, "com.ua": true, "com.pl": true, "co.id": true, "com.sa": true, "com.eg": true}
 
+// rootDomain 返回主域名（末两段），用于白名单的根域匹配。
+// 例：a.b.example.com → example.com，使子域自动获得授权。
 func rootDomain(hostport string) string {
 	host := normalizeHost(hostport)
 	if net.ParseIP(host) != nil {
@@ -637,6 +700,7 @@ func rootDomain(hostport string) string {
 	}
 	return strings.Join(parts[n-2:], ".")
 }
+
 // whitelistMatch 空列表表示不限制；支持完整 host、根域、以及 *.example.com 通配。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
@@ -682,42 +746,47 @@ type BlockEvent struct {
 
 // DayStat：按天统计（UpBytes=本机→客户端，DownBytes=上游→本机，Bytes=上下行合计）
 type DayStat struct {
-	Requests   int64            `json:"requests"`
-	Bytes      int64            `json:"bytes"`       // 上下行合计（兼容旧字段）
-	UpBytes    int64            `json:"up_bytes"`    // 上行（本机→客户端）
-	DownBytes  int64            `json:"down_bytes"`  // 下行（上游→本机）
-	BlockedCN  int64            `json:"blocked_cn"`
-	BlockedWL  int64            `json:"blocked_wl"`
-	BlockedBan int64            `json:"blocked_ban"`
-	BlockedRate int64           `json:"blocked_rate"`
-	BlockedUA  int64            `json:"blocked_ua"`
-	Countries  map[string]int64 `json:"countries,omitempty"`
-	IPs        map[string]int64 `json:"ips,omitempty"`
-	IPBytes    map[string]int64 `json:"ip_bytes,omitempty"`
-	IPUpBytes  map[string]int64 `json:"ip_up_bytes,omitempty"`
-	IPDownBytes map[string]int64 `json:"ip_down_bytes,omitempty"`
-	Hours      map[string]int64 `json:"hours,omitempty"`
-	HourBytes  map[string]int64 `json:"hour_bytes,omitempty"`
-	HourUpBytes map[string]int64 `json:"hour_up_bytes,omitempty"`
-	HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"`
-	Hosts      map[string]int64 `json:"hosts,omitempty"`
+	Requests      int64            `json:"requests"`   // 请求次数
+	Bytes         int64            `json:"bytes"`      // 上下行合计（兼容旧字段）
+	UpBytes       int64            `json:"up_bytes"`   // 上行（本机→客户端）
+	DownBytes     int64            `json:"down_bytes"` // 下行（上游→本机）
+	BlockedCN     int64            `json:"blocked_cn"`
+	BlockedWL     int64            `json:"blocked_wl"`
+	BlockedBan    int64            `json:"blocked_ban"`
+	BlockedRate   int64            `json:"blocked_rate"`
+	BlockedUA     int64            `json:"blocked_ua"`
+	Countries     map[string]int64 `json:"countries,omitempty"`       // 国家码 → 请求次数
+	IPs           map[string]int64 `json:"ips,omitempty"`             // IP → 请求次数（注意：不是流量，流量见下面三张表）
+	IPBytes       map[string]int64 `json:"ip_bytes,omitempty"`        // IP → 上下行合计字节
+	IPUpBytes     map[string]int64 `json:"ip_up_bytes,omitempty"`     // IP → 上行字节（本机 → 客户端）
+	IPDownBytes   map[string]int64 `json:"ip_down_bytes,omitempty"`   // IP → 下行字节（上游 → 本机）
+	Hours         map[string]int64 `json:"hours,omitempty"`           // 小时 HH → 请求次数
+	HourBytes     map[string]int64 `json:"hour_bytes,omitempty"`      // 小时 HH → 合计字节
+	HourUpBytes   map[string]int64 `json:"hour_up_bytes,omitempty"`   // 小时 HH → 上行字节
+	HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"` // 小时 HH → 下行字节
+	Hosts         map[string]int64 `json:"hosts,omitempty"`           // 上游域名 → 请求次数
 }
 
+// newDayStat 创建一天的统计对象，并初始化全部明细 map。
+// map 必须在这里就建好：后续累加走的是直接索引赋值，nil map 会 panic。
 func newDayStat() *DayStat {
 	return &DayStat{
-		Countries: map[string]int64{},
-		IPs:       map[string]int64{},
-		IPBytes:   map[string]int64{},
-		IPUpBytes: map[string]int64{},
-		IPDownBytes: map[string]int64{},
-		Hours:     map[string]int64{},
-		HourBytes: map[string]int64{},
-		HourUpBytes: map[string]int64{},
+		Countries:     map[string]int64{},
+		IPs:           map[string]int64{},
+		IPBytes:       map[string]int64{},
+		IPUpBytes:     map[string]int64{},
+		IPDownBytes:   map[string]int64{},
+		Hours:         map[string]int64{},
+		HourBytes:     map[string]int64{},
+		HourUpBytes:   map[string]int64{},
 		HourDownBytes: map[string]int64{},
-		Hosts:     map[string]int64{},
+		Hosts:         map[string]int64{},
 	}
 }
 
+// ensureDayMaps 补齐某天的明细 map。
+// 从旧版本数据库反序列化出来的 DayStat 可能缺少后加的字段，遍历前必须先补，
+// 否则读取路径上会 panic（写路径则静默失败）。
 func ensureDayMaps(d *DayStat) {
 	if d.Countries == nil {
 		d.Countries = map[string]int64{}
@@ -751,6 +820,8 @@ func ensureDayMaps(d *DayStat) {
 	}
 }
 
+// copyInt64Map 复制一份 int64 map。统计 map 在锁外被遍历前必须先拷贝，
+// 否则会与统计 worker 的写入并发冲突。空 map 返回 nil，便于 JSON omitempty。
 func copyInt64Map(src map[string]int64) map[string]int64 {
 	if len(src) == 0 {
 		return nil
@@ -791,30 +862,30 @@ func dayOf(date string) *DayStat {
 // 写入：recordRequestStart → statChan → startStatsWorker 单协程聚合
 // 落盘：startStatsSaver 每 5 分钟 prune + 写入 stats_meta / stats_daily / stats_blocks
 type Stats struct {
-	SchemaVersion    int                 `json:"schema_version"` // 2 = 上下行新口径（下行=上游→本机，上行=本机→客户端）
-	TodayDate        string              `json:"today_date"`
-	TodayRequests    int64               `json:"today_requests"`
-	TodayBytes       int64               `json:"today_bytes"`
-	TodayUpBytes     int64               `json:"today_up_bytes"`
-	TodayDownBytes   int64               `json:"today_down_bytes"`
-	TotalRequests    int64               `json:"total_requests"`
-	TotalBytes       int64               `json:"total_bytes"`
-	TotalUpBytes     int64               `json:"total_up_bytes"`
-	TotalDownBytes   int64               `json:"total_down_bytes"`
-	BlockedCN        int64               `json:"blocked_cn"`
-	BlockedWhitelist int64               `json:"blocked_whitelist"`
-	BlockedBan       int64               `json:"blocked_ban"`
-	BlockedRate      int64               `json:"blocked_rate"`
-	BlockedUA        int64               `json:"blocked_ua"`
-	LastProxyAt      string              `json:"last_proxy_at"`
-	CountryCounts    map[string]int64    `json:"country_counts"`
-	IPCounts         map[string]int64    `json:"ip_counts"`
-	IPBytes          map[string]int64    `json:"ip_bytes"`
-	IPUpBytes        map[string]int64    `json:"ip_up_bytes"`
-	IPDownBytes      map[string]int64    `json:"ip_down_bytes"`
-	Daily            map[string]*DayStat `json:"daily,omitempty"`
-	Blocks           []BlockEvent        `json:"blocks"`
-	Audit            []AuditEvent        `json:"audit,omitempty"`
+	SchemaVersion    int                 `json:"schema_version"`    // 2 = 上下行新口径（下行=上游→本机，上行=本机→客户端）
+	TodayDate        string              `json:"today_date"`        // 今日日期（北京时间），与 Today* 配套，跨天时整体重置
+	TodayRequests    int64               `json:"today_requests"`    // 今日累计请求数
+	TodayBytes       int64               `json:"today_bytes"`       // 今日累计流量（上下行合计）
+	TodayUpBytes     int64               `json:"today_up_bytes"`    // 今日上行字节
+	TodayDownBytes   int64               `json:"today_down_bytes"`  // 今日下行字节
+	TotalRequests    int64               `json:"total_requests"`    // 历史累计请求数
+	TotalBytes       int64               `json:"total_bytes"`       // 历史累计流量（上下行合计）
+	TotalUpBytes     int64               `json:"total_up_bytes"`    // 历史上行字节
+	TotalDownBytes   int64               `json:"total_down_bytes"`  // 历史下行字节
+	BlockedCN        int64               `json:"blocked_cn"`        // 拦截：非中国大陆 IP
+	BlockedWhitelist int64               `json:"blocked_whitelist"` // 拦截：上游域名不在白名单
+	BlockedBan       int64               `json:"blocked_ban"`       // 拦截：命中 IP 黑名单
+	BlockedRate      int64               `json:"blocked_rate"`      // 拦截：触发限流
+	BlockedUA        int64               `json:"blocked_ua"`        // 拦截：UA 不在白名单
+	LastProxyAt      string              `json:"last_proxy_at"`     // 最近一次成功反代的时间
+	CountryCounts    map[string]int64    `json:"country_counts"`    // 全局聚合：国家码 → 请求次数（由 Daily 汇总，Top1000）
+	IPCounts         map[string]int64    `json:"ip_counts"`         // 全局聚合：IP → 请求次数（Top1000）
+	IPBytes          map[string]int64    `json:"ip_bytes"`          // 全局聚合：IP → 合计字节（Top1000）
+	IPUpBytes        map[string]int64    `json:"ip_up_bytes"`       // 全局聚合：IP → 上行字节（Top1000）
+	IPDownBytes      map[string]int64    `json:"ip_down_bytes"`     // 全局聚合：IP → 下行字节（Top1000）
+	Daily            map[string]*DayStat `json:"daily,omitempty"`   // 按日期分桶的明细，是对外统计与上报的唯一真相来源
+	Blocks           []BlockEvent        `json:"blocks"`            // 最近的拦截事件（环形截断，仅保留最近若干条）
+	Audit            []AuditEvent        `json:"audit,omitempty"`   // 最近的管理操作审计事件
 }
 
 // AuditEvent 管理操作审计
@@ -831,13 +902,13 @@ var (
 )
 
 type statEvent struct {
-	IP       string
-	Country  string
-	Host     string
-	Bytes    int64
-	UpBytes  int64
+	IP        string
+	Country   string
+	Host      string
+	Bytes     int64
+	UpBytes   int64
 	DownBytes int64
-	IsStart  bool
+	IsStart   bool
 }
 
 var statChan = make(chan statEvent, 10000)
@@ -858,14 +929,82 @@ type portTraffic struct {
 
 var traffic portTraffic
 
+// reqBytes 单次请求的上下行字节计数（通过 context 传递）
+type reqBytes struct {
+	up   atomic.Int64
+	down atomic.Int64
+	ip   string
+}
+
+type reqBytesKey struct{}
+
+// withReqBytes 把本次请求的字节计数器挂到 context 上。
+// 反代的 ModifyResponse 拿不到外层 handler 的局部变量，只能通过 context 传递。
+func withReqBytes(ctx context.Context, rb *reqBytes) context.Context {
+	return context.WithValue(ctx, reqBytesKey{}, rb)
+}
+
+// reqBytesFrom 从 context 取回字节计数器；不存在时返回 nil，调用方需容忍。
+func reqBytesFrom(ctx context.Context) *reqBytes {
+	rb, _ := ctx.Value(reqBytesKey{}).(*reqBytes)
+	return rb
+}
+
+// ipLiveRate 实时网速：按 IP 累计近期字节，采样时计算速率后清零
+type ipLiveRate struct {
+	up   atomic.Int64
+	down atomic.Int64
+}
+
+var ipLiveRates sync.Map // ip -> *ipLiveRate
+
+// addIPLive 把本次收发字节累加到该 IP 的实时速率桶。
+// 只做累加，清零与速率换算由采样器负责——这样采样周期与请求频率解耦。
+func addIPLive(ip string, up, down int64) {
+	if ip == "" || (up == 0 && down == 0) {
+		return
+	}
+	v, _ := ipLiveRates.LoadOrStore(ip, &ipLiveRate{})
+	r := v.(*ipLiveRate)
+	if up > 0 {
+		r.up.Add(up)
+	}
+	if down > 0 {
+		r.down.Add(down)
+	}
+}
+
+// snapshotIPRates 取出并清零各 IP 的近期字节，返回 map[ip]{up,down}（调用方按时间差算速率）
+func snapshotIPRates() map[string][2]int64 {
+	out := make(map[string][2]int64)
+	ipLiveRates.Range(func(k, v any) bool {
+		r := v.(*ipLiveRate)
+		up, down := r.up.Swap(0), r.down.Swap(0)
+		if up > 0 || down > 0 {
+			out[k.(string)] = [2]int64{up, down}
+		}
+		return true
+	})
+	return out
+}
+
 // countingReader 包装响应体，读取时累计下行字节。
 // 反代是边读边写的同步拷贝，读多少基本等于写给客户端多少。
-type countingReader struct{ r io.Reader }
+type countingReader struct {
+	r  io.Reader
+	rb *reqBytes
+}
 
+// Read 包装上游响应体的读取，顺带累计下行字节。
+// 反代是边读边写的同步拷贝，读到的量基本等于写给客户端的量。
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
 		traffic.down.Add(int64(n))
+		if c.rb != nil {
+			c.rb.down.Add(int64(n))
+			addIPLive(c.rb.ip, 0, int64(n))
+		}
 	}
 	return n, err
 }
@@ -873,12 +1012,18 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // countingWriter 包装 ResponseWriter，写出时累计上行字节。
 type countingWriter struct {
 	http.ResponseWriter
+	rb *reqBytes
 }
 
+// Write 包装响应写出，顺带累计上行字节。
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.ResponseWriter.Write(p)
 	if n > 0 {
 		traffic.up.Add(int64(n))
+		if c.rb != nil {
+			c.rb.up.Add(int64(n))
+			addIPLive(c.rb.ip, int64(n), 0)
+		}
 	}
 	return n, err
 }
@@ -895,6 +1040,8 @@ func (c *countingWriter) Flush() {
 // 避免“刚进页面要等几分钟才出数”。带缓冲 1，重复投递不会阻塞。
 var netSpeedWake = make(chan struct{}, 1)
 
+// wakeNetSpeedSampler 唤醒长睡中的采样器。
+// 采样器空闲时会拉长间隔省 CPU，后台打开实时监控时投递一次信号即可立即出数。
 func wakeNetSpeedSampler() {
 	select {
 	case netSpeedWake <- struct{}{}:
@@ -922,6 +1069,8 @@ var (
 	liveSeq  atomic.Int64
 )
 
+// pushLiveEvent 把一条请求事件写入实时环形缓冲，并更新当秒 RPS 计数。
+// 无人观看（liveClients 为 0）时直接返回，避免无谓的开销。
 func pushLiveEvent(ip, country, host, path string) {
 	if liveClients.Load() == 0 {
 		return // 无人观看时不收集
@@ -952,6 +1101,7 @@ func pushLiveEvent(ip, country, host, path string) {
 	liveMu.Unlock()
 }
 
+// clearLive 清空实时事件缓冲与 RPS 计数，用于后台「清空」操作。
 func clearLive() {
 	liveMu.Lock()
 	liveBuf = nil
@@ -960,6 +1110,8 @@ func clearLive() {
 	rpsCount.Store(0)
 }
 
+// snapshotLive 取一份实时事件快照（按时间正序，最新在后），并附带当前并发与 RPS。
+// 环形缓冲写满后会覆盖最旧的事件，拷贝时需按 head 位置分两段拼接。
 func snapshotLive() (events []liveEvent, conc int64, rps int64) {
 	liveMu.Lock()
 	n := len(liveBuf)
@@ -981,6 +1133,7 @@ type netSpeed struct {
 	RxBps int64 `json:"rx_bps"`
 	TxBps int64 `json:"tx_bps"`
 }
+
 var (
 	netSpeedMu  sync.RWMutex
 	curNetSpeed netSpeed
@@ -1021,16 +1174,8 @@ func startNetSpeedSampler() {
 						curNetSpeed = netSpeed{RxBps: rxBps, TxBps: txBps}
 						netSpeedMu.Unlock()
 					}
-					// 流量累计：
-					// 端口计数下 down（上游→本机）与 up（本机→客户端）是同一份数据的
-					// 两端，相加即为重复计算。这里只上报 down 作为真实业务流量，
-					// up 置 0，使 total = down 等于实际转发字节数。
-					if dRx > 0 {
-						select {
-						case statChan <- statEvent{DownBytes: dRx, Bytes: dRx}:
-						default:
-						}
-					}
+					// 流量累计已改为请求结束时按 IP 精确上报，这里不再重复上报全局增量。
+					// 全局计数器仅用于实时速率计算。
 				}
 			}
 			lastRx, lastTx, lastT = rx, tx, now
@@ -1058,6 +1203,7 @@ func startNetSpeedSampler() {
 	}()
 }
 
+// getNetSpeed 返回最近一次采样得到的整机网速快照（读锁保护）。
 func getNetSpeed() netSpeed {
 	netSpeedMu.RLock()
 	defer netSpeedMu.RUnlock()
@@ -1079,6 +1225,8 @@ var speedTokens sync.Map // token -> *speedToken
 // 测速链接有效期：创建 7 天后自动过期（惰性校验 + 定时清理）
 const speedTokenValidity = 7 * 24 * time.Hour
 
+// speedTokenExpired 判断测速链接是否已超过有效期。
+// 创建时间解析失败时按未过期处理，兼容历史数据。
 func speedTokenExpired(st *speedToken) bool {
 	t, err := time.Parse(time.RFC3339, st.Created)
 	if err != nil {
@@ -1180,6 +1328,7 @@ var (
 
 const maxSpeedResults = 100
 
+// loadSpeedResults 从 bolt 载入历史测速结果（启动时调用一次）。
 func loadSpeedResults() {
 	speedResults = nil
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -1197,6 +1346,8 @@ func loadSpeedResults() {
 	})
 }
 
+// appendSpeedResult 追加一条测速结果并按上限裁剪，随后整体写盘。
+// 先拷贝快照再放锁写盘：写 bolt 比内存追加慢得多，不应占着锁影响测速请求。
 func appendSpeedResult(r speedResult) {
 	speedResultsMu.Lock()
 	speedResults = append(speedResults, r)
@@ -1223,21 +1374,28 @@ func appendSpeedResult(r speedResult) {
 
 // reportSnap 上次上报时的日累计快照（含三张明细 map，用于差分出周期增量）
 type reportSnap struct {
-	Date       string           `json:"date"`
-	At         string           `json:"at"` // 快照时间 RFC3339
-	Requests   int64            `json:"requests"`
-	Up         int64            `json:"up"`
-	Down       int64            `json:"down"`
-	BlockedCN  int64            `json:"blocked_cn"`
-	BlockedWL  int64            `json:"blocked_wl"`
-	BlockedBan int64            `json:"blocked_ban"`
-	BlockedRate int64           `json:"blocked_rate"`
-	BlockedUA  int64            `json:"blocked_ua"`
-	Hosts      map[string]int64 `json:"hosts,omitempty"`
-	IPs        map[string]int64 `json:"ips,omitempty"`
-	Countries  map[string]int64 `json:"countries,omitempty"`
+	Date        string           `json:"date"`
+	At          string           `json:"at"` // 快照时间 RFC3339
+	Requests    int64            `json:"requests"`
+	Up          int64            `json:"up"`
+	Down        int64            `json:"down"`
+	BlockedCN   int64            `json:"blocked_cn"`
+	BlockedWL   int64            `json:"blocked_wl"`
+	BlockedBan  int64            `json:"blocked_ban"`
+	BlockedRate int64            `json:"blocked_rate"`
+	BlockedUA   int64            `json:"blocked_ua"`
+	Hosts       map[string]int64 `json:"hosts,omitempty"`
+	IPs         map[string]int64 `json:"ips,omitempty"`
+	Countries   map[string]int64 `json:"countries,omitempty"`
+	// 按 IP 的流量明细（用于上报每 IP 上下行增量）
+	IPBytes     map[string]int64 `json:"ip_bytes,omitempty"`
+	IPUpBytes   map[string]int64 `json:"ip_up_bytes,omitempty"`
+	IPDownBytes map[string]int64 `json:"ip_down_bytes,omitempty"`
 }
 
+// satSub 计算 a-b 并饱和到 0。统计值理论上单调递增，
+// 但快照被清空、跨天重置或进程重启都可能让当前值小于基准值，
+// 此时增量应视为 0 而不是负数。
 func satSub(a, b int64) int64 {
 	if a > b {
 		return a - b
@@ -1258,42 +1416,54 @@ func mapDelta(cur, prev map[string]int64) map[string]int64 {
 
 // reportPayload 上报体：单个统计周期的增量
 type reportPayload struct {
-	BatchID      string `json:"batch_id"`    // 批次唯一 ID（node_key+周期起点），接收端可幂等去重
-	NodeKey      string `json:"node_key"`    // 节点唯一标识（首次启动自动生成，持久化）
-	Node         string `json:"node"`        // 节点名称（本机公网 IP 或主机名）
-	Note         string `json:"note"`        // 服务器备注（后台配置）
-	Version      string `json:"version"`     // 程序版本
-	PeriodStart  string `json:"period_start"` // 统计周期起点（北京时间 RFC3339）
-	PeriodEnd    string `json:"period_end"`   // 统计周期终点
-	PeriodDate   string `json:"period_date"`  // 周期归属日期（YYYY-MM-DD，便于查询/归档）
-	PeriodHour   string `json:"period_hour"`  // 周期归属小时（两位 HH，如 "14" 表示 14 点档）
-	ReportedAt   string `json:"reported_at"`  // 上报时间
-	Requests     int64  `json:"requests"`     // 周期内请求数
-	UpBytes      int64  `json:"up_bytes"`     // 周期内上行
-	DownBytes    int64  `json:"down_bytes"`   // 周期内下行
-	Blocked      int64  `json:"blocked"`      // 周期内拦截总数
-	BlockedCN    int64  `json:"blocked_cn"`
-	BlockedBan   int64  `json:"blocked_ban"`
-	BlockedRate  int64  `json:"blocked_rate"`
-	BlockedUA    int64  `json:"blocked_ua"`
-	BlockedWL    int64  `json:"blocked_whitelist"`
-	Hosts        map[string]int64 `json:"hosts,omitempty"`     // 周期内上游主机请求增量（Top100）
-	IPs          map[string]int64 `json:"ips,omitempty"`       // 周期内客户端 IP 请求增量（Top100）
-	Countries    map[string]int64 `json:"countries,omitempty"` // 周期内国家/地区增量（中文名）
-	QueueDepth   int    `json:"queue_depth"` // 上报时积压批次数
+	BatchID     string `json:"batch_id"`
+	NodeKey     string `json:"node_key"`
+	Node        string `json:"node"`
+	Note        string `json:"note"`
+	Version     string `json:"version"`
+	PeriodStart string `json:"period_start"`
+	PeriodEnd   string `json:"period_end"`
+	PeriodDate  string `json:"period_date"`
+	PeriodHour  string `json:"period_hour"`
+	ReportedAt  string `json:"reported_at"`
+	Requests    int64  `json:"requests"`
+	UpBytes     int64  `json:"up_bytes"`
+	DownBytes   int64  `json:"down_bytes"`
+	Blocked     int64  `json:"blocked"`
+	BlockedCN   int64  `json:"blocked_cn"`
+	BlockedBan  int64  `json:"blocked_ban"`
+	BlockedRate int64  `json:"blocked_rate"`
+	BlockedUA   int64  `json:"blocked_ua"`
+	BlockedWL   int64  `json:"blocked_whitelist"`
+	// 明细 map 一律不加 omitempty：本周期没有数据时下发 {}，
+	// 让接收端能区分「这个周期确实没流量」和「服务端根本没实现该字段」。
+	Hosts      map[string]int64 `json:"hosts"`
+	IPs        map[string]int64 `json:"ips"`         // 每 IP 请求次数（历史字段，含义不变）
+	IPRequests map[string]int64 `json:"ip_requests"` // 与 ips 同值：语义化命名，避免被当成流量
+	Countries  map[string]int64 `json:"countries"`
+	// 按 IP 的流量增量（Top100，按「上行+下行」总量裁剪；三张表 key 集合严格一致）
+	IPBytes     map[string]int64 `json:"ip_bytes"`
+	IPUpBytes   map[string]int64 `json:"ip_up_bytes"`
+	IPDownBytes map[string]int64 `json:"ip_down_bytes"`
+	// 自证字段：便于接收端与后台对账，排查「有请求无流量」这类缺口。
+	IPStatsOK   bool  `json:"ip_stats_ok"`   // 本批次是否含按 IP 流量数据
+	StatDropped int64 `json:"stats_dropped"` // 进程内统计通道累计丢弃条数（持续增长说明采集有缺口）
+	QueueDepth  int   `json:"queue_depth"`
 }
 
 var reportQueueMu sync.Mutex
 
-// buildCurrentSnap 生成当前日累计快照（含三张明细 map）
+// buildCurrentSnap 生成当前日累计快照（含三张明细 map）。
+// 注意：必须在 statsMu 内完成 map 拷贝——原实现只把 Stats 结构体浅拷贝出锁，
+// 之后在锁外遍历 Daily/IPs 等 map，会与统计 worker 的并发写撞车
+// （Go runtime 直接抛 "concurrent map read and map write" 终止进程）。
 func buildCurrentSnap() reportSnap {
-	statsMu.Lock()
-	s := stats
-	statsMu.Unlock()
 	now := nowBeijing()
 	date := beijingDate(now)
 	sn := reportSnap{Date: date, At: beijingRFC3339(now)}
-	if d := s.Daily[date]; d != nil {
+	statsMu.Lock()
+	defer statsMu.Unlock()
+	if d := stats.Daily[date]; d != nil {
 		sn.Requests, sn.Up, sn.Down = d.Requests, d.UpBytes, d.DownBytes
 		sn.BlockedCN, sn.BlockedWL, sn.BlockedBan = d.BlockedCN, d.BlockedWL, d.BlockedBan
 		sn.BlockedRate, sn.BlockedUA = d.BlockedRate, d.BlockedUA
@@ -1302,6 +1472,10 @@ func buildCurrentSnap() reportSnap {
 		sn.Hosts = copyInt64Map(d.Hosts)
 		sn.IPs = copyInt64Map(d.IPs)
 		sn.Countries = copyInt64Map(d.Countries)
+		// 按 IP 流量明细
+		sn.IPBytes = copyInt64Map(d.IPBytes)
+		sn.IPUpBytes = copyInt64Map(d.IPUpBytes)
+		sn.IPDownBytes = copyInt64Map(d.IPDownBytes)
 	}
 	return sn
 }
@@ -1320,6 +1494,8 @@ func loadReportSnaps() []reportSnap {
 	return list
 }
 
+// saveReportSnaps 保存整份快照列表（与补传队列共用 report_queue bucket，键为 snaps）。
+// 快照是「上次上报时的日累计值」，据此做差分才能得到每个周期的增量。
 func saveReportSnaps(list []reportSnap) {
 	raw, _ := json.Marshal(list)
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -1380,16 +1556,84 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 	pruneTopN(p.Hosts, 100)
 	p.IPs = mapDelta(cur.IPs, base.IPs)
 	pruneTopN(p.IPs, 100)
+	p.IPRequests = p.IPs // 同一份数据，另给一个不会被误读成「流量」的字段名
 	ctryDelta := mapDelta(cur.Countries, base.Countries)
-	if len(ctryDelta) > 0 {
-		p.Countries = make(map[string]int64, len(ctryDelta))
-		for code, v := range ctryDelta {
-			name := countryName(code)
-			p.Countries[name] += v
-		}
+	p.Countries = make(map[string]int64, len(ctryDelta)) // 空也下发 {}，不出现 null
+	for code, v := range ctryDelta {
+		name := countryName(code)
+		p.Countries[name] += v
 	}
+	// 按 IP 的流量增量。
+	// 旧实现用 ip_down_bytes 当唯一白名单去删另外两张表：一旦下行增量为 0
+	// （窗口内没有媒体流、快照被清空、请求刚发起还没结束……），
+	// keepIPs 为空集，ip_up_bytes 与 ip_bytes 会被逐条删光，
+	// 最终表现为「有 ips 请求次数、三个流量字段一起消失」。
+	// 现在改为：三张表各自算增量 → 按「上行+下行」总量统一选 Top100 →
+	// 保留的 IP 在三张表里都补齐（缺的写 0），key 集合严格一致、不丢数据。
+	p.IPBytes = mapDelta(cur.IPBytes, base.IPBytes)
+	p.IPUpBytes = mapDelta(cur.IPUpBytes, base.IPUpBytes)
+	p.IPDownBytes = mapDelta(cur.IPDownBytes, base.IPDownBytes)
+
+	keepIPs := topIPsByTotal(p.IPBytes, p.IPUpBytes, p.IPDownBytes, 100)
+	p.IPBytes = alignIPStats(p.IPBytes, keepIPs)
+	p.IPUpBytes = alignIPStats(p.IPUpBytes, keepIPs)
+	p.IPDownBytes = alignIPStats(p.IPDownBytes, keepIPs)
+
+	p.IPStatsOK = len(p.IPBytes) > 0
+	p.StatDropped = statDropped.Load()
 	p.BatchID = p.NodeKey + "-" + p.PeriodDate + "-" + p.PeriodHour
 	return p
+}
+
+// topIPsByTotal 从三张按 IP 的明细表中挑出「合计流量最大」的前 n 个 IP。
+// 排序口径优先用 up+down（真实吞吐），缺失时回落到 bytes 字段，
+// 这样只上传、只下载、或只有合计的 IP 都不会被误杀。
+func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} {
+	score := make(map[string]int64, len(total)+len(up)+len(down))
+	for ip := range total {
+		score[ip] = total[ip]
+	}
+	for ip := range up {
+		if s := up[ip] + down[ip]; s > score[ip] {
+			score[ip] = s
+		}
+	}
+	for ip := range down {
+		if s := up[ip] + down[ip]; s > score[ip] {
+			score[ip] = s
+		}
+	}
+	if n <= 0 || len(score) <= n {
+		out := make(map[string]struct{}, len(score))
+		for ip := range score {
+			out[ip] = struct{}{}
+		}
+		return out
+	}
+	type kv struct {
+		k string
+		v int64
+	}
+	arr := make([]kv, 0, len(score))
+	for ip, v := range score {
+		arr = append(arr, kv{ip, v})
+	}
+	sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+	out := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		out[arr[i].k] = struct{}{}
+	}
+	return out
+}
+
+// alignIPStats 把按 IP 的明细裁剪到 keep 集合并补齐缺失键（值为 0）。
+// 补齐而不是删除，是为了让接收端能对同一 IP 直接对齐 bytes / up / down 三个字段。
+func alignIPStats(m map[string]int64, keep map[string]struct{}) map[string]int64 {
+	out := make(map[string]int64, len(keep))
+	for ip := range keep {
+		out[ip] = m[ip] // 不存在时取零值
+	}
+	return out
 }
 
 // lastFullHourReport 取最近两个整点快照的差分 = 上一个完整自然小时的增量。
@@ -1420,13 +1664,16 @@ func lastFullHourReport() (reportPayload, bool) {
 	return payloadFromDelta(snaps[len(snaps)-2], snaps[len(snaps)-1]), true
 }
 
+// parseRFC3339 解析 RFC3339 时间。解析失败返回零值时间，
+// 调用方应把零值视为「未知」而不是「1970 年」，避免分桶出现 08 点这类异常键。
 func parseRFC3339(s string) time.Time {
 	t, _ := time.Parse(time.RFC3339, s)
 	return t
 }
 
 // detectNodeName 节点标识：优先本机公网 IP，其次主机名
-func detectNodeName() string {	if ip, _ := selfPublicIP.Load().(string); ip != "" {
+func detectNodeName() string {
+	if ip, _ := selfPublicIP.Load().(string); ip != "" {
 		return ip
 	}
 	if h, err := os.Hostname(); err == nil && h != "" {
@@ -1466,18 +1713,259 @@ func getNodeKey() string {
 	return key
 }
 
+// ---------- 上报记录（每次投递的结果留痕，保留 30 天） ----------
+//
+// 与上报队列相互独立：队列管「还没送出去的数据」，记录管「送出去的每一次结果」。
+// 无论自动整点上报、手动立即上报还是失败补传，只要发生一次 HTTP 投递就写一条记录。
+type reportRecord struct {
+	ID         string `json:"id"`          // 记录 ID（时间戳-随机）
+	Time       string `json:"time"`        // 投递时间（北京时间 RFC3339）
+	BatchID    string `json:"batch_id"`    // 批次 ID
+	Trigger    string `json:"trigger"`     // auto=整点自动 manual=手动 retry=补传
+	OK         bool   `json:"ok"`          // 是否成功
+	StatusCode int    `json:"status_code"` // 接收端 HTTP 状态码，0=未拿到响应
+	Error      string `json:"error,omitempty"`
+	RespBody   string `json:"resp_body,omitempty"` // 接收端响应片段（最多 512 字节）
+	Attempts   int    `json:"attempts"`            // 该批第几次尝试
+	PeriodDate string `json:"period_date"`         // 数据周期归属日期
+	PeriodHour string `json:"period_hour"`         // 数据周期归属小时
+	Requests   int64  `json:"requests"`
+	UpBytes    int64  `json:"up_bytes"`
+	DownBytes  int64  `json:"down_bytes"`
+	Blocked    int64  `json:"blocked"`
+	URL        string `json:"url"`  // 投递时的接收地址
+	Note       string `json:"note"` // 服务器备注
+	IP         string `json:"ip"`   // 触发来源 IP（手动上报时有值）
+	DurationMS int64  `json:"duration_ms"`
+	Size       int    `json:"size"` // 请求体字节数
+	// 原始上报报文（完整 JSON 原文）单独存放在 report_payloads bucket，
+	// key = 记录 ID，这里只标记是否已保存。
+	// 不把原文塞进记录结构：3000 条记录每次 append 都要整体 marshal 落盘，
+	// 带上原文会让单次写盘膨胀到几十 MB。
+	PayloadSaved bool `json:"payload_saved"`
+}
+
+const (
+	reportRecordKeepDays = 30               // 记录保留天数
+	maxReportRecords     = 3000             // 条数硬上限，防止极端情况下无限增长
+	reportRecordBucket   = "report_records" // bolt bucket
+	reportPayloadBucket  = "report_payloads"
+	// 单条原文上限。正常一小时的上报体在 5~30KB，512KB 足以容纳
+	// Top100 全满的极端情况，同时防止异常报文把库撑爆。
+	maxReportPayloadLen = 512 << 10
+)
+
+var (
+	reportRecords   []reportRecord
+	reportRecordsMu sync.Mutex
+)
+
+// loadReportRecords 启动时载入并顺带做一次 30 天清理
+func loadReportRecords() {
+	reportRecordsMu.Lock()
+	defer reportRecordsMu.Unlock()
+	reportRecords = nil
+	_ = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(reportRecordBucket))
+		if b == nil {
+			return nil
+		}
+		if raw := b.Get([]byte("data")); raw != nil {
+			_ = json.Unmarshal(raw, &reportRecords)
+		}
+		return nil
+	})
+	if pruneReportRecordsLocked() {
+		persistReportRecordsLocked()
+	}
+	// 顺带清掉没有对应记录的孤儿报文（异常退出、历史裁剪残留）
+	gcReportPayloadsLocked()
+}
+
+// pruneReportRecordsLocked 删除超过保留期或超出条数上限的记录，返回是否有变更（调用方需持锁）
+func pruneReportRecordsLocked() bool {
+	cutoff := nowBeijing().AddDate(0, 0, -reportRecordKeepDays).Format(time.RFC3339)
+	out := reportRecords[:0]
+	var dead []string
+	for _, r := range reportRecords {
+		if r.Time >= cutoff {
+			out = append(out, r)
+		} else if r.ID != "" {
+			dead = append(dead, r.ID)
+		}
+	}
+	if len(out) > maxReportRecords {
+		cut := len(out) - maxReportRecords
+		for _, r := range out[:cut] {
+			if r.ID != "" {
+				dead = append(dead, r.ID)
+			}
+		}
+		out = out[cut:]
+	}
+	reportRecords = out
+	if len(dead) > 0 {
+		deleteReportPayloads(dead)
+		return true
+	}
+	return false
+}
+
+// ---------- 上报原文（原始请求体，原样保存，不做解析） ----------
+
+// saveReportPayload 保存一条记录的原始上报报文，key = 记录 ID
+func saveReportPayload(id string, payload []byte) {
+	if id == "" || len(payload) == 0 {
+		return
+	}
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(reportPayloadBucket))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(id), payload)
+	})
+}
+
+// loadReportPayload 按记录 ID 读取原始上报报文（原样返回，不解析）
+func loadReportPayload(id string) (string, bool) {
+	if id == "" {
+		return "", false
+	}
+	var out []byte
+	_ = db.View(func(tx *bolt.Tx) error {
+		if b := tx.Bucket([]byte(reportPayloadBucket)); b != nil {
+			if v := b.Get([]byte(id)); v != nil {
+				out = append([]byte(nil), v...)
+			}
+		}
+		return nil
+	})
+	return string(out), out != nil
+}
+
+// deleteReportPayloads 批量删除报文（与记录清理同步，避免库无限膨胀）
+func deleteReportPayloads(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(reportPayloadBucket))
+		if b == nil {
+			return nil
+		}
+		for _, id := range ids {
+			_ = b.Delete([]byte(id))
+		}
+		return nil
+	})
+}
+
+// clearReportPayloads 清空全部报文（后台「清空上报记录」时调用）
+func clearReportPayloads() {
+	_ = db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte(reportPayloadBucket)) != nil {
+			return tx.DeleteBucket([]byte(reportPayloadBucket))
+		}
+		return nil
+	})
+}
+
+// gcReportPayloadsLocked 删除没有对应记录的孤儿报文（调用方需持锁）
+func gcReportPayloadsLocked() {
+	keep := make(map[string]struct{}, len(reportRecords))
+	for _, r := range reportRecords {
+		if r.ID != "" {
+			keep[r.ID] = struct{}{}
+		}
+	}
+	var orphan []string
+	_ = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(reportPayloadBucket))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, _ []byte) error {
+			if _, ok := keep[string(k)]; !ok {
+				orphan = append(orphan, string(k))
+			}
+			return nil
+		})
+	})
+	deleteReportPayloads(orphan)
+}
+
+// persistReportRecordsLocked 把上报记录整体写盘（调用方需持 reportRecordsMu）。
+// 记录条数有上限，单次序列化体积可控，因此采用整体覆盖而不是增量追加。
+func persistReportRecordsLocked() {
+	snap := make([]reportRecord, len(reportRecords))
+	copy(snap, reportRecords)
+	raw, _ := json.Marshal(snap)
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(reportRecordBucket))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("data"), raw)
+	})
+}
+
+// appendReportRecord 追加一条上报记录（写盘在锁内完成，失败不影响业务）。
+// payload 是本次实际投递的请求体，原样存入 report_payloads，不做任何解析。
+func appendReportRecord(rec reportRecord, payload []byte) {
+	if rec.Time == "" {
+		rec.Time = beijingRFC3339(nowBeijing())
+	}
+	if rec.ID == "" {
+		rec.ID = fmt.Sprintf("%d-%s", time.Now().UnixNano(), randToken(4))
+	}
+	if len(rec.RespBody) > 512 {
+		rec.RespBody = rec.RespBody[:512]
+	}
+	if len(payload) > maxReportPayloadLen {
+		payload = payload[:maxReportPayloadLen]
+	}
+	rec.PayloadSaved = len(payload) > 0
+	reportRecordsMu.Lock()
+	defer reportRecordsMu.Unlock()
+	// 先落原文再落记录：记录存在则原文必定在，异常退出最多留下可被 GC 的孤儿
+	if rec.PayloadSaved {
+		saveReportPayload(rec.ID, payload)
+	}
+	reportRecords = append(reportRecords, rec)
+	pruneReportRecordsLocked()
+	persistReportRecordsLocked()
+}
+
+// startReportRecordCleaner 每小时清理一次过期记录。
+// 服务长时间运行时即便没有新记录，也能保证 30 天外的数据被删掉。
+func startReportRecordCleaner() {
+	go func() {
+		for {
+			time.Sleep(time.Hour)
+			reportRecordsMu.Lock()
+			if pruneReportRecordsLocked() {
+				persistReportRecordsLocked()
+			}
+			reportRecordsMu.Unlock()
+		}
+	}()
+}
+
 // ---------- 上报队列（bolt 持久化，重启后继续补传） ----------
 
 const maxReportQueue = 24 // 最多积压 24 批（约一天）
 
 type queuedReport struct {
-	ID      string `json:"id"`
-	Payload []byte `json:"payload"`
-	Created string `json:"created"`
-	Attempts int   `json:"attempts"`
+	ID       string `json:"id"`
+	Payload  []byte `json:"payload"`
+	Created  string `json:"created"`
+	Attempts int    `json:"attempts"`
 	LastErr  string `json:"last_err,omitempty"`
 }
 
+// loadReportQueue 载入待补传队列。队列在投递失败时写入，成功补传后移除，
+// 保证接收端宕机期间的数据不丢、且补传顺序与产生顺序一致。
 func loadReportQueue() []queuedReport {
 	var list []queuedReport
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -1493,6 +1981,7 @@ func loadReportQueue() []queuedReport {
 	return list
 }
 
+// saveReportQueue 保存整个待补传队列。
 func saveReportQueue(list []queuedReport) {
 	raw, _ := json.Marshal(list)
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -1504,13 +1993,7 @@ func saveReportQueue(list []queuedReport) {
 	})
 }
 
-// sendOnce 单次 HTTP 投递，成功返回 nil
-func sendOnce(url, token string, body []byte) error {
-	_, _, err := sendOnceResp(url, token, body)
-	return err
-}
-
-// sendOnceResp 同 sendOnce，但额外返回接收端的状态码与响应片段（手动上报回显用）
+// sendOnceResp 单次 HTTP 投递；返回接收端状态码与响应片段（失败时可用于回显与留痕）
 func sendOnceResp(url, token string, body []byte) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1537,6 +2020,7 @@ func sendOnceResp(url, token string, body []byte) (int, string, error) {
 
 var reportClient = &http.Client{Timeout: 25 * time.Second}
 
+// errString 把 error 转成字符串，nil 时返回空串，便于直接放进 JSON 字段。
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -1563,7 +2047,12 @@ func flushReportQueue() {
 			keep = append(keep, it)
 			continue
 		}
-		if err := sendOnce(c.ReportURL, c.ReportToken, it.Payload); err != nil {
+		start := time.Now()
+		status, respBody, err := sendOnceResp(c.ReportURL, c.ReportToken, it.Payload)
+		rec := recordFromPayload(it.Payload, it.ID, "retry", status, respBody, err, it.Attempts+1, start, "", c.ReportURL)
+		rec.Note = c.ReportNote
+		appendReportRecord(rec, it.Payload)
+		if err != nil {
 			it.Attempts++
 			it.LastErr = err.Error()
 			keep = append(keep, it)
@@ -1572,6 +2061,37 @@ func flushReportQueue() {
 		}
 	}
 	saveReportQueue(keep)
+}
+
+// recordFromPayload 由上报体生成一条投递记录（字段缺失时留零值，不影响主流程）
+func recordFromPayload(payload []byte, batchID, trigger string, status int, respBody string, err error, attempts int, start time.Time, ip, targetURL string) reportRecord {
+	var p reportPayload
+	_ = json.Unmarshal(payload, &p)
+	if batchID == "" {
+		batchID = p.BatchID
+	}
+	rec := reportRecord{
+		Time:       beijingRFC3339(nowBeijing()),
+		BatchID:    batchID,
+		Trigger:    trigger,
+		OK:         err == nil,
+		StatusCode: status,
+		Error:      errString(err),
+		RespBody:   respBody,
+		Attempts:   attempts,
+		PeriodDate: p.PeriodDate,
+		PeriodHour: p.PeriodHour,
+		Requests:   p.Requests,
+		UpBytes:    p.UpBytes,
+		DownBytes:  p.DownBytes,
+		Blocked:    p.Blocked,
+		URL:        targetURL,
+		Note:       p.Note,
+		IP:         ip,
+		DurationMS: time.Since(start).Milliseconds(),
+		Size:       len(payload),
+	}
+	return rec
 }
 
 // enqueueAndSend 取上一完整自然小时的增量：入队 → 投递
@@ -1586,6 +2106,8 @@ func enqueueAndSend() {
 	}
 	raw, _ := json.Marshal(p)
 
+	// 入队后立刻投递本轮这一批（并把队列里此前积压的一并补传），
+	// 每一次实际投递都会写一条上报记录
 	reportQueueMu.Lock()
 	list := loadReportQueue()
 	list = append(list, queuedReport{ID: p.BatchID, Payload: raw, Created: p.ReportedAt})
@@ -1595,7 +2117,6 @@ func enqueueAndSend() {
 	saveReportQueue(list)
 	reportQueueMu.Unlock()
 
-	// 立刻尝试投递，失败留待下一轮补传
 	flushReportQueue()
 }
 
@@ -1623,8 +2144,9 @@ func startReportWorker() {
 }
 
 // serveSpeedTest 处理测速链接：
-//   GET /speed/<token>       测速页面（占用一次使用次数）
-//   GET /speed/<token>/dl    测速数据流（不计次数，仅页面会话内使用）
+//
+//	GET /speed/<token>       测速页面（占用一次使用次数）
+//	GET /speed/<token>/dl    测速数据流（不计次数，仅页面会话内使用）
 func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/speed/")
 	if rest == "" {
@@ -2101,6 +2623,8 @@ func startStatsWorker() {
 	}()
 }
 
+// recordRequestStart 上报一次「请求开始」事件，用于按 IP / 国家 / 域名累加请求次数。
+// 非阻塞：统计通道满时直接计数丢弃并返回，绝不把统计压力传导到请求路径上。
 func recordRequestStart(ip, country, host string) {
 	select {
 	case statChan <- statEvent{IP: ip, Country: country, Host: host, IsStart: true}:
@@ -2130,6 +2654,7 @@ type statsMetaDisk struct {
 	LastProxyAt      string `json:"last_proxy_at"`
 }
 
+// emptyStats 构造空统计对象（含全部 map 初始化），用于首次启动与加载失败兜底。
 func emptyStats() Stats {
 	return Stats{
 		SchemaVersion: 2,
@@ -2145,6 +2670,8 @@ func emptyStats() Stats {
 	}
 }
 
+// rebuildAggregatesFromDaily 用 Daily 明细重算全局聚合（国家/ IP 的次数与流量）。
+// 全局聚合是 Daily 的冗余视图，重建后统一裁到 Top1000，避免旧库累积过多键。
 func rebuildAggregatesFromDaily() {
 	stats.CountryCounts = map[string]int64{}
 	stats.IPCounts = map[string]int64{}
@@ -2178,6 +2705,8 @@ func rebuildAggregatesFromDaily() {
 	pruneTopN(stats.IPDownBytes, 1000)
 }
 
+// loadStats 从 bolt 载入统计：优先读分桶后的新结构（stats_meta / stats_daily / stats_blocks），
+// 同时兼容旧版单键结构并在成功后迁移。加载完成后补齐缺失的明细 map 与全局聚合。
 func loadStats() {
 	stats = emptyStats()
 	if db == nil {
@@ -2308,8 +2837,11 @@ func loadStats() {
 type statsSnapshot struct {
 	meta       []byte
 	blocks     []byte
-	dailyItems []struct{ key string; data []byte }
-	dailyKeys  map[string]struct{}
+	dailyItems []struct {
+		key  string
+		data []byte
+	}
+	dailyKeys map[string]struct{}
 }
 
 // marshalStatsLocked 持锁序列化统计快照（调用方必须已持有 statsMu）
@@ -2343,7 +2875,10 @@ func marshalStatsLocked() *statsSnapshot {
 		if err != nil {
 			continue
 		}
-		snap.dailyItems = append(snap.dailyItems, struct{ key string; data []byte }{key: date, data: b})
+		snap.dailyItems = append(snap.dailyItems, struct {
+			key  string
+			data []byte
+		}{key: date, data: b})
 		snap.dailyKeys[date] = struct{}{}
 	}
 	return snap
@@ -2391,6 +2926,10 @@ func saveStatsOnce() {
 	statsMu.Unlock()
 	persistStats(snap)
 }
+
+// startStatsSaver 启动周期落盘协程：每 5 分钟清理过期明细、序列化快照并写盘，
+// 顺带清理过期的 IP 地理位置缓存。统计是「内存累加 + 周期落盘」，
+// 因此进程被强杀最多丢一个周期的增量。
 func startStatsSaver() {
 	go func() {
 		t := time.NewTicker(5 * time.Minute)
@@ -2466,6 +3005,8 @@ func isTrustedProxy(ip net.IP) bool {
 
 var selfPublicIP atomic.Value
 
+// detectSelfPublicIP 异步探测本机公网 IP，结果存入 selfPublicIP 供后续判断使用
+// （用于把本机自检流量从统计与拦截记录里排除）。多个探测源依次尝试，全部失败则保持为空。
 func detectSelfPublicIP() {
 	go func() {
 		client := &http.Client{Timeout: 4 * time.Second}
@@ -2488,6 +3029,7 @@ func detectSelfPublicIP() {
 		}
 	}()
 }
+
 // countryOf 使用嵌入的 iploc 本地库，不发起网络请求；失败返回 "??"。
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
@@ -2502,262 +3044,264 @@ func countryOf(ipStr string) string {
 }
 
 var countryNames = map[string]string{
-		"??": "未知",
-		"AD": "安道尔",
-		"AE": "阿联酋",
-		"AF": "阿富汗",
-		"AG": "安提瓜和巴布达",
-		"AI": "安圭拉",
-		"AL": "阿尔巴尼亚",
-		"AM": "亚美尼亚",
-		"AO": "安哥拉",
-		"AQ": "南极洲",
-		"AR": "阿根廷",
-		"AS": "美属萨摩亚",
-		"AT": "奥地利",
-		"AU": "澳大利亚",
-		"AW": "阿鲁巴",
-		"AX": "奥兰群岛",
-		"AZ": "阿塞拜疆",
-		"BA": "波黑",
-		"BB": "巴巴多斯",
-		"BD": "孟加拉国",
-		"BE": "比利时",
-		"BF": "布基纳法索",
-		"BG": "保加利亚",
-		"BH": "巴林",
-		"BI": "布隆迪",
-		"BJ": "贝宁",
-		"BL": "圣巴泰勒米",
-		"BM": "百慕大",
-		"BN": "文莱",
-		"BO": "玻利维亚",
-		"BQ": "荷属加勒比",
-		"BR": "巴西",
-		"BS": "巴哈马",
-		"BT": "不丹",
-		"BV": "布韦岛",
-		"BW": "博茨瓦纳",
-		"BY": "白俄罗斯",
-		"BZ": "伯利兹",
-		"CA": "加拿大",
-		"CC": "科科斯群岛",
-		"CD": "刚果（金）",
-		"CF": "中非",
-		"CG": "刚果（布）",
-		"CH": "瑞士",
-		"CI": "科特迪瓦",
-		"CK": "库克群岛",
-		"CL": "智利",
-		"CM": "喀麦隆",
-		"CN": "中国",
-		"CO": "哥伦比亚",
-		"CR": "哥斯达黎加",
-		"CU": "古巴",
-		"CV": "佛得角",
-		"CW": "库拉索",
-		"CX": "圣诞岛",
-		"CY": "塞浦路斯",
-		"CZ": "捷克",
-		"DE": "德国",
-		"DJ": "吉布提",
-		"DK": "丹麦",
-		"DM": "多米尼克",
-		"DO": "多米尼加",
-		"DZ": "阿尔及利亚",
-		"EC": "厄瓜多尔",
-		"EE": "爱沙尼亚",
-		"EG": "埃及",
-		"EH": "西撒哈拉",
-		"ER": "厄立特里亚",
-		"ES": "西班牙",
-		"ET": "埃塞俄比亚",
-		"FI": "芬兰",
-		"FJ": "斐济",
-		"FK": "福克兰群岛",
-		"FM": "密克罗尼西亚",
-		"FO": "法罗群岛",
-		"FR": "法国",
-		"GA": "加蓬",
-		"GB": "英国",
-		"GD": "格林纳达",
-		"GE": "格鲁吉亚",
-		"GF": "法属圭亚那",
-		"GG": "根西岛",
-		"GH": "加纳",
-		"GI": "直布罗陀",
-		"GL": "格陵兰",
-		"GM": "冈比亚",
-		"GN": "几内亚",
-		"GP": "瓜德罗普",
-		"GQ": "赤道几内亚",
-		"GR": "希腊",
-		"GS": "南乔治亚",
-		"GT": "危地马拉",
-		"GU": "关岛",
-		"GW": "几内亚比绍",
-		"GY": "圭亚那",
-		"HK": "中国香港",
-		"HM": "赫德岛",
-		"HN": "洪都拉斯",
-		"HR": "克罗地亚",
-		"HT": "海地",
-		"HU": "匈牙利",
-		"ID": "印度尼西亚",
-		"IE": "爱尔兰",
-		"IL": "以色列",
-		"IM": "马恩岛",
-		"IN": "印度",
-		"IO": "英属印度洋领地",
-		"IQ": "伊拉克",
-		"IR": "伊朗",
-		"IS": "冰岛",
-		"IT": "意大利",
-		"JE": "泽西岛",
-		"JM": "牙买加",
-		"JO": "约旦",
-		"JP": "日本",
-		"KE": "肯尼亚",
-		"KG": "吉尔吉斯斯坦",
-		"KH": "柬埔寨",
-		"KI": "基里巴斯",
-		"KM": "科摩罗",
-		"KN": "圣基茨和尼维斯",
-		"KP": "朝鲜",
-		"KR": "韩国",
-		"KW": "科威特",
-		"KY": "开曼群岛",
-		"KZ": "哈萨克斯坦",
-		"LA": "老挝",
-		"LB": "黎巴嫩",
-		"LC": "圣卢西亚",
-		"LI": "列支敦士登",
-		"LK": "斯里兰卡",
-		"LO": "本机",
-		"LR": "利比里亚",
-		"LS": "莱索托",
-		"LT": "立陶宛",
-		"LU": "卢森堡",
-		"LV": "拉脱维亚",
-		"LY": "利比亚",
-		"MA": "摩洛哥",
-		"MC": "摩纳哥",
-		"MD": "摩尔多瓦",
-		"ME": "黑山",
-		"MF": "法属圣马丁",
-		"MG": "马达加斯加",
-		"MH": "马绍尔群岛",
-		"MK": "北马其顿",
-		"ML": "马里",
-		"MM": "缅甸",
-		"MN": "蒙古",
-		"MO": "中国澳门",
-		"MP": "北马里亚纳",
-		"MQ": "马提尼克",
-		"MR": "毛里塔尼亚",
-		"MS": "蒙特塞拉特",
-		"MT": "马耳他",
-		"MU": "毛里求斯",
-		"MV": "马尔代夫",
-		"MW": "马拉维",
-		"MX": "墨西哥",
-		"MY": "马来西亚",
-		"MZ": "莫桑比克",
-		"NA": "纳米比亚",
-		"NC": "新喀里多尼亚",
-		"NE": "尼日尔",
-		"NF": "诺福克岛",
-		"NG": "尼日利亚",
-		"NI": "尼加拉瓜",
-		"NL": "荷兰",
-		"NO": "挪威",
-		"NP": "尼泊尔",
-		"NR": "瑙鲁",
-		"NU": "纽埃",
-		"NZ": "新西兰",
-		"OM": "阿曼",
-		"PA": "巴拿马",
-		"PE": "秘鲁",
-		"PF": "法属波利尼西亚",
-		"PG": "巴布亚新几内亚",
-		"PH": "菲律宾",
-		"PK": "巴基斯坦",
-		"PL": "波兰",
-		"PM": "圣皮埃尔",
-		"PN": "皮特凯恩",
-		"PR": "波多黎各",
-		"PS": "巴勒斯坦",
-		"PT": "葡萄牙",
-		"PV": "内网",
-		"PW": "帕劳",
-		"PY": "巴拉圭",
-		"QA": "卡塔尔",
-		"RE": "留尼汪",
-		"RO": "罗马尼亚",
-		"RS": "塞尔维亚",
-		"RU": "俄罗斯",
-		"RW": "卢旺达",
-		"SA": "沙特阿拉伯",
-		"SB": "所罗门群岛",
-		"SC": "塞舌尔",
-		"SD": "苏丹",
-		"SE": "瑞典",
-		"SG": "新加坡",
-		"SH": "圣赫勒拿",
-		"SI": "斯洛文尼亚",
-		"SJ": "斯瓦尔巴",
-		"SK": "斯洛伐克",
-		"SL": "塞拉利昂",
-		"SM": "圣马力诺",
-		"SN": "塞内加尔",
-		"SO": "索马里",
-		"SR": "苏里南",
-		"SS": "南苏丹",
-		"ST": "圣多美和普林西比",
-		"SV": "萨尔瓦多",
-		"SX": "荷属圣马丁",
-		"SY": "叙利亚",
-		"SZ": "斯威士兰",
-		"TC": "特克斯和凯科斯",
-		"TD": "乍得",
-		"TF": "法属南部领地",
-		"TG": "多哥",
-		"TH": "泰国",
-		"TJ": "塔吉克斯坦",
-		"TK": "托克劳",
-		"TL": "东帝汶",
-		"TM": "土库曼斯坦",
-		"TN": "突尼斯",
-		"TO": "汤加",
-		"TR": "土耳其",
-		"TT": "特立尼达和多巴哥",
-		"TV": "图瓦卢",
-		"TW": "中国台湾",
-		"TZ": "坦桑尼亚",
-		"UA": "乌克兰",
-		"UG": "乌干达",
-		"UM": "美国本土外小岛屿",
-		"US": "美国",
-		"UY": "乌拉圭",
-		"UZ": "乌兹别克斯坦",
-		"VA": "梵蒂冈",
-		"VC": "圣文森特和格林纳丁斯",
-		"VE": "委内瑞拉",
-		"VG": "英属维尔京群岛",
-		"VI": "美属维尔京群岛",
-		"VN": "越南",
-		"VU": "瓦努阿图",
-		"WF": "瓦利斯和富图纳",
-		"WS": "萨摩亚",
-		"XK": "科索沃",
-		"YE": "也门",
-		"YT": "马约特",
-		"ZA": "南非",
-		"ZM": "赞比亚",
-		"ZW": "津巴布韦",
-		"ZZ": "未知",
-	}
+	"??": "未知",
+	"AD": "安道尔",
+	"AE": "阿联酋",
+	"AF": "阿富汗",
+	"AG": "安提瓜和巴布达",
+	"AI": "安圭拉",
+	"AL": "阿尔巴尼亚",
+	"AM": "亚美尼亚",
+	"AO": "安哥拉",
+	"AQ": "南极洲",
+	"AR": "阿根廷",
+	"AS": "美属萨摩亚",
+	"AT": "奥地利",
+	"AU": "澳大利亚",
+	"AW": "阿鲁巴",
+	"AX": "奥兰群岛",
+	"AZ": "阿塞拜疆",
+	"BA": "波黑",
+	"BB": "巴巴多斯",
+	"BD": "孟加拉国",
+	"BE": "比利时",
+	"BF": "布基纳法索",
+	"BG": "保加利亚",
+	"BH": "巴林",
+	"BI": "布隆迪",
+	"BJ": "贝宁",
+	"BL": "圣巴泰勒米",
+	"BM": "百慕大",
+	"BN": "文莱",
+	"BO": "玻利维亚",
+	"BQ": "荷属加勒比",
+	"BR": "巴西",
+	"BS": "巴哈马",
+	"BT": "不丹",
+	"BV": "布韦岛",
+	"BW": "博茨瓦纳",
+	"BY": "白俄罗斯",
+	"BZ": "伯利兹",
+	"CA": "加拿大",
+	"CC": "科科斯群岛",
+	"CD": "刚果（金）",
+	"CF": "中非",
+	"CG": "刚果（布）",
+	"CH": "瑞士",
+	"CI": "科特迪瓦",
+	"CK": "库克群岛",
+	"CL": "智利",
+	"CM": "喀麦隆",
+	"CN": "中国",
+	"CO": "哥伦比亚",
+	"CR": "哥斯达黎加",
+	"CU": "古巴",
+	"CV": "佛得角",
+	"CW": "库拉索",
+	"CX": "圣诞岛",
+	"CY": "塞浦路斯",
+	"CZ": "捷克",
+	"DE": "德国",
+	"DJ": "吉布提",
+	"DK": "丹麦",
+	"DM": "多米尼克",
+	"DO": "多米尼加",
+	"DZ": "阿尔及利亚",
+	"EC": "厄瓜多尔",
+	"EE": "爱沙尼亚",
+	"EG": "埃及",
+	"EH": "西撒哈拉",
+	"ER": "厄立特里亚",
+	"ES": "西班牙",
+	"ET": "埃塞俄比亚",
+	"FI": "芬兰",
+	"FJ": "斐济",
+	"FK": "福克兰群岛",
+	"FM": "密克罗尼西亚",
+	"FO": "法罗群岛",
+	"FR": "法国",
+	"GA": "加蓬",
+	"GB": "英国",
+	"GD": "格林纳达",
+	"GE": "格鲁吉亚",
+	"GF": "法属圭亚那",
+	"GG": "根西岛",
+	"GH": "加纳",
+	"GI": "直布罗陀",
+	"GL": "格陵兰",
+	"GM": "冈比亚",
+	"GN": "几内亚",
+	"GP": "瓜德罗普",
+	"GQ": "赤道几内亚",
+	"GR": "希腊",
+	"GS": "南乔治亚",
+	"GT": "危地马拉",
+	"GU": "关岛",
+	"GW": "几内亚比绍",
+	"GY": "圭亚那",
+	"HK": "中国香港",
+	"HM": "赫德岛",
+	"HN": "洪都拉斯",
+	"HR": "克罗地亚",
+	"HT": "海地",
+	"HU": "匈牙利",
+	"ID": "印度尼西亚",
+	"IE": "爱尔兰",
+	"IL": "以色列",
+	"IM": "马恩岛",
+	"IN": "印度",
+	"IO": "英属印度洋领地",
+	"IQ": "伊拉克",
+	"IR": "伊朗",
+	"IS": "冰岛",
+	"IT": "意大利",
+	"JE": "泽西岛",
+	"JM": "牙买加",
+	"JO": "约旦",
+	"JP": "日本",
+	"KE": "肯尼亚",
+	"KG": "吉尔吉斯斯坦",
+	"KH": "柬埔寨",
+	"KI": "基里巴斯",
+	"KM": "科摩罗",
+	"KN": "圣基茨和尼维斯",
+	"KP": "朝鲜",
+	"KR": "韩国",
+	"KW": "科威特",
+	"KY": "开曼群岛",
+	"KZ": "哈萨克斯坦",
+	"LA": "老挝",
+	"LB": "黎巴嫩",
+	"LC": "圣卢西亚",
+	"LI": "列支敦士登",
+	"LK": "斯里兰卡",
+	"LO": "本机",
+	"LR": "利比里亚",
+	"LS": "莱索托",
+	"LT": "立陶宛",
+	"LU": "卢森堡",
+	"LV": "拉脱维亚",
+	"LY": "利比亚",
+	"MA": "摩洛哥",
+	"MC": "摩纳哥",
+	"MD": "摩尔多瓦",
+	"ME": "黑山",
+	"MF": "法属圣马丁",
+	"MG": "马达加斯加",
+	"MH": "马绍尔群岛",
+	"MK": "北马其顿",
+	"ML": "马里",
+	"MM": "缅甸",
+	"MN": "蒙古",
+	"MO": "中国澳门",
+	"MP": "北马里亚纳",
+	"MQ": "马提尼克",
+	"MR": "毛里塔尼亚",
+	"MS": "蒙特塞拉特",
+	"MT": "马耳他",
+	"MU": "毛里求斯",
+	"MV": "马尔代夫",
+	"MW": "马拉维",
+	"MX": "墨西哥",
+	"MY": "马来西亚",
+	"MZ": "莫桑比克",
+	"NA": "纳米比亚",
+	"NC": "新喀里多尼亚",
+	"NE": "尼日尔",
+	"NF": "诺福克岛",
+	"NG": "尼日利亚",
+	"NI": "尼加拉瓜",
+	"NL": "荷兰",
+	"NO": "挪威",
+	"NP": "尼泊尔",
+	"NR": "瑙鲁",
+	"NU": "纽埃",
+	"NZ": "新西兰",
+	"OM": "阿曼",
+	"PA": "巴拿马",
+	"PE": "秘鲁",
+	"PF": "法属波利尼西亚",
+	"PG": "巴布亚新几内亚",
+	"PH": "菲律宾",
+	"PK": "巴基斯坦",
+	"PL": "波兰",
+	"PM": "圣皮埃尔",
+	"PN": "皮特凯恩",
+	"PR": "波多黎各",
+	"PS": "巴勒斯坦",
+	"PT": "葡萄牙",
+	"PV": "内网",
+	"PW": "帕劳",
+	"PY": "巴拉圭",
+	"QA": "卡塔尔",
+	"RE": "留尼汪",
+	"RO": "罗马尼亚",
+	"RS": "塞尔维亚",
+	"RU": "俄罗斯",
+	"RW": "卢旺达",
+	"SA": "沙特阿拉伯",
+	"SB": "所罗门群岛",
+	"SC": "塞舌尔",
+	"SD": "苏丹",
+	"SE": "瑞典",
+	"SG": "新加坡",
+	"SH": "圣赫勒拿",
+	"SI": "斯洛文尼亚",
+	"SJ": "斯瓦尔巴",
+	"SK": "斯洛伐克",
+	"SL": "塞拉利昂",
+	"SM": "圣马力诺",
+	"SN": "塞内加尔",
+	"SO": "索马里",
+	"SR": "苏里南",
+	"SS": "南苏丹",
+	"ST": "圣多美和普林西比",
+	"SV": "萨尔瓦多",
+	"SX": "荷属圣马丁",
+	"SY": "叙利亚",
+	"SZ": "斯威士兰",
+	"TC": "特克斯和凯科斯",
+	"TD": "乍得",
+	"TF": "法属南部领地",
+	"TG": "多哥",
+	"TH": "泰国",
+	"TJ": "塔吉克斯坦",
+	"TK": "托克劳",
+	"TL": "东帝汶",
+	"TM": "土库曼斯坦",
+	"TN": "突尼斯",
+	"TO": "汤加",
+	"TR": "土耳其",
+	"TT": "特立尼达和多巴哥",
+	"TV": "图瓦卢",
+	"TW": "中国台湾",
+	"TZ": "坦桑尼亚",
+	"UA": "乌克兰",
+	"UG": "乌干达",
+	"UM": "美国本土外小岛屿",
+	"US": "美国",
+	"UY": "乌拉圭",
+	"UZ": "乌兹别克斯坦",
+	"VA": "梵蒂冈",
+	"VC": "圣文森特和格林纳丁斯",
+	"VE": "委内瑞拉",
+	"VG": "英属维尔京群岛",
+	"VI": "美属维尔京群岛",
+	"VN": "越南",
+	"VU": "瓦努阿图",
+	"WF": "瓦利斯和富图纳",
+	"WS": "萨摩亚",
+	"XK": "科索沃",
+	"YE": "也门",
+	"YT": "马约特",
+	"ZA": "南非",
+	"ZM": "赞比亚",
+	"ZW": "津巴布韦",
+	"ZZ": "未知",
+}
 
+// countryName 把两位国家码转成中文名；未知码原样返回，便于发现数据源变化。
+// 空码与 ZZ 统一显示为「未知」。
 func countryName(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if code == "" || code == "ZZ" {
@@ -2798,6 +3342,8 @@ var countryCodeByEnglishName = map[string]string{
 	"Morocco": "MA", "Algeria": "DZ", "Tunisia": "TN", "Ethiopia": "ET",
 }
 
+// countryCodeByName 用国家中文名反查两位国家码。
+// 部分查询接口只给名字不给码，需要这一步归一。反向表首次调用时构建，之后只读。
 func countryCodeByName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -2823,7 +3369,8 @@ func countryCodeByName(name string) string {
 	return ""
 }
 
-
+// isSelfOrLocalIP 判断是否为本机公网 IP 或本地/内网地址。
+// 这类来源的自检、探活请求不计入拦截统计，否则后台会被自己的健康检查刷屏。
 func isSelfOrLocalIP(ip, country string) bool {
 	if country == "LO" || country == "PV" {
 		return true
@@ -2839,6 +3386,9 @@ func isSelfOrLocalIP(ip, country string) bool {
 	}
 	return false
 }
+
+// recordBlocked 记录一次拦截：同时累加全局计数与当天计数，并写入拦截事件列表。
+// 本机与内网来源不计入。注释里的五类原因与后台「安全与访问控制」的开关一一对应。
 func recordBlocked(ip, country, path, reason, ua string) {
 	if isSelfOrLocalIP(ip, country) {
 		return
@@ -2934,9 +3484,12 @@ func geoPrune() {
 	}
 	geoMu.Unlock()
 }
+
 // geoParseGeneric 把上游 JSON 归一化成 geoEntry。
-//   · 主接口 ip9.com.cn：{ret:200, data:{country, country_code, prov, city, isp, ...}}
-//   · 兜底 ip-api.com：{status:"success", country, countryCode, regionName, city, isp, org, as}
+//
+//	· 主接口 ip9.com.cn：{ret:200, data:{country, country_code, prov, city, isp, ...}}
+//	· 兜底 ip-api.com：{status:"success", country, countryCode, regionName, city, isp, org, as}
+//
 // 两种结构字段名不同（country_code vs countryCode、prov vs regionName），这里统一兼容。
 func geoParseGeneric(m map[string]any) (geoEntry, error) {
 	// ip9 把业务数据放在 data 里；ip-api 是平铺结构
@@ -3035,6 +3588,7 @@ func geoEndpoints(ipEscaped string) []string {
 	}
 }
 
+// geoFetch 查询 IP 的地理位置，按 geoEndpoints 给出的优先级依次尝试，任一成功即返回。
 func geoFetch(ipStr string) (geoEntry, error) {
 	return geoFetchVia(geoEndpoints(url.QueryEscape(ipStr)), ipStr)
 }
@@ -3126,7 +3680,10 @@ type adminCred struct {
 	PassHash string // bcrypt hash；兼容迁移期可能短暂存明文再被覆盖
 }
 
+// setAdminCred 原子替换管理账号快照（用户名 + 密码哈希）。
 func setAdminCred(u, hash string) { adminCredPtr.Store(&adminCred{User: u, PassHash: hash}) }
+
+// getAdminUser 返回当前管理用户名，未初始化时回落 admin。
 func getAdminUser() string {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -3134,6 +3691,8 @@ func getAdminUser() string {
 	}
 	return c.User
 }
+
+// getAdminHash 返回当前密码哈希，未设置时返回空串（调用方据此判断是否需要引导设置密码）。
 func getAdminHash() string {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -3142,6 +3701,7 @@ func getAdminHash() string {
 	return c.PassHash
 }
 
+// hashPassword 用 bcrypt 生成密码哈希。bcrypt 自带随机盐，同一密码每次结果不同。
 func hashPassword(plain string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
 	if err != nil {
@@ -3150,6 +3710,8 @@ func hashPassword(plain string) (string, error) {
 	return string(b), nil
 }
 
+// verifyPassword 校验密码。兼容旧版明文存储：非 bcrypt 格式时做常量时间比较，
+// 登录成功后由调用方重写为 bcrypt 哈希。
 func verifyPassword(hash, plain string) bool {
 	if hash == "" || plain == "" {
 		return false
@@ -3161,6 +3723,7 @@ func verifyPassword(hash, plain string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 
+// isBcryptHash 判断字符串是否为 bcrypt 哈希（用于识别并迁移旧的明文密码）。
 func isBcryptHash(s string) bool {
 	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }
@@ -3182,12 +3745,16 @@ var (
 	captchas sync.Map
 )
 
+// randToken 生成 n 字节的随机十六进制串，用于会话令牌、记录 ID、验证码 ID。
+// 取自 crypto/rand，不可用 math/rand 替代。
 func randToken(n int) string {
 	b := make([]byte, n)
 	_, _ = io.ReadFull(rand.Reader, b)
 	return hex.EncodeToString(b)
 }
 
+// initSessionsCleanup 启动后台清理协程，定期移除过期的会话与验证码，
+// 防止内存 map 随登录次数无界增长。
 func initSessionsCleanup() {
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
@@ -3209,11 +3776,15 @@ func initSessionsCleanup() {
 	}()
 }
 
+// createSession 创建一次管理会话并返回令牌，同时把同一账号的旧会话清掉
+// （单点登录：新登录会挤掉旧登录，避免令牌被长期复用）。
 func createSession() string {
 	tok := randToken(16)
 	sessions.Store(tok, sessionEntry{Expires: time.Now().Add(sessionTTL)})
 	return tok
 }
+
+// validSession 校验会话令牌是否有效且未过期，过期即删除。
 func validSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -3244,11 +3815,15 @@ func destroyOtherSessions(keep string) {
 		return true
 	})
 }
+
+// destroySession 注销指定会话（登出）。
 func destroySession(tok string) {
 	if tok != "" {
 		sessions.Delete(tok)
 	}
 }
+
+// getSessionToken 从 Cookie 读取会话令牌，不存在时返回空串。
 func getSessionToken(r *http.Request) string {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
@@ -3256,6 +3831,9 @@ func getSessionToken(r *http.Request) string {
 	}
 	return c.Value
 }
+
+// requestIsHTTPS 判断当前请求是否为 HTTPS：直连看 TLS，反向代理后看 X-Forwarded-Proto。
+// 决定会话 Cookie 是否加 Secure 属性。
 func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -3266,6 +3844,8 @@ func requestIsHTTPS(r *http.Request) bool {
 	return false
 }
 
+// setSessionCookie 写入管理会话 Cookie：HttpOnly + SameSite=Lax，路径限定 /admin，
+// HTTPS 时追加 Secure。
 func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	c := &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/admin",
@@ -3277,6 +3857,8 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	}
 	http.SetCookie(w, c)
 }
+
+// clearSessionCookie 让浏览器立即失效会话 Cookie（MaxAge=-1）。
 func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
 }
@@ -3319,6 +3901,8 @@ func generateCaptchaSVG() (id, answer, svg string) {
 	return id, answer, svg
 }
 
+// verifyCaptcha 校验图形验证码，忽略大小写与首尾空白。
+// 无论成功与否都立即删除该验证码，做到一次性使用，防止同码重放。
 func verifyCaptcha(id, input string) bool {
 	if id == "" || input == "" {
 		return false
@@ -3472,6 +4056,8 @@ loadCaptcha();
 </body>
 </html>`
 
+// saveAdminPassHash 把密码哈希写入 bolt 的 auth bucket，并删除遗留的明文键。
+// 幂等：重复调用只覆盖哈希，可安全用于启动引导与改密。
 func saveAdminPassHash(hash string) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -3509,13 +4095,15 @@ type loginFailEntry struct {
 var loginFailers sync.Map // ip -> *loginFailEntry
 
 const (
-	loginFailLimit    = 5                // 窗口内失败次数上限
-	loginFailWindow   = 10 * time.Minute // 计数窗口
-	loginLockBase     = 15 * time.Minute // 首次锁定时长
-	loginLockMax      = 2 * time.Hour    // 锁定上限
-	captchaRateLimit  = 30               // 每分钟每 IP 验证码请求上限
+	loginFailLimit   = 5                // 窗口内失败次数上限
+	loginFailWindow  = 10 * time.Minute // 计数窗口
+	loginLockBase    = 15 * time.Minute // 首次锁定时长
+	loginLockMax     = 2 * time.Hour    // 锁定上限
+	captchaRateLimit = 30               // 每分钟每 IP 验证码请求上限
 )
 
+// loginLockDuration 计算第 n 次锁定的时长：15m 起逐次翻倍，封顶 2 小时。
+// 递增锁定让暴力破解的时间成本快速上升，同时正常用户第一次误锁只等 15 分钟。
 func loginLockDuration(lockouts int64) time.Duration {
 	// 15m → 30m → 60m → 120m（封顶）
 	d := loginLockBase
@@ -3528,6 +4116,7 @@ func loginLockDuration(lockouts int64) time.Duration {
 	return d
 }
 
+// checkLoginAllowed 判断该 IP 当前是否允许尝试登录；被锁定时返回还需等待的秒数。
 func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
 	now := time.Now().UnixNano()
 	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
@@ -3574,6 +4163,7 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 	return false, 0, fails
 }
 
+// clearLoginFail 登录成功后清除该 IP 的失败记录，避免正常用户被历史失败拖累。
 func clearLoginFail(ip string) {
 	loginFailers.Delete(ip)
 }
@@ -3586,6 +4176,8 @@ type captchaRateEntry struct {
 
 var captchaLimiters sync.Map
 
+// checkCaptchaRate 对验证码接口做每分钟每 IP 的滑动窗口限流，防止被刷爆。
+// 验证码生成本身有开销且无鉴权，是最容易被滥用的入口。
 func checkCaptchaRate(ip string) bool {
 	val, _ := captchaLimiters.LoadOrStore(ip, &captchaRateEntry{})
 	e := val.(*captchaRateEntry)
@@ -3602,6 +4194,8 @@ func checkCaptchaRate(ip string) bool {
 
 type switchTransport struct{ v atomic.Value }
 
+// RoundTrip 每次请求都从原子变量取当前 Transport，
+// 从而实现「不重启进程、不打断在途连接」的传输层参数热更新。
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t, _ := s.v.Load().(*http.Transport)
 	if t == nil {
@@ -3612,12 +4206,15 @@ func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 type bufferPool struct{ pool sync.Pool }
 
+// Get 从池中取一块 32KB 缓冲区，池空时新建。
 func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
 	}
 	return make([]byte, 32*1024)
 }
+
+// Put 归还缓冲区；容量不足的直接丢弃，避免池里混入越来越小的碎片。
 func (b *bufferPool) Put(p []byte) {
 	if cap(p) >= 32*1024 {
 		b.pool.Put(p[:32*1024])
@@ -3626,6 +4223,10 @@ func (b *bufferPool) Put(p []byte) {
 
 var proxyBufPool = &bufferPool{}
 
+// newTransport 构造反代用的 Transport。
+// 关键取舍：禁用自动压缩（否则字节统计与 Range 语义都会失真）、
+// 开启 HTTP/2、放大空闲连接池（媒体流场景连接复用收益很高）、
+// TLS 最低 1.2 并缓存会话票据。
 func newTransport() *http.Transport {
 	return &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
@@ -3638,6 +4239,9 @@ func newTransport() *http.Transport {
 
 var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
 
+// rewriteOriginHeaders 把 Origin/Referer 改写成上游自己的域名。
+// 上游若启用了来源校验，客户端带来的本站域名会被判为跨站而拒绝，
+// 因此转发前统一替换；Cookie 的 Domain 属性也一并剥掉，避免浏览器据其串域。
 func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	if o := out.Header.Get("Origin"); o != "" && o != "null" {
 		if u, err := url.Parse(o); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) {
@@ -3654,9 +4258,10 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 }
 
 // buildProxy 构造反向代理（纯透传）：
-//   Rewrite        把路径中的目标写到 Out.URL
-//   ModifyResponse 只改写 Location / Set-Cookie Domain，不包装响应体
-//   ErrorHandler   上游失败时返回统一错误页
+//
+//	Rewrite        把路径中的目标写到 Out.URL
+//	ModifyResponse 只改写 Location / Set-Cookie Domain，不包装响应体
+//	ErrorHandler   上游失败时返回统一错误页
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		// FlushInterval = 0：不做定时强制 flush，由底层 bufio 写满自然下发。
@@ -3696,10 +4301,11 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			// 响应体包一层计数 Reader：仅统计真正经过本服务的下行字节。
 			// 不改变传输语义（纯流式透传，不缓冲、不预读）。
 			if resp.Body != nil {
+				rb := reqBytesFrom(resp.Request.Context())
 				resp.Body = struct {
 					io.Reader
 					io.Closer
-				}{&countingReader{r: resp.Body}, resp.Body}
+				}{&countingReader{r: resp.Body, rb: rb}, resp.Body}
 			}
 			upHost := ""
 			if resp.Request != nil && resp.Request.URL != nil {
@@ -3836,9 +4442,10 @@ h1{font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-.3px}
 `
 
 // swSource 管理后台 Service Worker（仅保留 PWA 安装能力，不做任何缓存）：
-//   · 不预缓存应用壳、不缓存导航请求、不缓存 CDN 脚本、不调用 caches API
-//   · fetch 事件直接放行（浏览器默认行为），保证页面与数据永远是最新版本
-//   · install 时立即激活并清理历史版本遗留的缓存（老版本 SW 缓存的旧页面）
+//
+//	· 不预缓存应用壳、不缓存导航请求、不缓存 CDN 脚本、不调用 caches API
+//	· fetch 事件直接放行（浏览器默认行为），保证页面与数据永远是最新版本
+//	· install 时立即激活并清理历史版本遗留的缓存（老版本 SW 缓存的旧页面）
 const swSource = `self.addEventListener('install', function (e) {
   e.waitUntil(self.skipWaiting());
 });
@@ -3874,6 +4481,8 @@ type gzipResponseWriter struct {
 	gzOn    bool // 实际启用压缩
 }
 
+// WriteHeader 在首次写出时决定是否压缩：仅对可压缩类型、且处理器未自行压缩时启用。
+// 判断放在这里而不是构造时，是因为 Content-Type 往往要等处理器写完才确定。
 func (g *gzipResponseWriter) WriteHeader(code int) {
 	if !g.decided {
 		g.decided = true
@@ -3890,6 +4499,8 @@ func (g *gzipResponseWriter) WriteHeader(code int) {
 	g.ResponseWriter.WriteHeader(code)
 }
 
+// Write 写出响应体；已启用压缩时写入 gzip 流，否则直接透传。
+// 首次 Write 前若未调用 WriteHeader，先补一次以触发压缩决策。
 func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	if !g.decided {
 		g.WriteHeader(http.StatusOK)
@@ -3966,42 +4577,44 @@ func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheC
 // diskUsage 返回磁盘剩余/总量（仅 unix，用 syscall.Statfs；失败返回 0）
 type diskSpace struct{ free, total uint64 }
 
+// diskUsage 返回指定路径所在分区的可用与总容量（字节）。
+// 仅支持 unix：走 syscall.Statfs，非 unix 平台或调用失败时返回错误由调用方降级。
 func diskUsage(path string) (diskSpace, error) {
-var st syscall.Statfs_t
-if err := syscall.Statfs(path, &st); err != nil {
-	return diskSpace{}, err
-}
-return diskSpace{
-	free:  st.Bavail * uint64(st.Bsize),
-	total: st.Blocks * uint64(st.Bsize),
-}, nil
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return diskSpace{}, err
+	}
+	return diskSpace{
+		free:  st.Bavail * uint64(st.Bsize),
+		total: st.Blocks * uint64(st.Bsize),
+	}, nil
 }
 
 // appVersion 程序版本号（发版时改这里即可，后台「系统信息」会展示）
 const appVersionStr = "2.2.0"
 
+// appVersion 返回程序版本号，供后台「系统信息」与上报 UA 使用。
 func appVersion() string { return appVersionStr }
 
 // blockedAll 五种拦截之和（调用方需自行持有 statsMu 或接受轻微误差）
 func blockedAll() int64 {
-statsMu.Lock()
-defer statsMu.Unlock()
-return stats.BlockedCN + stats.BlockedWhitelist + stats.BlockedBan + stats.BlockedRate + stats.BlockedUA
+	statsMu.Lock()
+	defer statsMu.Unlock()
+	return stats.BlockedCN + stats.BlockedWhitelist + stats.BlockedBan + stats.BlockedRate + stats.BlockedUA
 }
 
 // activeSessionCount 当前未过期的后台登录会话数
 func activeSessionCount() int {
-now := time.Now()
-n := 0
-sessions.Range(func(_, v interface{}) bool {
-	if e, ok := v.(sessionEntry); ok && now.Before(e.Expires) {
-		n++
-	}
-	return true
-})
-return n
+	now := time.Now()
+	n := 0
+	sessions.Range(func(_, v interface{}) bool {
+		if e, ok := v.(sessionEntry); ok && now.Before(e.Expires) {
+			n++
+		}
+		return true
+	})
+	return n
 }
-
 
 // adminHandler 注册 /admin 下全部路由（登录页、API、静态后台页）。
 func adminHandler() http.HandlerFunc {
@@ -4140,7 +4753,7 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
 	})
-// /admin/api/system：概览「系统信息」卡片的运行态数据（全部来自本进程与 os，不依赖外部命令）
+	// /admin/api/system：概览「系统信息」卡片的运行态数据（全部来自本进程与 os，不依赖外部命令）
 	mux.HandleFunc("/admin/api/system", func(w http.ResponseWriter, r *http.Request) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
@@ -4260,12 +4873,31 @@ func adminHandler() http.HandlerFunc {
 				if len(delta) > 0 {
 					lastSeq = delta[0].Seq // events 是 newest-first
 				}
+				// 每秒采样一次各 IP 近期字节，换算成实时网速
+				ipRates := snapshotIPRates()
+				type ipSpeed struct {
+					IP string `json:"ip"`
+					Rx int64  `json:"rx_bps"`
+					Tx int64  `json:"tx_bps"`
+				}
+				var speeds []ipSpeed
+				for ip, b := range ipRates {
+					speeds = append(speeds, ipSpeed{IP: ip, Rx: b[1], Tx: b[0]}) // down=rx, up=tx
+				}
+				// 按总速率排序，取前 20
+				sort.Slice(speeds, func(i, j int) bool {
+					return speeds[i].Rx+speeds[i].Tx > speeds[j].Rx+speeds[j].Tx
+				})
+				if len(speeds) > 20 {
+					speeds = speeds[:20]
+				}
 				msg := map[string]any{
 					"concurrent": conc,
 					"rps":        rps,
 					"rx_bps":     ns.RxBps,
 					"tx_bps":     ns.TxBps,
 					"events":     delta,
+					"ip_speeds":  speeds,
 				}
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := conn.WriteJSON(msg); err != nil {
@@ -4302,21 +4934,21 @@ func adminHandler() http.HandlerFunc {
 		}
 
 		type TrendItem struct {
-			Date      string           `json:"date"`
-			Requests  int64            `json:"requests"`
-			Bytes     int64            `json:"bytes"`
-			UpBytes   int64            `json:"up_bytes"`
-			DownBytes int64            `json:"down_bytes"`
-			Blocked   int64            `json:"blocked"`
-			BlockedCN int64            `json:"blocked_cn"`
-			BlockedWL int64            `json:"blocked_whitelist"`
+			Date          string           `json:"date"`
+			Requests      int64            `json:"requests"`
+			Bytes         int64            `json:"bytes"`
+			UpBytes       int64            `json:"up_bytes"`
+			DownBytes     int64            `json:"down_bytes"`
+			Blocked       int64            `json:"blocked"`
+			BlockedCN     int64            `json:"blocked_cn"`
+			BlockedWL     int64            `json:"blocked_whitelist"`
 			Hours         map[string]int64 `json:"hours,omitempty"`
 			HourBytes     map[string]int64 `json:"hour_bytes,omitempty"`
 			HourUpBytes   map[string]int64 `json:"hour_up_bytes,omitempty"`
 			HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"`
 			Hosts         map[string]int64 `json:"hosts,omitempty"`
-			IPs       map[string]int64 `json:"ips,omitempty"`
-			Countries map[string]int64 `json:"countries,omitempty"`
+			IPs           map[string]int64 `json:"ips,omitempty"`
+			Countries     map[string]int64 `json:"countries,omitempty"`
 		}
 		var trend []TrendItem
 		hostAll := map[string]int64{}
@@ -4329,7 +4961,7 @@ func adminHandler() http.HandlerFunc {
 				// 缺了 hours/hour_*_bytes 就会退化成一条全 0 的直线）；IP/国家/主机明细仍跳过。
 				trend = append(trend, TrendItem{
 					Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
-					Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
+					Blocked:   d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
 					BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
 					Hours:         hour24(d.Hours),
 					HourBytes:     hour24(d.HourBytes),
@@ -4352,14 +4984,14 @@ func adminHandler() http.HandlerFunc {
 			pruneTopN(ipsCopy, 100)
 			pruneTopN(ctryCopy, 50)
 			pruneTopN(hostsCopy, 50)
-		trend = append(trend, TrendItem{
-			Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
-			Blocked: d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
-			BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
-			Hours: hoursCopy, HourBytes: hourBytesCopy,
-			HourUpBytes: hourUpCopy, HourDownBytes: hourDownCopy, Hosts: hostsCopy,
-			IPs: ipsCopy, Countries: ctryCopy,
-		})
+			trend = append(trend, TrendItem{
+				Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
+				Blocked:   d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
+				BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
+				Hours: hoursCopy, HourBytes: hourBytesCopy,
+				HourUpBytes: hourUpCopy, HourDownBytes: hourDownCopy, Hosts: hostsCopy,
+				IPs: ipsCopy, Countries: ctryCopy,
+			})
 		}
 		sort.Slice(trend, func(i, j int) bool { return trend[i].Date < trend[j].Date })
 
@@ -4395,10 +5027,10 @@ func adminHandler() http.HandlerFunc {
 			"today_date": today, "requests": reqs, "bytes": byts,
 			"blocked_cn": cn, "blocked_whitelist": wl,
 			"blocked_ban": ban, "blocked_rate": rate, "blocked_ua": ua,
-			"blocked_total": cn + wl + ban + rate + ua,
+			"blocked_total":  cn + wl + ban + rate + ua,
 			"today_requests": todayReqs, "today_bytes": todayBytes,
 			"today_up_bytes": todayUp, "today_down_bytes": todayDown,
-			"trend": trend,
+			"trend":        trend,
 			"uptime_sec":   int64(time.Since(startedAt).Seconds()),
 			"stat_dropped": statDropped.Load(),
 		}
@@ -4456,7 +5088,7 @@ func adminHandler() http.HandlerFunc {
 			items[i] = map[string]any{
 				"time": ev.Time, "ip": ev.IP, "country": ev.Country,
 				"country_name": countryName(ev.Country),
-				"path": ev.Path, "reason": ev.Reason, "reason_text": ev.ReasonText, "ua": ev.UA,
+				"path":         ev.Path, "reason": ev.Reason, "reason_text": ev.ReasonText, "ua": ev.UA,
 			}
 		}
 		statsMu.Unlock()
@@ -4563,6 +5195,8 @@ func adminHandler() http.HandlerFunc {
 		}
 		statsMu.Lock()
 		reqs := stats.IPCounts[ip]
+		upBytes := stats.IPUpBytes[ip]
+		downBytes := stats.IPDownBytes[ip]
 		// 被拦截的 IP 请求不会进入代理统计，IPCounts 恒为 0；
 		// 从拦截事件中统计该 IP 的拦截次数（仅限保留的最近事件窗口内）。
 		blocked := 0
@@ -4579,6 +5213,7 @@ func adminHandler() http.HandlerFunc {
 			"isp": geo.ISP, "org": geo.Org, "as": geo.AS,
 			"location": strings.Join(locParts, " · "),
 			"requests": reqs, "blocked": blocked,
+			"up_bytes": upBytes, "down_bytes": downBytes,
 		})
 	})
 	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
@@ -4633,7 +5268,7 @@ func adminHandler() http.HandlerFunc {
 		}
 		if r.Method == http.MethodPost {
 			var req struct {
-				Uses   int `json:"uses"`
+				Uses   int    `json:"uses"`
 				Action string `json:"action"`
 				Token  string `json:"token"`
 			}
@@ -4687,16 +5322,79 @@ func adminHandler() http.HandlerFunc {
 			http.Error(w, `{"error":"方法不支持"}`, http.StatusMethodNotAllowed)
 			return
 		}
+		var req struct {
+			Action string `json:"action"`
+			ID     string `json:"id"` // action=payload 时指定要取哪条记录的原文
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+
+		// 查看上报记录列表：不依赖上报开关，未配置地址时也能看到历史
+		if req.Action == "records" {
+			reportRecordsMu.Lock()
+			list := make([]reportRecord, len(reportRecords))
+			copy(list, reportRecords)
+			reportRecordsMu.Unlock()
+			// 最近的在前
+			for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+				list[i], list[j] = list[j], list[i]
+			}
+			cfg := cfgPtr.Load()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items":     list,
+				"total":     len(list),
+				"keep_days": reportRecordKeepDays,
+				"url":       cfg.ReportURL,
+				"on":        cfg.ReportOn,
+			})
+			return
+		}
+		// 取某条记录的原始上报报文：原样返回 JSON 文本，不做任何解析重组
+		if req.Action == "payload" {
+			text, ok := loadReportPayload(req.ID)
+			if !ok {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "saved": false})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":      true,
+				"saved":   true,
+				"id":      req.ID,
+				"size":    len(text),
+				"payload": text, // 字符串原文，前端直接展示
+			})
+			return
+		}
+		// 清空上报记录
+		if req.Action == "clearrec" {
+			reportRecordsMu.Lock()
+			reportRecords = nil
+			persistReportRecordsLocked()
+			clearReportPayloads() // 原文一并清掉，否则库只增不减
+			reportRecordsMu.Unlock()
+			recordAudit(getClientIP(r), "report_clear_records", "清空上报记录")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+		}
+		// 补传先前失败的批次
+		if req.Action == "retry" {
+			c := cfgPtr.Load()
+			if c == nil || c.ReportURL == "" {
+				http.Error(w, `{"error":"尚未配置接收地址"}`, http.StatusBadRequest)
+				return
+			}
+			before := len(loadReportQueue())
+			flushReportQueue()
+			after := len(loadReportQueue())
+			recordAudit(getClientIP(r), "report_retry", fmt.Sprintf("补传上报队列，剩余 %d 批", after))
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "before": before, "after": after, "sent": before - after})
+			return
+		}
+
 		c := cfgPtr.Load()
 		if c == nil || c.ReportURL == "" {
 			http.Error(w, `{"error":"尚未配置上报地址"}`, http.StatusBadRequest)
 			return
 		}
-		// 查询队列状态
-		var req struct {
-			Action string `json:"action"`
-		}
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&req)
 		if req.Action == "flush" {
 			flushReportQueue()
 		}
@@ -4730,8 +5428,12 @@ func adminHandler() http.HandlerFunc {
 			return
 		}
 		raw, _ := json.Marshal(p)
+		start := time.Now()
 		status, respBody, err := sendOnceResp(c.ReportURL, c.ReportToken, raw)
-		recordAudit(getClientIP(r), "report_test", c.ReportURL)
+		clientIP := getClientIP(r)
+		rec := recordFromPayload(raw, p.BatchID, "manual", status, respBody, err, 1, start, clientIP, c.ReportURL)
+		appendReportRecord(rec, raw)
+		recordAudit(clientIP, "report_test", c.ReportURL)
 		if err != nil {
 			reportQueueMu.Lock()
 			list := loadReportQueue()
@@ -4753,6 +5455,7 @@ func adminHandler() http.HandlerFunc {
 			"resp_body":   respBody,
 			"error":       errString(err),
 			"queued":      err != nil,
+			"record_id":   rec.ID,
 		})
 		return
 	})
@@ -4845,7 +5548,6 @@ func adminHandler() http.HandlerFunc {
 		requireAuth(mux.ServeHTTP)(w, r)
 	}
 }
-
 
 // startGeoDBUpdater 启动时确保本地 IP 库存在，并每 24h 尝试更新一次。
 // 当前使用 phuslu/iploc（已嵌入）；此处预留从网络拉取更新包的扩展点。
@@ -4945,6 +5647,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	loadStats()
 	loadSpeedResults()
 	loadSpeedTokens()
+	loadReportRecords()
+	startReportRecordCleaner()
 	startSpeedTokenCleaner()
 	startStatsWorker()
 	startStatsSaver()
@@ -5018,11 +5722,24 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 
 		concurrent.Add(1)
 		defer concurrent.Add(-1)
+		rb := &reqBytes{ip: ip}
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
+		ctx = withReqBytes(ctx, rb)
 		// 包一层计数 Writer 统计上行字节（本机→客户端）。
 		// Hijack 场景（如内部 WebSocket 升级）不经过这里，但媒体流均为普通 HTTP，
 		// 其计数落点就是客户端的 TCP 写出。
-		proxy.ServeHTTP(&countingWriter{ResponseWriter: w}, r.WithContext(ctx))
+		proxy.ServeHTTP(&countingWriter{ResponseWriter: w, rb: rb}, r.WithContext(ctx))
+		// 请求结束，按 IP 上报本次上下行字节（累计统计）
+		up, down := rb.up.Load(), rb.down.Load()
+		if up > 0 || down > 0 {
+			select {
+			case statChan <- statEvent{IP: ip, UpBytes: up, DownBytes: down, Bytes: up + down}:
+			default:
+				// 通道满时丢弃必须计数：否则「有请求次数、没有按 IP 流量」
+				// 这种缺口在后台完全看不出来（stat_dropped 永远是 0）。
+				statDropped.Add(1)
+			}
+		}
 		pushLiveEvent(ip, country, target.Host, r.URL.Path)
 	})
 
@@ -5076,12 +5793,13 @@ func main() {
 	adminPass := fs.String("admin-pass", "", "密码")
 	dbFile := fs.String("db", "/etc/emby-proxy/emby.db", "数据库")
 	_ = fs.Parse(args)
-	if *adminPass == "" {
-		log.Fatal("必须指定 --admin-pass")
-	}
+	// 这里不能强制要求 --admin-pass：首次安装后脚本会把明文密码从 unit 中剥离，
+	// 之后完全依赖数据库里的 admin_pass_hash。若在此 Log.Fatal，
+	// 任何一次重启（update / 系统重启 / systemd 拉起）都会陷入
+	// "必须指定 --admin-pass" → 退出 → Restart=on-failure → 再退出的死循环。
+	// 密码是否可用由 runServer 统一判定（DB 有哈希则无需参数）。
 	runServer(*port, *adminUser, *adminPass, *dbFile)
 }
-
 GO_SOURCE
   cat > "$dir/admin.html" <<'ADMIN_HTML'
 <!DOCTYPE html>
@@ -5202,8 +5920,10 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .bar{flex:1;height:8px;background:#f1f5f9;border-radius:99px;overflow:hidden;min-width:50px}
 .bar>i{display:block;height:100%;border-radius:99px;transition:width .4s ease-out}
 .bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
-.dv{width:80px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0}
+.dv{width:80px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0;white-space:nowrap}
 .dv span{color:var(--t3);font-size:12px;margin-left:4px;font-weight:normal}
+/* IP 排行的流量列：独立于次数列，固定宽度右对齐，空值占位保证各行右边缘对齐 */
+.dbt{width:74px;flex-shrink:0;text-align:right;font-size:11.5px;color:var(--t3);font-weight:normal;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* 表格 */
 .table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--bd);-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;text-align:left;min-width:600px}
@@ -5262,6 +5982,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   .filter{padding:6px 8px;font-size:12px;flex:1;text-align:center;min-width:0}
   .dn{width:min(90px,28vw);font-size:12px}
   .dv{width:auto;min-width:52px;font-size:12px}
+  .dbt{display:none}
   .dr{gap:8px;padding:10px 0}
   .bar{min-width:36px}
   .ch{flex-wrap:wrap;gap:8px}
@@ -5352,6 +6073,25 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   .sg{grid-template-columns:1fr}
   .sv{font-size:22px}
 }
+
+/* ===== 数据上报页 ===== */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:12px;margin-bottom:4px}
+.stat-b{background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:12px 14px}
+.stat-b .k{font-size:12px;color:var(--t3);margin-bottom:4px}
+.stat-b .v{font-size:19px;font-weight:700;letter-spacing:-.4px;color:var(--t)}
+.stat-b .v small{font-size:11px;font-weight:500;color:var(--t3);margin-left:2px}
+.rp-g{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;white-space:nowrap}
+.rp-g.ok{background:rgba(16,185,129,.12);color:#047857}
+.rp-g.bad{background:rgba(239,68,68,.12);color:#b91c1c}
+.rp-g.wt{background:rgba(245,158,11,.14);color:#b45309}
+.rp-tg{display:inline-block;font-size:11.5px;padding:2px 7px;border-radius:5px;background:#f1f5f9;color:var(--t2);white-space:nowrap}
+.rp-tg.auto{background:var(--ps);color:var(--pd)}
+.rp-tg.manual{background:rgba(245,158,11,.14);color:#b45309}
+.rp-tg.retry{background:rgba(239,68,68,.1);color:#b91c1c}
+.rp-row{cursor:pointer}
+.rp-row:hover td{background:#f8fafc}
+.rp-pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px;font:12px/1.6 var(--mono);overflow:auto;max-height:300px;white-space:pre-wrap;word-break:break-all;margin-top:6px}
+.pgbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;font-size:12.5px;color:var(--t3);flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -5367,6 +6107,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <li><button class="nav-i" data-t="realtime"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>实时监控</button></li>
 <li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
 <li><button class="nav-i" data-t="speedm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>测速管理</button></li>
+<li><button class="nav-i" data-t="report"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5-7 5 7"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>数据上报</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
 <div class="sb-f" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
@@ -5468,6 +6209,10 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   <div class="stc r"><div class="sl">↑ 发送</div><div class="sv" id="rtTx">-</div><div class="ss">转发速率</div></div>
 </div>
 <div class="card">
+<div class="ch"><div><h2 class="ct">各 IP 实时网速</h2><div class="cd">最近 1 秒内有流量的 IP（按总速率排序，最多 20 个）</div></div></div>
+<div id="rtIPSpeeds" style="display:grid;gap:8px;margin-bottom:8px"><div style="color:var(--t3);font-size:13px;padding:8px 0">等待数据…</div></div>
+</div>
+<div class="card">
 <div class="ch"><div><h2 class="ct">实时请求流</h2><div class="cd" id="rtStatus">进入页面才开始收集，退出即清空</div></div></div>
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th><th>地区</th><th>上游主机</th><th>路径</th></tr></thead><tbody id="rtTable"></tbody></table></div>
 </div>
@@ -5515,6 +6260,71 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   </div>
 </div>
 </section>
+<section id="report" class="pg">
+<div class="card">
+  <div class="ch">
+    <div><h2 class="ct">上报状态</h2><div class="cd">每小时整点将「上一个自然小时」的增量 POST 到接收地址（JSON + Bearer Token），失败自动排队重试，重启不丢</div></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <span id="rpState" class="rp-g wt">读取中</span>
+      <label class="sw" title="开启/关闭每小时自动上报"><input type="checkbox" id="reportOn"><span class="tr2"></span></label>
+    </div>
+  </div>
+  <div class="stat-grid" id="rpStats">
+    <div class="stat-b"><div class="k">近 24 小时成功</div><div class="v" id="rpOk">—</div></div>
+    <div class="stat-b"><div class="k">近 24 小时失败</div><div class="v" id="rpFail">—</div></div>
+    <div class="stat-b"><div class="k">成功率</div><div class="v" id="rpRate">—</div></div>
+    <div class="stat-b"><div class="k">待补传队列</div><div class="v" id="rpQueue">—<small>批</small></div></div>
+    <div class="stat-b"><div class="k">最近成功</div><div class="v" id="rpLast" style="font-size:13px;font-weight:600">—</div></div>
+    <div class="stat-b"><div class="k">记录保留</div><div class="v">30<small>天</small></div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="ch"><div><h2 class="ct">上报配置</h2><div class="cd">接收地址、鉴权与备注；服务器备注会随每批数据一起发出，便于接收端区分多台机器</div></div></div>
+  <div class="fi"><label class="fl">接收地址</label><div class="hint" style="margin-bottom:8px">留空则不上报，例如 https://api.example.com/collect</div><input id="reportUrl" class="inp m" type="url" placeholder="https://api.example.com/collect"></div>
+  <div class="fi"><label class="fl">Bearer Token</label><div class="hint" style="margin-bottom:8px">留空则不带 Authorization 头</div><input id="reportToken" class="inp m" type="text" placeholder="可选"></div>
+  <div class="fi"><label class="fl">服务器备注</label><div class="hint" style="margin-bottom:8px">如「香港节点」「家里宽带」</div><input id="reportNote" class="inp m" type="text" maxlength="60" placeholder="可选，如：香港节点"></div>
+  <div class="acts" style="display:flex;gap:10px;flex-wrap:wrap">
+    <button class="btn b" id="saveReport">保存配置</button>
+    <button class="btn g" id="testReport">立即上报一次</button>
+    <button class="btn g" id="reportRetry">补传队列</button>
+    <button class="btn g" id="reportClear">清空快照</button>
+  </div>
+  <div id="reportMsg" style="margin-top:12px;font-size:12.5px;color:var(--t3);word-break:break-all"></div>
+</div>
+
+<div class="card">
+  <div class="ch">
+    <div><h2 class="ct">上传记录</h2><div class="cd">每一次 HTTP 投递的结果（自动 / 手动 / 补传）· 保留最近 30 天 · 点击行查看详情</div></div>
+    <button type="button" class="btn g s" id="rpRefresh">刷新</button>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;align-items:center">
+    <input id="rpQ" class="inp m" type="search" placeholder="搜索批次 / 地址 / 错误" style="max-width:240px">
+    <select id="rpResult" class="inp m" style="width:auto;max-width:150px">
+      <option value="">全部结果</option>
+      <option value="ok">成功</option>
+      <option value="fail">失败</option>
+    </select>
+    <select id="rpTrigger" class="inp m" style="width:auto;max-width:150px">
+      <option value="">全部触发方式</option>
+      <option value="auto">整点自动</option>
+      <option value="manual">手动</option>
+      <option value="retry">补传</option>
+    </select>
+    <span id="rpCount" style="font-size:12.5px;color:var(--t3)"></span>
+    <span style="flex:1"></span>
+    <button type="button" class="btn d s" id="rpClearRec">清空记录</button>
+  </div>
+  <div class="table-wrap"><table><thead><tr><th>时间</th><th>触发</th><th>结果</th><th>数据周期</th><th>请求</th><th>下行</th><th>上行</th><th>耗时</th><th>批次</th></tr></thead><tbody id="rpBody"></tbody></table></div>
+  <div class="pgbar">
+    <span id="rpPageInfo"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn g s" id="rpPrev">上一页</button>
+      <button class="btn g s" id="rpNext">下一页</button>
+    </div>
+  </div>
+</div>
+</section>
 <section id="settings" class="pg">
 <div class="g2">
   <div style="display:flex;flex-direction:column;gap:24px;">
@@ -5546,21 +6356,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
     <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
   </div>
-  <div class="card" style="margin-bottom:0;grid-column:1/-1;">
-    <div class="ch"><div><h2 class="ct">数据上报</h2><div class="hint" style="margin-top:4px">每小时向指定接口 POST 一次当日汇总（JSON + Bearer Token），失败自动排队重试，重启不丢</div></div>
-      <label class="sw"><input type="checkbox" id="reportOn"><span class="tr2"></span></label>
-    </div>
-    <div class="fi"><label class="fl">接收地址</label><div class="hint" style="margin-bottom:8px">留空则不上报，例如 https://api.example.com/collect</div><input id="reportUrl" class="inp m" type="url" placeholder="https://api.example.com/collect"></div>
-    <div class="fi"><label class="fl">Bearer Token</label><div class="hint" style="margin-bottom:8px">留空则不带 Authorization 头</div><input id="reportToken" class="inp m" type="text" placeholder="可选"></div>
-    <div class="fi"><label class="fl">服务器备注</label><div class="hint" style="margin-bottom:8px">随每批数据一起上报，用于在接收端区分多台服务器，如「香港节点」「家里宽带」</div><input id="reportNote" class="inp m" type="text" maxlength="60" placeholder="可选，如：香港节点"></div>
-    <div class="acts" style="display:flex;gap:10px;flex-wrap:wrap">
-      <button class="btn b" id="saveReport">保存上报配置</button>
-      <button class="btn g" id="testReport">立即上报一次</button>
-      <button class="btn g" id="reportStatus">查看队列</button>
-      <button class="btn g" id="reportClear">清空快照</button>
-    </div>
-    <div id="reportMsg" style="margin-top:12px;font-size:12.5px;color:var(--t3);word-break:break-all"></div>
-  </div>
 </div>
 </section>
 </div>
@@ -5575,6 +6370,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 const state={port:0,labels:{},ovRange:'today',ovFrom:'',ovTo:'',tfRange:'today',tfFrom:'',tfTo:'',schemaVersion:2,cfgCache:null};
 let ovTrendData=[];
 
+// 字节数转可读文本（B/KB/MB/GB），用于所有流量展示
 function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
 /* 字节坐标轴：先按数据最大值定一个统一单位，再在该单位下取整齐步长，
    避免 Chart.js 自动步长造成「1000 B / 1.95 KB」这类同轴混排 */
@@ -5643,6 +6439,7 @@ function fmtBeijing(iso, mode){
   if(mode==='hm') return `${g('hour')}:${g('minute')}`;
   return `${date} ${time}`;
 }
+// 取今天的北京时间日期（YYYY-MM-DD），作为各页面区间的默认终点
 function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
 /* 拦截原因统一映射：cn=地区限制 whitelist=域名白名单 ban=IP黑名单 rate_limit=限流 ua=UA白名单 */
@@ -5650,6 +6447,7 @@ function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ba
 function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',rate_limit:'pl',ua:'pu',login_fail:'pb'}[r]||'pw'}
 function reasonFull(r){return {cn:'地区限制：仅允许中国大陆 IP',whitelist:'域名未授权：目标域名不在白名单',ban:'IP 黑名单：命中黑名单规则',rate_limit:'触发限流：超过每分钟请求上限',ua:'UA 不允许：User-Agent 不在白名单'}[r]||'其他拦截'}
 
+// 国家码转显示名：优先用后端下发的中文映射，其次本地兜底表，最后原样返回
 function countryLabel(code){  if(!code) return '未知';
   const c = String(code).toUpperCase();
   if(state.labels && (state.labels[c]||state.labels[code])) return state.labels[c]||state.labels[code];
@@ -5657,31 +6455,36 @@ function countryLabel(code){  if(!code) return '未知';
   return fallback[c] || code;
 }
 
-const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',speedm:'测速管理',settings:'网关设置'};
-let blocksTimer=null, realtimeWS=null;
+const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',speedm:'测速管理',report:'数据上报',settings:'网关设置'};
+let blocksTimer=null, realtimeWS=null, reportTimer=null;
+// 清空实时监控界面的数值与表格（断线或退出时调用，避免残留旧数据）
 function clearRealtimeUI(){
   const ids=['rtConc','rtRps','rtRx','rtTx'];
   ids.forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='-';});
   const tb=document.getElementById('rtTable'); if(tb) tb.innerHTML='';
   const st=document.getElementById('rtStatus'); if(st) st.textContent='已退出，数据已清空';
 }
+// 切换左侧导航：切换页面、清理上一页的定时器与 WebSocket，并按需加载数据
 function switchTab(id){
   document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));
   document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));
   document.getElementById('pt').textContent=pageTitles[id]||'';
   if(window.innerWidth<=1024)closeSidebar();
   if(blocksTimer){clearInterval(blocksTimer);blocksTimer=null}
+  if(reportTimer){clearInterval(reportTimer);reportTimer=null}
   if(realtimeWS){try{realtimeWS.close()}catch(e){} realtimeWS=null; clearRealtimeUI();}
   if(id==='overview')loadOverview();
   if(id==='traffic')loadTraffic();
   if(id==='realtime') connectRealtime();
   if(id==='speedm'){loadSpeedTokens();loadSpeedResults();}
   if(id==='settings')loadSpeedTokens();
+  if(id==='report')loadReportPage();
   if(id==='blocks'){
     loadBlocks();
     blocksTimer=setInterval(()=>{if(!document.hidden)loadBlocks()},5000);
   }
 }
+// 建立实时监控 WebSocket，断线后自动重连；收到消息即刷新并发/RPS/流量与事件表
 function connectRealtime(){
   clearRealtimeUI();
   const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
@@ -5700,6 +6503,19 @@ function connectRealtime(){
       document.getElementById('rtRps').textContent=(d.rps||0).toLocaleString();
       document.getElementById('rtRx').textContent=fmtBytes(d.rx_bps||0)+'/s';
       document.getElementById('rtTx').textContent=fmtBytes(d.tx_bps||0)+'/s';
+      // 各 IP 实时网速
+      const spdBox=document.getElementById('rtIPSpeeds');
+      if(spdBox){
+        const speeds=d.ip_speeds||[];
+        if(!speeds.length){
+          spdBox.innerHTML='<div style="color:var(--t3);font-size:13px;padding:8px 0">当前无活跃流量</div>';
+        }else{
+          spdBox.innerHTML=speeds.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:#f8fafc;border-radius:8px;font-size:13px">
+            <span class="mono" style="color:var(--pd);font-weight:600;cursor:pointer" onclick="showIPDetail('${esc(s.ip)}')">${esc(s.ip)}</span>
+            <span style="color:var(--t2)">↓ ${fmtBytes(s.rx_bps||0)}/s　↑ ${fmtBytes(s.tx_bps||0)}/s</span>
+          </div>`).join('');
+        }
+      }
       const evs=d.events||[];
       const tb=document.getElementById('rtTable');
       if(!evs.length) return;
@@ -5724,7 +6540,9 @@ function connectRealtime(){
     }catch(e){}
   };
 }
+// 移动端展开侧边栏
 function openSidebar(){document.getElementById('sb').classList.add('open');document.getElementById('sbMask').classList.add('on')}
+// 移动端收起侧边栏
 function closeSidebar(){document.getElementById('sb').classList.remove('open');document.getElementById('sbMask').classList.remove('on')}
 document.getElementById('mmb').addEventListener('click',(e)=>{e.stopPropagation();openSidebar()});
 document.getElementById('sbMask').addEventListener('click',closeSidebar);
@@ -5732,8 +6550,10 @@ document.getElementById('sbMask').addEventListener('click',closeSidebar);
 document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
 document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
 
+// 把当前监听端口写回设置页输入框与顶部端口标签
 function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portChip').textContent=':'+p}
 
+// 拉取后端配置并填充设置页表单（同时缓存到 state.cfgCache 供保存时对比）
 async function loadConfig(){
   try{
     const r=await fetch('/admin/api/config',{cache:'no-store'});
@@ -5779,6 +6599,7 @@ function ovFilteredTrend(){
   }).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
 }
 
+// 按当前区间汇总趋势数据，刷新概览页的请求数/流量/拦截等指标卡片
 function updateOvStats() {
   if (!ovTrendData.length) return;
   const {from,to}=ovRangeBounds();
@@ -5873,6 +6694,7 @@ function ovChartSeries(){
   return {labels,reqs,ups,downs,gran};
 }
 
+// 加载概览页：趋势数据、系统信息、拦截摘要
 async function loadOverview(){
   try{
     // slim=1：trend 只含每日汇总，避免 5 秒轮询拉全量明细（分时/主机/IP/国家）
@@ -5961,6 +6783,7 @@ function refreshOverview(){
 // esc：HTML 转义，防 XSS
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+// 渲染概览页底部的拦截摘要列表
 function renderOvBlocks(items){
   const box=document.getElementById('ovBlocks');
   if(!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">近期没有拦截事件</span></div>';return}
@@ -5970,6 +6793,7 @@ function renderOvBlocks(items){
   </div>`).join('');
 }
 
+// Date 对象转本地时区的 YYYY-MM-DD
 function localDateStr(d){
   return fmtBeijing(d instanceof Date ? d : new Date(d), 'date');
 }
@@ -5980,6 +6804,7 @@ function beijingDateStrBefore(days){
   bj.setDate(bj.getDate() - days);
   return bj.getFullYear() + '-' + String(bj.getMonth()+1).padStart(2,'0') + '-' + String(bj.getDate()).padStart(2,'0');
 }
+// 计算流量页区间边界（北京时间；自定义区间时自动纠正首尾颠倒）
 function dateRangeBounds(){
   const tStr=nowBeijingDateStr();
   let from=null,to=tStr;
@@ -5995,6 +6820,7 @@ function dateRangeBounds(){
   }
   return {from,to,today:tStr};
 }
+// 按当前区间过滤趋势数组，并按日期升序返回
 function filterTrendByRange(trend){
   const {from,to}=dateRangeBounds();
   return (trend||[]).filter(d=>{
@@ -6004,12 +6830,14 @@ function filterTrendByRange(trend){
     return true;
   }).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
 }
+// 返回某天所在周的周一日期，用于按周聚合
 function weekStartKey(dateStr){
   const d=new Date(dateStr+'T00:00:00');
   const day=d.getDay()||7;
   d.setDate(d.getDate()-day+1);
   return localDateStr(d);
 }
+// 取 YYYY-MM，用于按月聚合
 function monthKey(dateStr){ return (dateStr||'').slice(0,7); }
 /** 按区间跨度选择图表粒度：日 → 周(>60) → 月(>180) */
 function pickGranularity(dayCount){
@@ -6017,6 +6845,7 @@ function pickGranularity(dayCount){
   if(dayCount>60) return 'week';
   return 'day';
 }
+// 把后端趋势整理成流量页所需结构：按粒度生成 labels 与请求/上下行序列
 function buildTrafficView(trend){
   const filtered=filterTrendByRange(trend);
   const {from,to}=dateRangeBounds();
@@ -6086,6 +6915,7 @@ function buildTrafficView(trend){
   ctryEntries.slice(0,ctryTopN).forEach(([k,v])=>{ctryMapTrim[k]=v});
   return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN};
 }
+// 把整理好的序列渲染到流量页的图表与汇总指标
 function applyTrafficView(){
   const v=buildTrafficView(trafficTrendData);
   document.getElementById('tfReq').textContent=v.totalReq.toLocaleString();
@@ -6110,10 +6940,14 @@ function applyTrafficView(){
   renderReqChart(v.labels,v.reqs,v.gran);
   renderByteChart(v.labels,v.ups,v.downs,v.gran);
   renderHostChart(v.hostTop);
-  renderIP(v.ipMap,{},v.ipTotalUnique,v.ipTopN);
+  const ipBytesMap={};
+  if(state.ipUpBytes) for(const k in state.ipUpBytes) ipBytesMap[k]=(ipBytesMap[k]||0)+state.ipUpBytes[k];
+  if(state.ipDownBytes) for(const k in state.ipDownBytes) ipBytesMap[k]=(ipBytesMap[k]||0)+state.ipDownBytes[k];
+  renderIP(v.ipMap,ipBytesMap,v.ipTotalUnique,v.ipTopN);
   renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN);
 }
 
+// 加载流量页数据（趋势 + 域名/IP/地区排行）
 async function loadTraffic(){
   try{
     const r=await fetch('/admin/api/traffic',{cache:'no-store'});
@@ -6122,11 +6956,14 @@ async function loadTraffic(){
     if(t.country_labels) state.labels = t.country_labels;
     state.schemaVersion = (t.schema_version!=null? t.schema_version : 2);
     trafficTrendData = t.trend || [];
+    state.ipUpBytes = t.ip_up_bytes || {};
+    state.ipDownBytes = t.ip_down_bytes || {};
     // 自定义日期输入默认最近 7 天
     applyTrafficView();
   }catch(e){console.error('loadTraffic error:',e)}
 }
 
+// 复用已有 Chart 实例：同类型只更新数据，类型或粒度变化时销毁重建
 function upsertChart(prev,cv,cfg){
   // 分时(bar) 与按天(line) 切换时必须重建，否则会一直保留小时轴
   if(prev){
@@ -6142,12 +6979,14 @@ function upsertChart(prev,cv,cfg){
   }
   return new Chart(cv, cfg);
 }
+// 按粒度缩短 X 轴标签（月只留「MM月」，日只留「MM-DD」）
 function fmtAxisLabel(lab,gran){
   if(gran==='hour') return lab;
   if(gran==='month' && /^\d{4}-\d{2}$/.test(lab)) return lab.slice(5)+'月';
   if(/^\d{4}-\d{2}-\d{2}$/.test(lab)) return lab.slice(5);
   return lab;
 }
+// 生成图表 tooltip 标题；按周聚合时补「起一周」，避免误读
 function tooltipTitle(labels,gran){
   return (items)=>{
     const raw=labels[items[0].dataIndex]||'';
@@ -6156,6 +6995,7 @@ function tooltipTitle(labels,gran){
     return raw;
   };
 }
+// 按粒度控制 X 轴最多显示多少个刻度，防止标签重叠
 function chartTickLimit(n,gran){
   if(gran==='hour') return 12;
   if(n<=14) return n;
@@ -6163,6 +7003,7 @@ function chartTickLimit(n,gran){
   if(gran==='week') return Math.min(16,n);
   return 14;
 }
+// 渲染请求数图表
 function renderReqChart(labels,data,gran){
   const cv=document.getElementById('reqChart');if(!cv||typeof Chart==='undefined')return;
   gran=gran||'day';
@@ -6171,6 +7012,7 @@ function renderReqChart(labels,data,gran){
   const cfg={type:'line',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'请求数：'+Number(c.parsed.y||0).toLocaleString()}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
+// 渲染流量图表（上行/下行双序列）
 function renderByteChart(labels,ups,downs,gran){
   const cv=document.getElementById('byteChart');if(!cv||typeof Chart==='undefined')return;
   gran=gran||'day';
@@ -6183,6 +7025,7 @@ function renderByteChart(labels,ups,downs,gran){
   ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'流量：'+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
+// 渲染上游域名 Top N 图表
 function renderHostChart(hostTop){
   const cv=document.getElementById('hostChart');if(!cv||typeof Chart==='undefined')return;
   const labels=hostTop.map(([h])=>h.length>22?h.slice(0,20)+'…':h);
@@ -6193,6 +7036,7 @@ function renderHostChart(hostTop){
   const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.75)',hoverBackgroundColor:'#8b5cf6',borderRadius:4,maxBarThickness:22}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:14,font:{size:11}}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
 }
+// 渲染请求 IP 排行：IP、占比条、次数、流量四列，点击行看详情
 function renderIP(map,bytesMap,totalUnique,topN){
   topN=topN||20;
   const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
@@ -6200,11 +7044,16 @@ function renderIP(map,bytesMap,totalUnique,topN){
   if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有 IP 记录</span></div>';return}
   const max=rows[0][1]||1;
   const more=(totalUnique||rows.length)>rows.length;
-  let html=rows.map(([ip,n])=>`<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`).join('');
+  let html=rows.map(([ip,n])=>{
+    const b=bytesMap&&bytesMap[ip]||0;
+    const btxt='<span class="dbt">'+(b>0?fmtBytes(b):'')+'</span>';
+    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span>${btxt}</div>`;
+  }).join('');
   if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个 IP</div>`;
   box.innerHTML=html;
   box.querySelectorAll('.ip-row').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
 }
+// 渲染地区分布排行
 function renderRegion(map,totalUnique,topN){
   topN=topN||20;
   const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
@@ -6220,6 +7069,7 @@ function renderRegion(map,totalUnique,topN){
   box.innerHTML=html;
 }
 
+// 弹出单个 IP 的详情（请求数、上下行、最近访问等）
 async function showIPDetail(ip){
   if(!ip)return;
   document.getElementById('modalTitle').textContent='IP 详情';
@@ -6237,13 +7087,17 @@ async function showIPDetail(ip){
     }else{
       cntRow=['拦截次数',(d.blocked||0).toLocaleString()+' 次',false];
     }
-    const rows=[['IP',d.ip,true],['位置',loc,false],cntRow];
+    const rows=[['IP',d.ip,true],['位置',loc,false],cntRow,
+      ['下行流量',fmtBytes(d.down_bytes||0),false],
+      ['上行流量',fmtBytes(d.up_bytes||0),false],
+      ['合计',fmtBytes((d.up_bytes||0)+(d.down_bytes||0)),false]];
     document.getElementById('modalBody').innerHTML=rows.map(([k,v,m])=>'<div class="kv"><div class="kk">'+esc(k)+'</div><div class="kvv'+(m?' m':'')+'">'+esc(v)+'</div></div>').join('');
   }catch(e){
     document.getElementById('modalBody').innerHTML='<div style="color:var(--d);font-size:13px">加载失败：'+esc(e.message||'未知错误')+'</div>';
   }
 }
 
+// 加载拦截记录列表，并按当前筛选条件渲染
 async function loadBlocks(){
   try{
     const q=document.getElementById('blkQ')?.value?.trim()||'';
@@ -6289,6 +7143,7 @@ async function loadBlocks(){
 }
 
 
+// 从设置页表单收集配置项，返回待保存的配置对象
 function collect(){
   const raw=parseInt(document.getElementById('portInput').value,10);
   return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),
@@ -6297,6 +7152,7 @@ function collect(){
     report_token:(document.getElementById('reportToken')?.value||'').trim(),
     report_note:(document.getElementById('reportNote')?.value||'').trim()}
 }
+// 保存设置：提交后按需热切换端口，并刷新页面状态
 async function save(){
   try{
     const r=await fetch('/admin/api/save',{method:'POST',body:JSON.stringify(collect())});
@@ -6305,15 +7161,191 @@ async function save(){
     alert('配置已保存并即时生效');
   }catch(e){alert('保存失败：'+(e.message||'未知错误'))}
 }
-document.getElementById('savePort').addEventListener('click',save);document.getElementById('saveAll').addEventListener('click',save);
+document.getElementById('savePort').addEventListener('click',()=>save());document.getElementById('saveAll').addEventListener('click',()=>save());
 
 /* ===== 数据上报 ===== */
+const RP_PAGE_SIZE=20;
+const rpState={items:[],page:1,loaded:false};
+// 在数据上报页显示一条操作提示
 function reportMsg(t,color){const el=document.getElementById('reportMsg');if(el){el.textContent=t;el.style.color=color||'var(--t3)'}}
+// 上报触发方式转中文标签（整点自动/手动/补传）
+function rpTriggerLabel(t){return {auto:'整点自动',manual:'手动',retry:'补传'}[t]||t||'—'}
+// 请求耗时格式化（毫秒/秒）
+function fmtDur(ms){if(!ms)return '—';if(ms<1000)return ms+' ms';return (ms/1000).toFixed(1)+' s'}
+// 时间字段格式化，空值显示为「—」
+function fmtTimeSec(v){return v?fmtBeijing(v):'—'}
+
+// 加载数据上报页：记录列表 + 待补传条数，并开启 15 秒自动刷新
+async function loadReportPage(){
+  const st=document.getElementById('rpState');
+  if(st){st.className='rp-g wt';st.textContent='读取中'}
+  await Promise.all([loadReportRecords(), loadReportQueueStat()]);
+  if(!reportTimer){reportTimer=setInterval(()=>{if(!document.hidden && document.getElementById('report')?.classList.contains('on')){loadReportRecords();loadReportQueueStat()}},15000)}
+}
+
+// 按关键字与结果筛选上报记录
+function rpFiltered(){
+  const q=(document.getElementById('rpQ')?.value||'').trim().toLowerCase();
+  const res=document.getElementById('rpResult')?.value||'';
+  const tg=document.getElementById('rpTrigger')?.value||'';
+  return rpState.items.filter(it=>{
+    if(res==='ok'&&!it.ok)return false;
+    if(res==='fail'&&it.ok)return false;
+    if(tg&&it.trigger!==tg)return false;
+    if(q){
+      const hay=[it.batch_id,it.url,it.error,it.note,it.ip,it.id].join(' ').toLowerCase();
+      if(!hay.includes(q))return false;
+    }
+    return true;
+  });
+}
+
+// 渲染上报记录表格
+function rpRenderTable(){
+  const tb=document.getElementById('rpBody');
+  if(!tb)return;
+  const list=rpFiltered();
+  const pages=Math.max(1,Math.ceil(list.length/RP_PAGE_SIZE));
+  if(rpState.page>pages)rpState.page=pages;
+  const pageItems=list.slice((rpState.page-1)*RP_PAGE_SIZE, rpState.page*RP_PAGE_SIZE);
+  document.getElementById('rpCount').textContent='共 '+list.length+' 条记录';
+  document.getElementById('rpPageInfo').textContent=pages>1?('第 '+rpState.page+' / '+pages+' 页'):'';
+  document.getElementById('rpPrev').disabled=rpState.page<=1;
+  document.getElementById('rpNext').disabled=rpState.page>=pages;
+  if(!pageItems.length){
+    tb.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--t3);padding:22px 0">暂无上报记录；开启自动上报后每小时形成一条，或点「立即上报一次」马上产生一条</td></tr>';
+    return;
+  }
+  tb.innerHTML=pageItems.map(it=>{
+    const okCls=it.ok?'ok':'bad';
+    const okTxt=it.ok?'成功':(it.status_code?('失败 HTTP '+it.status_code):'失败');
+    const period=(it.period_date||'—')+(it.period_hour!==undefined&&it.period_hour!==''?' '+it.period_hour+':00':'');
+    return `<tr class="rp-row" data-rid="${esc(it.id)}">
+      <td data-label="时间"><span class="cell-v mono">${fmtTimeSec(it.time)}</span></td>
+      <td data-label="触发"><span class="cell-v"><span class="rp-tg ${esc(it.trigger||'')}">${rpTriggerLabel(it.trigger)}</span></span></td>
+      <td data-label="结果"><span class="cell-v"><span class="rp-g ${okCls}">${okTxt}</span></span></td>
+      <td data-label="数据周期"><span class="cell-v mono">${esc(period)}</span></td>
+      <td data-label="请求"><span class="cell-v">${(it.requests||0).toLocaleString()}</span></td>
+      <td data-label="下行"><span class="cell-v">${fmtBytes(it.down_bytes||0)}</span></td>
+      <td data-label="上行"><span class="cell-v">${fmtBytes(it.up_bytes||0)}</span></td>
+      <td data-label="耗时"><span class="cell-v muted">${fmtDur(it.duration_ms)}</span></td>
+      <td data-label="批次"><span class="cell-v mono" style="font-size:11.5px">${esc(it.batch_id||'—')}</span></td>
+    </tr>`;
+  }).join('');
+  tb.querySelectorAll('.rp-row').forEach(tr=>tr.addEventListener('click',()=>showReportRecord(tr.dataset.rid)));
+}
+
+// 打开某条上报记录的详情弹窗，并异步加载其原始报文
+function showReportRecord(id){
+  const it=rpState.items.find(x=>x.id===id);
+  if(!it)return;
+  const rows=[
+    ['投递时间',fmtTimeSec(it.time)],
+    ['触发方式',rpTriggerLabel(it.trigger)+(it.ip?'（来自 '+it.ip+'）':'')],
+    ['结果',(it.ok?'成功':'失败')+(it.status_code?'（HTTP '+it.status_code+'）':'')],
+    ['数据周期',(it.period_date||'—')+(it.period_hour!==undefined&&it.period_hour!==''?' '+it.period_hour+':00 档':'')],
+    ['批次 ID',it.batch_id||'—'],
+    ['接收地址',it.url||'—'],
+    ['服务器备注',it.note||'—'],
+    ['请求数',(it.requests||0).toLocaleString()],
+    ['下行 / 上行',fmtBytes(it.down_bytes||0)+' / '+fmtBytes(it.up_bytes||0)+((it.down_bytes||it.up_bytes)?('（'+Number(it.down_bytes||0).toLocaleString()+' / '+Number(it.up_bytes||0).toLocaleString()+' B）'):'')],
+    ['拦截数',(it.blocked||0).toLocaleString()],
+    ['请求体大小',(it.size||0)+' B'],
+    ['耗时',fmtDur(it.duration_ms)],
+    ['尝试次数','第 '+ (it.attempts||1) +' 次'],
+  ];
+  let html='<table style="min-width:0;width:100%;table-layout:fixed"><tbody>'
+    + rows.map(([k,v])=>`<tr><td style="width:88px;color:var(--t3);font-size:12.5px;padding:6px 0;vertical-align:top">${esc(k)}</td><td style="font-size:12.5px;padding:6px 0;word-break:break-all">${esc(String(v))}</td></tr>`).join('')
+    + '</tbody></table>';
+  // 原始上报数据：整段报文原样保留，这里直接原文展示，不做解析重组
+  if(it.payload_saved){
+    html+='<div style="font-size:12px;font-weight:600;color:var(--t2);margin-top:14px">原始上报数据 <span id="rpRawMeta" style="font-weight:normal;color:var(--t3)">· 加载中…</span></div>'
+      +'<div class="rp-pre" id="rpRaw">加载中…</div>';
+  }else{
+    html+='<div style="font-size:12px;font-weight:600;color:var(--t2);margin-top:14px">原始上报数据</div>'
+      +'<div style="font-size:12px;color:var(--t3);margin-top:4px">该记录未保存原文（由旧版本产生，或本次报文为空）。</div>';
+  }
+  if(it.error){
+    html+='<div style="font-size:12px;font-weight:600;color:var(--d);margin-top:12px">错误信息</div><div class="rp-pre">'+esc(it.error)+'</div>';
+  }
+  html+='<div style="font-size:12px;font-weight:600;color:var(--t2);margin-top:12px">接收端返回</div><div class="rp-pre">'+esc(it.resp_body||'（空）')+'</div>';
+  document.getElementById('modalTitle').textContent='上报记录详情';
+  document.getElementById('modalBody').innerHTML=html;
+  document.getElementById('modal').classList.add('on');
+  if(it.payload_saved)loadRawPayload(it.id);
+}
+
+// 按记录 ID 取原始报文。后端返回的就是投递时的原字符串，直接放进 <pre>，
+// 不 JSON.parse 再 stringify——那会改变键顺序并丢掉格式，就不再是「原文」了。
+async function loadRawPayload(id){
+  const box=document.getElementById('rpRaw'), meta=document.getElementById('rpRawMeta');
+  if(!box)return;
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'payload',id})});
+    const d=await r.json().catch(()=>({}));
+    if(!d.saved){box.textContent='该记录未保存原文。';return}
+    box.textContent=d.payload||'';
+    if(meta)meta.textContent='· '+fmtBytes(d.size||0)+' · 原样存储，未做解析';
+  }catch(e){
+    box.textContent='加载失败：'+(e.message||'');
+    if(meta)meta.textContent='';
+  }
+}
+
+// 拉取上报记录列表
+async function loadReportRecords(){
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'records'})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+    rpState.items=d.items||[];
+    rpState.loaded=true;
+    const st=document.getElementById('rpState');
+    if(st){
+      if(!d.url){st.className='rp-g wt';st.textContent='未配置地址'}
+      else if(d.on){st.className='rp-g ok';st.textContent='自动上报已开启'}
+      else{st.className='rp-g wt';st.textContent='自动上报已关闭'}
+    }
+    rpRenderTable();
+    rpRenderStats();
+  }catch(e){
+    const tb=document.getElementById('rpBody');
+    if(tb)tb.innerHTML='<tr><td colspan="9" style="color:var(--d);text-align:center;padding:18px 0">加载失败：'+esc(e.message||'')+'</td></tr>';
+  }
+}
+
+// 渲染上报页顶部的统计指标
+function rpRenderStats(){
+  const items=rpState.items||[];
+  const since=Date.now()-24*3600*1000;
+  const recent=items.filter(it=>{const t=new Date(it.time).getTime();return !isNaN(t)&&t>=since});
+  const okN=recent.filter(it=>it.ok).length, failN=recent.length-okN;
+  document.getElementById('rpOk').textContent=okN;
+  document.getElementById('rpFail').textContent=failN;
+  document.getElementById('rpRate').textContent=recent.length?Math.round(okN/recent.length*100)+'%':'—';
+  const last=items.find(it=>it.ok);
+  document.getElementById('rpLast').textContent=last?fmtTimeSec(last.time):'—';
+}
+
+// 拉取待补传队列条数，用于提示是否有积压
+async function loadReportQueueStat(){
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'status'})});
+    const d=await r.json().catch(()=>({}));
+    const el=document.getElementById('rpQueue');
+    if(!el)return;
+    const n=(r.ok&&typeof d.depth==='number')?d.depth:0;
+    el.innerHTML=String(n)+'<small>批</small>';
+    el.style.color=n?'var(--w)':'';
+  }catch(e){}
+}
+
 document.getElementById('saveReport')?.addEventListener('click',async()=>{
   const url=(document.getElementById('reportUrl')?.value||'').trim();
   if(url && !/^https?:\/\//i.test(url)){reportMsg('地址需以 http:// 或 https:// 开头','var(--d)');return}
   await save();
-  reportMsg('上报配置已保存'+(document.getElementById('reportOn')?.checked?'，将每小时上报':'（当前未开启）'),'var(--ok)');
+  reportMsg('上报配置已保存'+(document.getElementById('reportOn')?.checked?'，将每小时上报':'（当前未开启自动上报）'),'var(--ok)');
+  loadReportPage();
   setTimeout(()=>reportMsg(''),4000);
 });
 document.getElementById('testReport')?.addEventListener('click',async()=>{
@@ -6329,29 +7361,32 @@ document.getElementById('testReport')?.addEventListener('click',async()=>{
       document.getElementById('modalTitle').textContent='上报回显';
       document.getElementById('modalBody').innerHTML=head
         +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">发送的数据</div>'
-        +'<pre style="background:#f8fafc;border:1px solid var(--bd);border-radius:8px;padding:10px;font-size:11.5px;line-height:1.5;overflow:auto;max-height:300px;white-space:pre-wrap;word-break:break-all">'+esc(JSON.stringify(d.payload,null,2))+'</pre>'
-        +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin:10px 0 4px">接收端返回（HTTP '+d.resp_status+'）</div>'
-        +'<pre style="background:#f8fafc;border:1px solid var(--bd);border-radius:8px;padding:10px;font-size:11.5px;line-height:1.5;overflow:auto;max-height:160px;white-space:pre-wrap;word-break:break-all">'+esc(d.resp_body||'（空）')+'</pre>';
+        +'<pre class="rp-pre" style="max-height:300px">'+esc(JSON.stringify(d.payload,null,2))+'</pre>'
+        +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin:10px 0 0">接收端返回（HTTP '+d.resp_status+'）</div>'
+        +'<pre class="rp-pre" style="max-height:160px">'+esc(d.resp_body||'（空）')+'</pre>';
       document.getElementById('modal').classList.add('on');
       reportMsg(d.ok?'上报成功，详见弹窗':'上报失败，详见弹窗',d.ok?'var(--ok)':'var(--d)');
     }else{
       reportMsg(d.error||('HTTP '+r.status),'var(--d)');
     }
+    loadReportRecords(); loadReportQueueStat();
   }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
 });
-document.getElementById('reportStatus')?.addEventListener('click',async()=>{
-  reportMsg('查询中…');
+
+document.getElementById('reportRetry')?.addEventListener('click',async()=>{
+  reportMsg('正在补传…');
   try{
-    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'status'})});
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'retry'})});
     const d=await r.json().catch(()=>({}));
-    if(!r.ok){reportMsg(d.error||'查询失败','var(--d)');return}
-    if(!d.depth){reportMsg('队列为空，无积压数据（地址：'+(d.url||'未配置')+'）','var(--ok)');return}
-    reportMsg('积压 '+d.depth+' 批：'+d.queue.map(q=>q.id+'（重试'+q.attempts+'次'+(q.last_err?'，'+q.last_err:'')+'）').join('；'),'var(--w)');
+    if(!r.ok){reportMsg(d.error||'补传失败','var(--d)');return}
+    if(!d.before){reportMsg('队列为空，没有需要补传的数据','var(--ok)');return}
+    reportMsg(d.sent>0?('已补传 '+d.sent+' 批，剩余 '+(d.after||0)+' 批未发出'):('补传失败，仍有 '+(d.after||0)+' 批排队，请检查接收地址或网络'),d.sent>0?'var(--ok)':'var(--d)');
+    loadReportRecords(); loadReportQueueStat();
   }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
 });
 
 document.getElementById('reportClear')?.addEventListener('click',async()=>{
-  if(!confirm('确定清空上报快照链？清空后：手动上报会立即补建新快照重新开始，整点自动上报从下一个整点起恢复正常。排队中未发出的数据不受影响。'))return;
+  if(!confirm('确定清空上报快照链？清空后：手动上报会立即补建新快照重新开始，整点自动上报从下一个整点起恢复正常。排队中未发出的数据与历史记录不受影响。'))return;
   reportMsg('清空中…');
   try{
     const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear'})});
@@ -6360,6 +7395,22 @@ document.getElementById('reportClear')?.addEventListener('click',async()=>{
     reportMsg('快照已清空，到整点后会重新开始记录','var(--ok)');
   }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
 });
+
+document.getElementById('rpRefresh')?.addEventListener('click',()=>{loadReportRecords();loadReportQueueStat()});
+document.getElementById('rpClearRec')?.addEventListener('click',async()=>{
+  if(!confirm('确定清空全部上报记录？仅删除「上传记录」列表与保存的原始报文，不影响上报配置、快照与待补传数据。'))return;
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clearrec'})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){alert(d.error||'清空失败');return}
+    rpState.page=1; loadReportRecords();
+  }catch(e){alert('网络异常：'+e.message)}
+});
+document.getElementById('rpQ')?.addEventListener('input',()=>{rpState.page=1;rpRenderTable()});
+document.getElementById('rpResult')?.addEventListener('change',()=>{rpState.page=1;rpRenderTable()});
+document.getElementById('rpTrigger')?.addEventListener('change',()=>{rpState.page=1;rpRenderTable()});
+document.getElementById('rpPrev')?.addEventListener('click',()=>{if(rpState.page>1){rpState.page--;rpRenderTable()}});
+document.getElementById('rpNext')?.addEventListener('click',()=>{rpState.page++;rpRenderTable()});
 
 document.getElementById('changePassBtn').addEventListener('click',async()=>{
   const o=document.getElementById('oldPass').value,n=document.getElementById('newPass').value;
@@ -6483,6 +7534,7 @@ document.getElementById('pwaInstallBtn')?.addEventListener('click',pwaInstall);
 
 /* ---------- 测速链接 ---------- */
 let spdPage=1;const SPD_PAGE_SIZE=5;
+// 加载测速链接列表（分页）
 async function loadSpeedTokens(){
   const box=document.getElementById('spdList');
   if(!box)return;
@@ -6525,7 +7577,9 @@ async function loadSpeedTokens(){
     box.innerHTML=html;
   }catch(e){box.innerHTML='<div style="color:var(--d);font-size:12.5px">加载失败：'+esc(e.message)+'</div>'}
 }
+// 切换测速链接列表的分页
 function spdGo(p){spdPage=p;loadSpeedTokens();}
+// 创建一条限次测速链接
 async function createSpeedToken(){
   const uses=parseInt(document.getElementById('spdUses').value,10)||5;
   try{
@@ -6535,10 +7589,12 @@ async function createSpeedToken(){
     spdPage=1;loadSpeedTokens();
   }catch(e){alert('生成失败：'+e.message)}
 }
+// 删除指定测速链接
 async function delSpeedToken(tok){
   await fetch('/admin/api/speed-tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',token:tok})});
   loadSpeedTokens();
 }
+// 复制测速链接到剪贴板
 function copySpeedUrl(tok){
   const url=location.origin+'/speed/'+tok;
   (navigator.clipboard?navigator.clipboard.writeText(url):Promise.reject()).then(()=>{}).catch(()=>{
@@ -6547,6 +7603,7 @@ function copySpeedUrl(tok){
 }
 document.getElementById('spdCreate')?.addEventListener('click',createSpeedToken);
 
+// 加载历史测速结果列表
 async function loadSpeedResults(){
   const tb=document.getElementById('spdResBody');
   if(!tb)return;
@@ -6592,8 +7649,17 @@ document.addEventListener('visibilitychange',()=>{
 </script>
 </body>
 </html>
-
 ADMIN_HTML
+
+  # heredoc 用的是 <<'GO_SOURCE'（引号形式），变量在里面不会展开，
+  # 所以 Go 源码里的版本号在这里统一注入，保证与顶部 APP_VERSION 一致。
+  # 三处：源码注释头 / PWA manifest 描述 / appVersionStr 常量。
+  # 正则写成 [0-9][0-9.]* 而不是固定的 2.2.0，改版本号后依然幂等。
+  sed -i \
+    -e "s/路径反代 v[0-9][0-9.]*服务（单文件）/路径反代 v${APP_VERSION}服务（单文件）/" \
+    -e "s/路径反代 v[0-9][0-9.]*管理控制台/路径反代 v${APP_VERSION}管理控制台/" \
+    -e "s/^const appVersionStr = \".*\"\$/const appVersionStr = \"${APP_VERSION}\"/" \
+    "$dir/main.go"
 }
 
 compute_source_hash() {
@@ -6616,6 +7682,10 @@ make_unit() {
 Description=Emby Path Reverse Proxy (Go)
 After=network-online.target
 Wants=network-online.target
+# 崩溃时不要以 RestartSec=5s 无限重启：否则错误配置会每 5 秒刷一条日志，
+# 既刷爆 journal 又掩盖真正原因。60 秒内失败 5 次就停下来等人处理。
+StartLimitIntervalSec=60
+StartLimitBurst=5
 [Service]
 Type=simple
 # GOGC=100 保持默认 GC 节奏；GOMEMLIMIT 设软内存上限 256MiB，
@@ -6773,12 +7843,28 @@ cmd_install() {
     info "首次引导完成，已从 unit 中移除明文密码（后续以数据库哈希为准）"
   fi
   sleep 1
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
-    if port_listen "$(effective_port)"; then info "🎉 安装完成！端口 $(effective_port) 已监听"
-    else warn "服务已启动，端口暂未监听（稍等几秒）"; fi
+  # Type=simple + Restart=on-failure 时，进程刚崩会进入 5s 重启等待期，
+  # 此时 is-active 返回 activating（非 0）。直接判定会把「还在重启」误报成失败，
+  # 也会让真正的错误信息被吞掉——所以这里最多等 20 秒，并优先看端口是否已监听。
+  local waited=0 ep
+  ep="$(effective_port)"
+  while [[ $waited -lt 20 ]]; do
+    if systemctl is-active --quiet "$SERVICE_NAME" && port_listen "$ep"; then break; fi
+    sleep 1; waited=$((waited + 1))
+  done
+  if systemctl is-active --quiet "$SERVICE_NAME" && port_listen "$ep"; then
+    info "🎉 安装完成！端口 $ep 已监听"
+    print_access_info
+  elif systemctl is-active --quiet "$SERVICE_NAME"; then
+    warn "服务已启动，端口暂未监听（稍等几秒）"
     print_access_info
   else
-    err "启动失败: journalctl -u $SERVICE_NAME -n 80 --no-pager"; exit 1
+    err "启动失败，最近日志如下（可直接复制给我）："
+    printf '\033[0;90m%s\033[0m\n' "------------------------------------------------------------"
+    journalctl -u "$SERVICE_NAME" -n 60 --no-pager -o cat 2>/dev/null || true
+    printf '\033[0;90m%s\033[0m\n' "------------------------------------------------------------"
+    err "常见原因：端口 $ep 被占用 / 数据库被其他进程锁住 / 二进制无执行权限"
+    die "完整日志: journalctl -u $SERVICE_NAME -n 80 --no-pager"
   fi
 }
 cmd_uninstall() {
@@ -6850,7 +7936,7 @@ menu_banner() {
   local ip ep svc bt W
   ip="$(local_ip)"; ep="$(effective_port)"; svc="$(svc_state_colored)"; bt="$(build_time)"; W="$(term_cols)"
   printf '\n%s%s%s\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
-  printf '  %s⚡ Emby 路径反代 v2.2.0%s  %s·%s  %s管理菜单%s\n' "$C_B" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
+  printf '  %s⚡ Emby 路径反代 v%s%s  %s·%s  %s管理菜单%s\n' "$C_B" "$APP_VERSION" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
   printf '%s%s%s\n\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
   printf '   %s服务%s   %s\n' "$C_D" "$C_0" "$svc"
   printf '   %s端口%s   %s:%s%s\n' "$C_D" "$C_0" "$C_C" "$ep" "$C_0"
