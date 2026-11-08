@@ -1,0 +1,4 @@
+emby_rp_vps_go.ico
+emby_rp_vps_go_512.png
+emby_rp_vps_go_192.png
+emby_rp_vps_go.png
