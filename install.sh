@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="3.2.0"
+APP_VERSION="3.2.1"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -6906,6 +6906,7 @@ html[data-theme="dark"] .tl-res.block{background:#331519;color:#fca5a5;border-co
 .hm-cell:hover{transform:scale(1.12);z-index:2;box-shadow:0 2px 8px rgba(0,0,0,.18)}
 .hm-wrap{overflow-x:auto;padding-bottom:4px}
 .hm-legend{display:flex;align-items:center;gap:6px;margin-top:12px;font-size:11.5px;color:var(--t3);justify-content:flex-end}
+.hm+.hm{margin-top:8px}
 .hm-legend i{width:16px;height:10px;border-radius:2px;display:inline-block}
 
 .set-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
@@ -6938,7 +6939,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 
 .pgbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;font-size:12.5px;color:var(--t3);flex-wrap:wrap}
 .pgbar .acts{margin-top:0}
-@media(max-width:600px){.hm{grid-template-columns:44px repeat(24,1fr);gap:2px}.hm-cell{height:16px}}
+@media(max-width:600px){.hm{gap:2px}.hm-cell{height:16px}.hm-h{font-size:9.5px}}
 </style>
 </head>
 <body>
@@ -8001,11 +8002,24 @@ function hmCell(v,max,title){
   const bg=v?`background:rgba(59,130,246,${a.toFixed(3)})`:'';
   return `<div class="hm-cell" style="${bg}" title="${esc(title)}"></div>`;
 }
+let hourHeatDays=[];
+function hmGrid(head,cells,label,chunk){
+  const n=head.length;
+  const build=(hs,cs,lb)=>`<div class="hm" style="grid-template-columns:56px repeat(${hs.length},1fr)"><div class="hm-d"></div>${hs.join('')}<div class="hm-d">${lb}</div>${cs.join('')}</div>`;
+  if(!chunk||n<=chunk)return build(head,cells,esc(label));
+  let out='';
+  for(let i=0;i<n;i+=chunk){
+    const hs=head.slice(i,i+chunk),cs=cells.slice(i,i+chunk);
+    out+=build(hs,cs,i?'':esc(label));
+  }
+  return out;
+}
 function renderHourHeat(days){
   const box=document.getElementById('hourHeat');
   if(!box)return;
+  hourHeatDays=days||[];
   const sub=document.getElementById('hourHeatSub');
-  const list=(days||[]).filter(d=>d&&d.date).sort((a,b)=>a.date<b.date?-1:1);
+  const list=hourHeatDays.filter(d=>d&&d.date).sort((a,b)=>a.date<b.date?-1:1);
   if(!list.length){
     if(sub)sub.textContent='当前筛选条件下没有数据';
     box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有请求记录</span></div>';
@@ -8016,19 +8030,20 @@ function renderHourHeat(days){
   let span=list.length||1;
   if(from&&to){span=Math.round((new Date(to)-new Date(from))/86400000)+1}
 
-  let headCells=[],rowLabel='',unit='',max=1,cells='',title='';
+  let headCells=[],cells=[],rowLabel='',unit='',max=1,title='';
+  const chunk=(window.innerWidth||1024)<=600?12:0;
   if(single){
     const d=list.find(x=>x.date===from)||list[list.length-1];
     const hours=d.hours||{};
     for(let h=0;h<24;h++){const v=hours[String(h).padStart(2,'0')]||0;if(v>max)max=v}
-    headCells=[];for(let h=0;h<24;h++)headCells.push(`<div class="hm-h">${String(h).padStart(2,'0')}</div>`);
-    for(let h=0;h<24;h++){const k=String(h).padStart(2,'0');const v=hours[k]||0;cells+=hmCell(v,max,`${d.date} ${k}:00 · ${v.toLocaleString()} 次`)}
+    for(let h=0;h<24;h++)headCells.push(`<div class="hm-h">${String(h).padStart(2,'0')}</div>`);
+    for(let h=0;h<24;h++){const k=String(h).padStart(2,'0');const v=hours[k]||0;cells.push(hmCell(v,max,`${d.date} ${k}:00 · ${v.toLocaleString()} 次`))}
     rowLabel=String(d.date).slice(5);unit='次/时';
     title=`${d.date} 24 小时请求分布（北京时间）`;
   }else if(span<=31){
     list.forEach(d=>{if((d.requests||0)>max)max=d.requests||0});
     headCells=list.map(d=>`<div class="hm-h" title="${esc(d.date)}">${String(d.date).endsWith('-01')?String(d.date).slice(5):String(d.date).slice(8)}</div>`);
-    list.forEach(d=>{const v=d.requests||0;cells+=hmCell(v,max,`${d.date} · ${v.toLocaleString()} 次`)});
+    list.forEach(d=>{const v=d.requests||0;cells.push(hmCell(v,max,`${d.date} · ${v.toLocaleString()} 次`))});
     rowLabel='按天';unit='次/天';
     title=`${list[0].date} ~ ${list[list.length-1].date} 按天请求分布`;
   }else{
@@ -8037,17 +8052,19 @@ function renderHourHeat(days){
     const keys=Object.keys(months).sort();
     keys.forEach(m=>{if(months[m]>max)max=months[m]});
     headCells=keys.map(m=>`<div class="hm-h" title="${esc(m)}">${m}</div>`);
-    keys.forEach(m=>{const v=months[m];cells+=hmCell(v,max,`${m} · ${v.toLocaleString()} 次`)});
+    keys.forEach(m=>{const v=months[m];cells.push(hmCell(v,max,`${m} · ${v.toLocaleString()} 次`))});
     rowLabel='按月';unit='次/月';
     title=`${keys[0]} ~ ${keys[keys.length-1]} 按月请求分布`;
   }
   if(sub)sub.textContent=title;
-  const n=headCells.length;
-  box.innerHTML=`<div class="hm" style="grid-template-columns:56px repeat(${n},1fr)">${headCells.join('')}<div class="hm-d">${esc(rowLabel)}</div>${cells}</div>
-    <div class="hm-legend"><span>少</span>
-      <i style="background:rgba(59,130,246,.12)"></i><i style="background:rgba(59,130,246,.35)"></i><i style="background:rgba(59,130,246,.6)"></i><i style="background:rgba(59,130,246,.9)"></i>
-      <span>多（峰值 ${max.toLocaleString()} ${unit}）</span></div>`;
+  const narrow=chunk>0&&headCells.length>chunk;
+  box.innerHTML=hmGrid(headCells,cells,rowLabel,chunk)
+    +`<div class="hm-legend"${narrow?' style="margin-top:6px"':''}><span>少</span>`
+    +'<i style="background:rgba(59,130,246,.12)"></i><i style="background:rgba(59,130,246,.35)"></i><i style="background:rgba(59,130,246,.6)"></i><i style="background:rgba(59,130,246,.9)"></i>'
+    +`<span>多（峰值 ${max.toLocaleString()} ${unit}）</span></div>`;
 }
+let hourHeatRz=null;
+window.addEventListener('resize',()=>{clearTimeout(hourHeatRz);hourHeatRz=setTimeout(()=>{if(hourHeatDays.length)renderHourHeat(hourHeatDays)},200)});
 
 async function showIPDetail(ip){
   if(!ip)return;
