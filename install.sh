@@ -1,40 +1,8 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Emby 路径反代 — 一键安装 / 管理脚本
-#   版本号统一由下方 APP_VERSION 定义（紧跟 set -euo pipefail），只改那一处。
-# =============================================================================
-#
-# 功能概览
-#   · 内嵌完整 Go 源码（路径反代服务 + 管理后台 HTML）
-#   · 自动检测/安装 Go，编译为静态二进制并注册 systemd 服务
-#   · 子命令：menu | install | update | uninstall | status | start|stop|restart
-#
-# 数据目录（默认）
-#   /etc/emby-proxy/emby.db     bolt 库：配置、统计、认证（唯一的本地持久化数据）
-#   /usr/local/bin/emby-proxy   编译产物
-#   /etc/systemd/system/emby-proxy.service
-#
-# 常用
-#   sudo bash $0                # 交互菜单
-#   sudo bash $0 install        # 安装/重装
-#   sudo bash $0 update         # 仅重编译替换二进制
-#   sudo bash $0 uninstall -y   # 卸载
-#
-# =============================================================================
 set -euo pipefail
 
-# =============================================================================
-#  ★★★ 版本号 —— 本脚本唯一的版本定义，改这里就够了 ★★★
-#
-#  改完执行：  bash $0 update
-#  会同步到：  用法说明 / 菜单横幅 / 后台界面标题 / 编译进二进制的 appVersion
-#              / PWA manifest 描述 / 源码注释头
-#  同时源码哈希会变化，所以 update 一定会重新编译，不会命中缓存跳过。
-# =============================================================================
-APP_VERSION="3.0.0"
-# =============================================================================
+APP_VERSION="3.2.0"
 
-# ---------- 默认路径与版本（可通过 install 参数覆盖端口/路径等）----------
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
 DEFAULT_BIN="/usr/local/bin/emby-proxy"
@@ -47,7 +15,6 @@ GO_MIN_MINOR=20
 GO_FALLBACK_VERSION="1.23.4"
 IPLOC_VERSION="latest"
 
-# ---------- 运行时状态 ----------
 BUILD_TMPDIR=""
 GENERATED_PASS=0
 PORT=$DEFAULT_PORT
@@ -60,7 +27,6 @@ BINARY_ONLY=0
 PORT_GIVEN=0
 PASS_GIVEN=0
 
-# ---------- 日志辅助 ----------
 info() { printf '\033[1;32m[OK] %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
 err()  { printf '\033[1;31m[ERR] %s\033[0m\n' "$*" >&2; }
@@ -172,42 +138,10 @@ ensure_go() {
   info "Go 就绪: $(go env GOVERSION)"
 }
 
-# 将内嵌的 main.go + admin.html 写出到临时目录，供 go build 使用
 write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
-
-/*
-Emby 路径反代 v2.2.0服务（单文件）
-
-访问模型
-  客户端请求：  GET /https://emby.example.com:8096/web/index.html
-  本服务解析路径中的目标 URL，按白名单/地区/限流校验后反代到上游。
-
-上下行口径（服务端视角）
-  · 下行 down = 上游→本机（从源站读到的字节）
-  · 上行 up   = 本机→客户端（写给客户端的字节）
-
-主要模块
-  · parseTarget / buildProxy     路径解析与 httputil.ReverseProxy
-  · Config + bolt DB            持久化配置与统计
-  · 访问控制                    白名单、ChinaOnly、黑名单、UA、限流（ACL 预编译）
-  · 统计                        异步 channel 聚合，按日分桶，定期落盘
-  · 管理后台                    /admin/ 嵌入 admin.html，会话 Cookie + 验证码登录
-  · PWA 模式                    内置常开：manifest + Service Worker（不含离线缓存），后台可安装为独立应用
-  · 品牌图标                    favicon / Logo / PWA 图标（192、512）一律 302 到源站，本地不留副本
-  · CORS                        不提供跨域响应头（功能已移除，预检按普通请求转发上游）
-
-时区
-  统计分日/分时与对外时间字段统一按 Asia/Shanghai（北京时间）。
-
-内存与资源
-  · 除 bolt 数据库外不做任何本地缓存（图标/HTML/SW/geo 均不落盘、不驻留副本）
-  · geo 查询结果仅放在进程内 map，随进程退出丢弃
-  · 统计 map 定期 pruneTopN，防止无限增长
-  · GOMEMLIMIT 由 systemd unit 设为 256MiB 软限制
-*/
 
 import (
 	"bufio"
@@ -250,19 +184,16 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// adminHTML 为管理后台单页（构建时由脚本写入同目录 admin.html 后 embed）
-//
 //go:embed admin.html
 var adminHTML []byte
 
-// 上下文键：在 ReverseProxy.Rewrite 中取回目标 URL
+//go:embed chart.umd.min.js
+var chartJS []byte
+
 type targetCtxKey struct{}
 
 var httpPorts = map[string]bool{"80": true, "8080": true, "8000": true, "8008": true, "8081": true, "8088": true, "8888": true, "3000": true, "5000": true, "7001": true, "8090": true, "8096": true, "9000": true, "9090": true, "9200": true, "10000": true, "15672": true}
 
-// schemeForPort 按端口推断上游协议。
-// 443/8443/8920/9443 视为 TLS 端口；httpPorts 表内的常见明文端口用 http；
-// 其余保守回落 https —— 宁可握手失败，也不把明文请求发到需要 TLS 的服务上。
 func schemeForPort(port string) string {
 	if port == "" || port == "443" || port == "8443" || port == "8920" || port == "9443" {
 		return "https"
@@ -273,8 +204,6 @@ func schemeForPort(port string) string {
 	return "https"
 }
 
-// schemeForAuthority 从 authority（可能带 userinfo、可能是 IPv6 方括号形式）中取出端口，
-// 再交给 schemeForPort 推断协议；未写端口时按 https 处理。
 func schemeForAuthority(authority string) string {
 	host := authority
 	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
@@ -291,8 +220,6 @@ func schemeForAuthority(authority string) string {
 	return schemeForPort(port)
 }
 
-// splitAuthority 把 "host:port/path" 拆成 authority 与 path 两段。
-// path 保留前导斜杠，没有路径时返回空串。
 func splitAuthority(s string) (authority, path string) {
 	if i := strings.IndexByte(s, '/'); i >= 0 {
 		return s[:i], s[i:]
@@ -302,9 +229,6 @@ func splitAuthority(s string) (authority, path string) {
 
 var builtinAssets = map[string]bool{"favicon.ico": true, "favicon.png": true, "favicon.svg": true, "favicon-16x16.png": true, "favicon-32x32.png": true, "favicon-96x96.png": true, "apple-touch-icon.png": true, "apple-touch-icon-precomposed.png": true, "robots.txt": true, "sitemap.xml": true, "browserconfig.xml": true, "manifest.json": true, "site.webmanifest": true, "humans.txt": true, "security.txt": true, "crossdomain.xml": true, "app-ads.txt": true}
 
-// isBuiltinAssetPath 判断请求路径是否属于浏览器/爬虫的常见静态资源探测
-// （favicon、robots.txt、.well-known/* 等）。这类请求不应被当成反代目标转发，
-// 否则会被解析成一个不存在的主机名并产生大量无意义的拦截记录。
 func isBuiltinAssetPath(p string) bool {
 	p = strings.TrimPrefix(p, "/")
 	if p == "" {
@@ -319,13 +243,11 @@ func isBuiltinAssetPath(p string) bool {
 	return strings.HasPrefix(p, ".well-known/")
 }
 
-// ---------- 对外非管理页：首页与错误页（与管理后台独立的轻量样式）----------
 const pageCSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--r:16px}
 body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:40px 36px;max-width:520px;width:100%;box-shadow:0 4px 24px -4px rgba(15,23,42,.06);text-align:center}
-/* 品牌区：与登录页 brand 结构一致（Logo + 名称 + 副标题） */
 .brand{text-align:center;margin-bottom:22px}
 .brand-logo{width:56px;height:56px;border-radius:14px;display:block;margin:0 auto 14px}
 .brand h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
@@ -349,9 +271,6 @@ h2{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:10px;color:
 @media(max-width:480px){.card{padding:28px 20px}h2{font-size:20px}}
 `
 
-// writePage 统一风格的公共页面（首页/错误页）：
-// 品牌区（Logo + Emby Proxy + 副标题）与登录页结构一致；
-// icon 非空时展示状态图标（错误页），title 非空时展示页面标题。
 func writePage(w http.ResponseWriter, status int, iconClass, icon, title, desc, extraHTML string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -371,16 +290,12 @@ func writePage(w http.ResponseWriter, status int, iconClass, icon, title, desc, 
 	_, _ = w.Write([]byte(html))
 }
 
-// serveHome 根路径的健康检查页：只说明服务在跑，并给出管理后台入口，
-// 不暴露任何版本号以外的内部信息。
 func serveHome(w http.ResponseWriter, r *http.Request) {
 	extra := `<div class="acts" style="margin-top:8px"><a class="btn g" href="/admin/">管理</a></div>`
 	writePage(w, http.StatusOK, "", "", "",
 		"服务运行中。", extra)
 }
 
-// serveError 输出统一风格的错误页：按状态码挑选图标与配色，
-// body 文本只描述现象与建议，不携带上游地址、错误栈等技术细节。
 func serveError(w http.ResponseWriter, status int, title, message string) {
 	iconClass, icon := "red", "✕"
 	switch status {
@@ -395,8 +310,6 @@ func serveError(w http.ResponseWriter, status int, title, message string) {
 	writePage(w, status, iconClass, icon, title, message, extra)
 }
 
-// parseTarget 从请求路径解析上游目标。
-// 支持：/https://host/path、/http://host/path，或省略协议时按端口推断 scheme。
 func parseTarget(r *http.Request) (*url.URL, error) {
 	raw := r.URL.EscapedPath()
 	if raw == "" || raw == "/" {
@@ -411,7 +324,6 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	}
 	var scheme, body string
 	body = rest
-	// 避免整段 ToLower：只看前缀
 	for i := 0; i < 3; i++ {
 		if len(body) >= 6 && strings.EqualFold(body[:6], "https:") {
 			if scheme == "" {
@@ -437,7 +349,6 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	if scheme == "" {
 		scheme = schemeForAuthority(authority)
 	}
-	// 用 url.URL 直接构造，少一次字符串拼接 + Parse
 	u := &url.URL{Scheme: scheme, Host: authority, Path: pathPart, RawQuery: r.URL.RawQuery}
 	if u.Host == "" {
 		return nil, fmt.Errorf("目标地址无效：%s", authority)
@@ -445,26 +356,21 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	return u, nil
 }
 
-// Config 网关运行时配置（JSON 存入 bolt bucket "config"）
 type Config struct {
-	Port        int      `json:"port"`         // 监听端口；保存后可热切换
-	ChinaOnly   bool     `json:"china_only"`   // 仅允许中国大陆 IP（本地 iploc 判断）
-	Whitelist   []string `json:"whitelist"`    // 上游域名白名单，空=不限制；支持根域匹配
-	BanList     []string `json:"ban_list"`     // IP 或 CIDR
-	AutoBan     bool     `json:"auto_ban"`     // 触发地区拦截时自动写入黑名单
-	RateLimit   int      `json:"rate_limit"`   // 每 IP 每分钟请求上限，0=关闭
-	AllowedUAs  []string `json:"allowed_uas"`  // UA 关键字白名单，空=不限制
-	ReportURL   string   `json:"report_url"`   // 数据上报接收地址，空=不上报
-	ReportToken string   `json:"report_token"` // Bearer Token，空=不带鉴权头
-	ReportOn    bool     `json:"report_on"`    // 是否开启每小时上报
-	ReportNote  string   `json:"report_note"`  // 服务器备注，随上报携带
-	// 说明：CORS 与 PWA 已固化为程序常量（CORS 关闭、PWA 常开），不再作为可配置项，
-	// 也不再出现在后台设置中；旧数据库里遗留的 cors/pwa 字段会被自动忽略。
+	Port        int      `json:"port"`
+	ChinaOnly   bool     `json:"china_only"`
+	Whitelist   []string `json:"whitelist"`
+	BanList     []string `json:"ban_list"`
+	AllowedUAs  []string `json:"allowed_uas"`
+	ReportURL   string   `json:"report_url"`
+	ReportToken string   `json:"report_token"`
+	ReportOn    bool     `json:"report_on"`
+	ReportNote  string   `json:"report_note"`
+	AdminAllow  []string `json:"admin_allow"`
 }
 
 var startedAt = time.Now()
 
-// 统一使用北京时间（Asia/Shanghai）做日期分桶与对外时间展示
 var beijingLoc = func() *time.Location {
 	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
@@ -473,17 +379,12 @@ var beijingLoc = func() *time.Location {
 	return loc
 }()
 
-// nowBeijing 返回当前北京时间。全项目的日期分桶与对外时间展示都以它为准，
-// 避免服务器所在时区不同导致「今天」错位。
 func nowBeijing() time.Time { return time.Now().In(beijingLoc) }
 
-// beijingDate 格式化为北京时间日期 YYYY-MM-DD，作为 Daily 统计的分桶键。
 func beijingDate(t time.Time) string { return t.In(beijingLoc).Format("2006-01-02") }
 
-// beijingHour 格式化为北京时间小时 HH（00-23），作为分时统计的键。
 func beijingHour(t time.Time) string { return t.In(beijingLoc).Format("15") }
 
-// beijingRFC3339 格式化为 RFC3339，用于对外输出的时间字段。
 func beijingRFC3339(t time.Time) string { return t.In(beijingLoc).Format(time.RFC3339) }
 
 var (
@@ -497,22 +398,17 @@ var (
 	globalSrv *http.Server
 )
 
-// ---------- 品牌图标资源 ----------
-// 不再在本地缓存图标：一律 302 到源站，由浏览器自行缓存（省去进程内的图标副本与启动预热请求）。
 const (
-	iconFaviconURL = "https://i.ibb.co/H9QXXb8/emby-rp-icon.jpg"      // 网页 favicon（32x32）
-	iconLogoURL    = "https://i.ibb.co/KxByc0q8/emby-rp-logo.png"     // 品牌 Logo（512x512）
-	icon192URL     = "https://i.ibb.co/84fwCqPj/emby-rp-logo-192.png" // PWA 192x192
-	icon512URL     = "https://i.ibb.co/RkTFtq4n/emby-rp-logo-512.png" // PWA 512x512
+	iconFaviconURL = "https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/img/emby_rp_vps_go.ico"
+	iconLogoURL    = "https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/img/emby_rp_vps_go.PNG"
+	icon192URL     = "https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/img/emby_rp_vps_go_192.png"
+	icon512URL     = "https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/img/emby_rp_vps_go_512.png"
 )
 
-// redirectIcon 直接 302 到源站图标，不在本地保存任何副本
 func redirectIcon(w http.ResponseWriter, r *http.Request, src string) {
 	http.Redirect(w, r, src, http.StatusFound)
 }
 
-// currentCfg 读取当前配置的原子快照。未初始化时返回零值 Config，
-// 调用方无需判空，避免热路径上反复出现 nil 检查。
 func currentCfg() *Config {
 	if p := cfgPtr.Load(); p != nil {
 		return p
@@ -520,19 +416,14 @@ func currentCfg() *Config {
 	return &Config{}
 }
 
-// compiledACL 由 rebuildACL 在配置加载/保存时生成，供每个请求快速检查，
-// 避免在热路径上反复 net.ParseCIDR 与 strings.ToLower。
 type compiledACL struct {
 	exactBan  map[string]struct{}
 	cidrs     []*net.IPNet
-	uaNeedles []string // 已小写；空 = 不限制
+	uaNeedles []string
 }
 
 var aclPtr atomic.Pointer[compiledACL]
 
-// rebuildACL 把配置里的黑名单与 UA 白名单预编译成查表结构，
-// 写入 aclPtr 供每个请求无锁读取。配置加载/保存后调用一次即可。
-// 编译时统一做 TrimSpace 与小写，避免请求热路径上重复处理。
 func rebuildACL(c *Config) {
 	a := &compiledACL{exactBan: map[string]struct{}{}}
 	if c == nil {
@@ -561,8 +452,6 @@ func rebuildACL(c *Config) {
 	aclPtr.Store(a)
 }
 
-// currentACL 读取已编译的 ACL 快照；尚未编译时返回空规则（即不拦截任何请求），
-// 保证启动早期也不会因 nil 解引用崩溃。
 func currentACL() *compiledACL {
 	if p := aclPtr.Load(); p != nil {
 		return p
@@ -570,8 +459,25 @@ func currentACL() *compiledACL {
 	return &compiledACL{exactBan: map[string]struct{}{}}
 }
 
-// isBannedIP 判断 IP 是否命中黑名单：先查精确匹配表，再逐个比对 CIDR 段。
-// 精确表是 map 查找，绝大多数请求只走这一步。
+func pageParams(r *http.Request, defLimit int) (int, int) {
+	limit := defLimit
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	offset := 0
+	if s := r.URL.Query().Get("offset"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	return limit, offset
+}
+
 func isBannedIP(ipStr string, clientIP net.IP) bool {
 	a := currentACL()
 	if _, ok := a.exactBan[ipStr]; ok {
@@ -588,8 +494,29 @@ func isBannedIP(ipStr string, clientIP net.IP) bool {
 	return false
 }
 
-// uaAllowed 判断 UA 是否命中白名单关键字（子串、忽略大小写）。
-// 白名单为空表示不限制，直接放行。
+func uaWhitelistKeyword(ua string) string {
+	for _, u := range currentCfg().AllowedUAs {
+		k := strings.TrimSpace(u)
+		if k == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(ua), strings.ToLower(k)) {
+			return k
+		}
+	}
+	return ""
+}
+
+func uaClassOfEx(ua string) string {
+	cls := uaClassOf(ua)
+	if cls == "其他" || cls == "未知" {
+		if k := uaWhitelistKeyword(ua); k != "" {
+			return k
+		}
+	}
+	return cls
+}
+
 func uaAllowed(ua string) bool {
 	a := currentACL()
 	if len(a.uaNeedles) == 0 {
@@ -604,12 +531,8 @@ func uaAllowed(ua string) bool {
 	return false
 }
 
-// currentPort 返回当前实际监听端口（受 listenMu 保护，保存配置后可能热切换）。
 func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPort }
 
-// startListen 在指定端口启动监听并把连接交给 srv 处理，用于端口热切换。
-// 新旧监听的替换是「先起新的、再关旧的」：新端口监听失败时直接返回错误，
-// 旧监听保持不动，配置回滚也不会把服务弄断。
 func startListen(srv *http.Server, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -631,8 +554,6 @@ func startListen(srv *http.Server, port int) error {
 	return nil
 }
 
-// loadConfig 从 bolt 的 config bucket 读取配置到内存，并重建 ACL。
-// 库里没有配置时使用默认值，随后由调用方决定是否落盘。
 func loadConfig() {
 	c := &Config{}
 	if db != nil {
@@ -650,8 +571,6 @@ func loadConfig() {
 	rebuildACL(c)
 }
 
-// saveConfig 把配置写入 bolt 并同步刷新内存快照与编译后的 ACL。
-// 写库失败时直接返回错误，不更新内存——避免出现「界面显示已保存、重启后丢失」。
 func saveConfig(c *Config) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -670,8 +589,6 @@ func saveConfig(c *Config) error {
 	return err
 }
 
-// normalizeHost 去掉端口与首尾空白，得到小写主机名，用于白名单比较。
-// IPv6 方括号形式会先去掉方括号。
 func normalizeHost(hostport string) string {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
@@ -682,8 +599,6 @@ func normalizeHost(hostport string) string {
 
 var multiSuffix = map[string]bool{"co.uk": true, "org.uk": true, "me.uk": true, "ac.uk": true, "gov.uk": true, "ltd.uk": true, "plc.uk": true, "net.uk": true, "sch.uk": true, "com.cn": true, "net.cn": true, "org.cn": true, "gov.cn": true, "edu.cn": true, "ac.cn": true, "com.tw": true, "org.tw": true, "net.tw": true, "idv.tw": true, "com.hk": true, "org.hk": true, "net.hk": true, "edu.hk": true, "gov.hk": true, "co.jp": true, "or.jp": true, "ne.jp": true, "ac.jp": true, "go.jp": true, "co.kr": true, "or.kr": true, "com.au": true, "net.au": true, "org.au": true, "com.br": true, "com.sg": true, "com.my": true, "co.in": true, "com.tr": true, "com.ru": true, "com.mx": true, "com.ar": true, "co.nz": true, "co.za": true, "com.ua": true, "com.pl": true, "co.id": true, "com.sa": true, "com.eg": true}
 
-// rootDomain 返回主域名（末两段），用于白名单的根域匹配。
-// 例：a.b.example.com → example.com，使子域自动获得授权。
 func rootDomain(hostport string) string {
 	host := normalizeHost(hostport)
 	if net.ParseIP(host) != nil {
@@ -701,7 +616,6 @@ func rootDomain(hostport string) string {
 	return strings.Join(parts[n-2:], ".")
 }
 
-// whitelistMatch 空列表表示不限制；支持完整 host、根域、以及 *.example.com 通配。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
@@ -710,7 +624,6 @@ func whitelistMatch(list []string, targetHost string) bool {
 	targetRoot := rootDomain(target)
 	for _, w := range list {
 		w = strings.TrimSpace(w)
-		// 允许行内注释
 		if i := strings.IndexAny(w, "#;"); i >= 0 {
 			w = strings.TrimSpace(w[:i])
 		}
@@ -744,31 +657,39 @@ type BlockEvent struct {
 	UA         string `json:"ua"`
 }
 
-// DayStat：按天统计（UpBytes=本机→客户端，DownBytes=上游→本机，Bytes=上下行合计）
 type DayStat struct {
-	Requests      int64            `json:"requests"`   // 请求次数
-	Bytes         int64            `json:"bytes"`      // 上下行合计（兼容旧字段）
-	UpBytes       int64            `json:"up_bytes"`   // 上行（本机→客户端）
-	DownBytes     int64            `json:"down_bytes"` // 下行（上游→本机）
+	Requests      int64            `json:"requests"`
+	Bytes         int64            `json:"bytes"`
+	UpBytes       int64            `json:"up_bytes"`
+	DownBytes     int64            `json:"down_bytes"`
 	BlockedCN     int64            `json:"blocked_cn"`
 	BlockedWL     int64            `json:"blocked_wl"`
 	BlockedBan    int64            `json:"blocked_ban"`
-	BlockedRate   int64            `json:"blocked_rate"`
 	BlockedUA     int64            `json:"blocked_ua"`
-	Countries     map[string]int64 `json:"countries,omitempty"`       // 国家码 → 请求次数
-	IPs           map[string]int64 `json:"ips,omitempty"`             // IP → 请求次数（注意：不是流量，流量见下面三张表）
-	IPBytes       map[string]int64 `json:"ip_bytes,omitempty"`        // IP → 上下行合计字节
-	IPUpBytes     map[string]int64 `json:"ip_up_bytes,omitempty"`     // IP → 上行字节（本机 → 客户端）
-	IPDownBytes   map[string]int64 `json:"ip_down_bytes,omitempty"`   // IP → 下行字节（上游 → 本机）
-	Hours         map[string]int64 `json:"hours,omitempty"`           // 小时 HH → 请求次数
-	HourBytes     map[string]int64 `json:"hour_bytes,omitempty"`      // 小时 HH → 合计字节
-	HourUpBytes   map[string]int64 `json:"hour_up_bytes,omitempty"`   // 小时 HH → 上行字节
-	HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"` // 小时 HH → 下行字节
-	Hosts         map[string]int64 `json:"hosts,omitempty"`           // 上游域名 → 请求次数
+	Countries     map[string]int64 `json:"countries,omitempty"`
+	IPs           map[string]int64 `json:"ips,omitempty"`
+	IPBytes       map[string]int64 `json:"ip_bytes,omitempty"`
+	IPUpBytes     map[string]int64 `json:"ip_up_bytes,omitempty"`
+	IPDownBytes   map[string]int64 `json:"ip_down_bytes,omitempty"`
+	Hours         map[string]int64 `json:"hours,omitempty"`
+	HourBytes     map[string]int64 `json:"hour_bytes,omitempty"`
+	HourUpBytes   map[string]int64 `json:"hour_up_bytes,omitempty"`
+	HourDownBytes map[string]int64 `json:"hour_down_bytes,omitempty"`
+	Hosts         map[string]int64 `json:"hosts,omitempty"`
+	UAClass       map[string]int64 `json:"ua_class,omitempty"`
+	UARaw         map[string]int64 `json:"ua_raw,omitempty"`
 }
 
-// newDayStat 创建一天的统计对象，并初始化全部明细 map。
-// map 必须在这里就建好：后续累加走的是直接索引赋值，nil map 会 panic。
+const uaRawCap = 100
+
+func uaRawKey(ua string) string {
+	k := strings.Join(strings.Fields(ua), " ")
+	if len(k) > 96 {
+		k = k[:96]
+	}
+	return k
+}
+
 func newDayStat() *DayStat {
 	return &DayStat{
 		Countries:     map[string]int64{},
@@ -781,12 +702,11 @@ func newDayStat() *DayStat {
 		HourUpBytes:   map[string]int64{},
 		HourDownBytes: map[string]int64{},
 		Hosts:         map[string]int64{},
+		UAClass:       map[string]int64{},
+		UARaw:         map[string]int64{},
 	}
 }
 
-// ensureDayMaps 补齐某天的明细 map。
-// 从旧版本数据库反序列化出来的 DayStat 可能缺少后加的字段，遍历前必须先补，
-// 否则读取路径上会 panic（写路径则静默失败）。
 func ensureDayMaps(d *DayStat) {
 	if d.Countries == nil {
 		d.Countries = map[string]int64{}
@@ -818,23 +738,21 @@ func ensureDayMaps(d *DayStat) {
 	if d.Hosts == nil {
 		d.Hosts = map[string]int64{}
 	}
+	if d.UAClass == nil {
+		d.UAClass = map[string]int64{}
+	}
+	if d.UARaw == nil {
+		d.UARaw = map[string]int64{}
+	}
 }
 
-// copyInt64Map 复制一份 int64 map。统计 map 在锁外被遍历前必须先拷贝，
-// 否则会与统计 worker 的写入并发冲突。空 map 返回 nil，便于 JSON omitempty。
 func copyInt64Map(src map[string]int64) map[string]int64 {
 	if len(src) == 0 {
 		return nil
 	}
-	out := make(map[string]int64, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
-	return out
+	return cloneInt64Map(src)
 }
 
-// hour24 把分时 map 规整成固定 24 个键（00~23），缺值为 0。
-// 前端按 0~23 点直接取键作图，缺键会导致整条曲线退化为全 0 直线。
 func hour24(src map[string]int64) map[string]int64 {
 	out := make(map[string]int64, 24)
 	for h := 0; h < 24; h++ {
@@ -844,7 +762,6 @@ func hour24(src map[string]int64) map[string]int64 {
 	return out
 }
 
-// dayOf 需在持有 statsMu 时调用。
 func dayOf(date string) *DayStat {
 	if stats.Daily == nil {
 		stats.Daily = map[string]*DayStat{}
@@ -858,37 +775,32 @@ func dayOf(date string) *DayStat {
 	return d
 }
 
-// ---------- 访问统计 ----------
-// 写入：recordRequestStart → statChan → startStatsWorker 单协程聚合
-// 落盘：startStatsSaver 每 5 分钟 prune + 写入 stats_meta / stats_daily / stats_blocks
 type Stats struct {
-	SchemaVersion    int                 `json:"schema_version"`    // 2 = 上下行新口径（下行=上游→本机，上行=本机→客户端）
-	TodayDate        string              `json:"today_date"`        // 今日日期（北京时间），与 Today* 配套，跨天时整体重置
-	TodayRequests    int64               `json:"today_requests"`    // 今日累计请求数
-	TodayBytes       int64               `json:"today_bytes"`       // 今日累计流量（上下行合计）
-	TodayUpBytes     int64               `json:"today_up_bytes"`    // 今日上行字节
-	TodayDownBytes   int64               `json:"today_down_bytes"`  // 今日下行字节
-	TotalRequests    int64               `json:"total_requests"`    // 历史累计请求数
-	TotalBytes       int64               `json:"total_bytes"`       // 历史累计流量（上下行合计）
-	TotalUpBytes     int64               `json:"total_up_bytes"`    // 历史上行字节
-	TotalDownBytes   int64               `json:"total_down_bytes"`  // 历史下行字节
-	BlockedCN        int64               `json:"blocked_cn"`        // 拦截：非中国大陆 IP
-	BlockedWhitelist int64               `json:"blocked_whitelist"` // 拦截：上游域名不在白名单
-	BlockedBan       int64               `json:"blocked_ban"`       // 拦截：命中 IP 黑名单
-	BlockedRate      int64               `json:"blocked_rate"`      // 拦截：触发限流
-	BlockedUA        int64               `json:"blocked_ua"`        // 拦截：UA 不在白名单
-	LastProxyAt      string              `json:"last_proxy_at"`     // 最近一次成功反代的时间
-	CountryCounts    map[string]int64    `json:"country_counts"`    // 全局聚合：国家码 → 请求次数（由 Daily 汇总，Top1000）
-	IPCounts         map[string]int64    `json:"ip_counts"`         // 全局聚合：IP → 请求次数（Top1000）
-	IPBytes          map[string]int64    `json:"ip_bytes"`          // 全局聚合：IP → 合计字节（Top1000）
-	IPUpBytes        map[string]int64    `json:"ip_up_bytes"`       // 全局聚合：IP → 上行字节（Top1000）
-	IPDownBytes      map[string]int64    `json:"ip_down_bytes"`     // 全局聚合：IP → 下行字节（Top1000）
-	Daily            map[string]*DayStat `json:"daily,omitempty"`   // 按日期分桶的明细，是对外统计与上报的唯一真相来源
-	Blocks           []BlockEvent        `json:"blocks"`            // 最近的拦截事件（环形截断，仅保留最近若干条）
-	Audit            []AuditEvent        `json:"audit,omitempty"`   // 最近的管理操作审计事件
+	SchemaVersion    int                 `json:"schema_version"`
+	TodayDate        string              `json:"today_date"`
+	TodayRequests    int64               `json:"today_requests"`
+	TodayBytes       int64               `json:"today_bytes"`
+	TodayUpBytes     int64               `json:"today_up_bytes"`
+	TodayDownBytes   int64               `json:"today_down_bytes"`
+	TotalRequests    int64               `json:"total_requests"`
+	TotalBytes       int64               `json:"total_bytes"`
+	TotalUpBytes     int64               `json:"total_up_bytes"`
+	TotalDownBytes   int64               `json:"total_down_bytes"`
+	BlockedCN        int64               `json:"blocked_cn"`
+	BlockedWhitelist int64               `json:"blocked_whitelist"`
+	BlockedBan       int64               `json:"blocked_ban"`
+	BlockedUA        int64               `json:"blocked_ua"`
+	LastProxyAt      string              `json:"last_proxy_at"`
+	CountryCounts    map[string]int64    `json:"country_counts"`
+	IPCounts         map[string]int64    `json:"ip_counts"`
+	IPBytes          map[string]int64    `json:"ip_bytes"`
+	IPUpBytes        map[string]int64    `json:"ip_up_bytes"`
+	IPDownBytes      map[string]int64    `json:"ip_down_bytes"`
+	Daily            map[string]*DayStat `json:"daily,omitempty"`
+	Blocks           []BlockEvent        `json:"blocks"`
+	Audit            []AuditEvent        `json:"audit,omitempty"`
 }
 
-// AuditEvent 管理操作审计
 type AuditEvent struct {
 	Time   string `json:"time"`
 	IP     string `json:"ip"`
@@ -905,6 +817,8 @@ type statEvent struct {
 	IP        string
 	Country   string
 	Host      string
+	UAClass   string
+	UARaw     string
 	Bytes     int64
 	UpBytes   int64
 	DownBytes int64
@@ -913,23 +827,16 @@ type statEvent struct {
 
 var statChan = make(chan statEvent, 10000)
 
-// ---------- 实时监控（仅在有 WS 客户端时收集，退出即清空，不落盘） ----------
 var concurrent atomic.Int64
 var liveClients atomic.Int32
 
-// ---------- 端口级流量计数 ----------
-// /proc/net/dev 只能按网卡统计，同一网卡上其他进程的流量无法剔除，
-// 导致后台显示的“流量”远大于本服务实际转发量。
-// 改为在转发链路上自行计数：只有真正经过本服务的字节才计入，
-// 与整机网卡、其他进程彻底无关，跨平台且零依赖。
 type portTraffic struct {
-	down atomic.Int64 // 上游→本机（下行，从源站读到的字节）
-	up   atomic.Int64 // 本机→客户端（上行）
+	down atomic.Int64
+	up   atomic.Int64
 }
 
 var traffic portTraffic
 
-// reqBytes 单次请求的上下行字节计数（通过 context 传递）
 type reqBytes struct {
 	up   atomic.Int64
 	down atomic.Int64
@@ -938,28 +845,22 @@ type reqBytes struct {
 
 type reqBytesKey struct{}
 
-// withReqBytes 把本次请求的字节计数器挂到 context 上。
-// 反代的 ModifyResponse 拿不到外层 handler 的局部变量，只能通过 context 传递。
 func withReqBytes(ctx context.Context, rb *reqBytes) context.Context {
 	return context.WithValue(ctx, reqBytesKey{}, rb)
 }
 
-// reqBytesFrom 从 context 取回字节计数器；不存在时返回 nil，调用方需容忍。
 func reqBytesFrom(ctx context.Context) *reqBytes {
 	rb, _ := ctx.Value(reqBytesKey{}).(*reqBytes)
 	return rb
 }
 
-// ipLiveRate 实时网速：按 IP 累计近期字节，采样时计算速率后清零
 type ipLiveRate struct {
 	up   atomic.Int64
 	down atomic.Int64
 }
 
-var ipLiveRates sync.Map // ip -> *ipLiveRate
+var ipLiveRates sync.Map
 
-// addIPLive 把本次收发字节累加到该 IP 的实时速率桶。
-// 只做累加，清零与速率换算由采样器负责——这样采样周期与请求频率解耦。
 func addIPLive(ip string, up, down int64) {
 	if ip == "" || (up == 0 && down == 0) {
 		return
@@ -974,7 +875,6 @@ func addIPLive(ip string, up, down int64) {
 	}
 }
 
-// snapshotIPRates 取出并清零各 IP 的近期字节，返回 map[ip]{up,down}（调用方按时间差算速率）
 func snapshotIPRates() map[string][2]int64 {
 	out := make(map[string][2]int64)
 	ipLiveRates.Range(func(k, v any) bool {
@@ -988,15 +888,11 @@ func snapshotIPRates() map[string][2]int64 {
 	return out
 }
 
-// countingReader 包装响应体，读取时累计下行字节。
-// 反代是边读边写的同步拷贝，读多少基本等于写给客户端多少。
 type countingReader struct {
 	r  io.Reader
 	rb *reqBytes
 }
 
-// Read 包装上游响应体的读取，顺带累计下行字节。
-// 反代是边读边写的同步拷贝，读到的量基本等于写给客户端的量。
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
@@ -1009,13 +905,11 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// countingWriter 包装 ResponseWriter，写出时累计上行字节。
 type countingWriter struct {
 	http.ResponseWriter
 	rb *reqBytes
 }
 
-// Write 包装响应写出，顺带累计上行字节。
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.ResponseWriter.Write(p)
 	if n > 0 {
@@ -1028,20 +922,14 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Flush 透传，保证 FlushInterval 逻辑与 SSE 场景不被包装破坏
 func (c *countingWriter) Flush() {
 	if f, ok := c.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
-// netSpeedWake 用于唤醒空闲期长睡的采样器：
-// 有人打开实时监控时立刻投递信号，采样器不必等长睡结束就能马上采集一次，
-// 避免“刚进页面要等几分钟才出数”。带缓冲 1，重复投递不会阻塞。
 var netSpeedWake = make(chan struct{}, 1)
 
-// wakeNetSpeedSampler 唤醒长睡中的采样器。
-// 采样器空闲时会拉长间隔省 CPU，后台打开实时监控时投递一次信号即可立即出数。
 func wakeNetSpeedSampler() {
 	select {
 	case netSpeedWake <- struct{}{}:
@@ -1069,11 +957,9 @@ var (
 	liveSeq  atomic.Int64
 )
 
-// pushLiveEvent 把一条请求事件写入实时环形缓冲，并更新当秒 RPS 计数。
-// 无人观看（liveClients 为 0）时直接返回，避免无谓的开销。
 func pushLiveEvent(ip, country, host, path string) {
 	if liveClients.Load() == 0 {
-		return // 无人观看时不收集
+		return
 	}
 	now := time.Now()
 	sec := now.Unix()
@@ -1101,7 +987,6 @@ func pushLiveEvent(ip, country, host, path string) {
 	liveMu.Unlock()
 }
 
-// clearLive 清空实时事件缓冲与 RPS 计数，用于后台「清空」操作。
 func clearLive() {
 	liveMu.Lock()
 	liveBuf = nil
@@ -1110,8 +995,6 @@ func clearLive() {
 	rpsCount.Store(0)
 }
 
-// snapshotLive 取一份实时事件快照（按时间正序，最新在后），并附带当前并发与 RPS。
-// 环形缓冲写满后会覆盖最旧的事件，拷贝时需按 head 位置分两段拼接。
 func snapshotLive() (events []liveEvent, conc int64, rps int64) {
 	liveMu.Lock()
 	n := len(liveBuf)
@@ -1139,16 +1022,11 @@ var (
 	curNetSpeed netSpeed
 )
 
-// 说明：不再保留 readNetBytes（/proc/net/dev 整机网卡统计）。
-// 该口径会把同机其他进程的流量一并计入，与“本服务转发量”严重不符，
-// 现统一改用 traffic 计数器（见 portTraffic）在转发链路上精确累计。
-
 func startNetSpeedSampler() {
 	go func() {
 		var lastRx, lastTx int64
 		var lastT time.Time
 		for {
-			// 只统计经过本服务的端口流量，不再读整机网卡
 			rx, tx := traffic.down.Load(), traffic.up.Load()
 			now := time.Now()
 			if !lastT.IsZero() {
@@ -1162,11 +1040,6 @@ func startNetSpeedSampler() {
 					if dTx < 0 {
 						dTx = 0
 					}
-					// 仅在有实时客户端时才更新“瞬时速率”。
-					// 空闲期采样间隔长达 5 分钟，若也写入，页面上会显示一个
-					// 跨 5 分钟的平均值，与真实瞬时网速完全对不上。
-					// 另外要求 dt <= 10s：刚从长睡被唤醒时 dt 可能是几分钟，
-					// 这一次算出来的是长周期均值，跳过不写，等下一秒的 1 秒窗口。
 					if liveClients.Load() > 0 && dt <= 10 {
 						rxBps := int64(float64(dRx) / dt)
 						txBps := int64(float64(dTx) / dt)
@@ -1174,14 +1047,10 @@ func startNetSpeedSampler() {
 						curNetSpeed = netSpeed{RxBps: rxBps, TxBps: txBps}
 						netSpeedMu.Unlock()
 					}
-					// 流量累计已改为请求结束时按 IP 精确上报，这里不再重复上报全局增量。
-					// 全局计数器仅用于实时速率计算。
 				}
 			}
 			lastRx, lastTx, lastT = rx, tx, now
 
-			// 有人看实时监控：1 秒一次，保证数字实时跳动。
-			// 无人观看：5 分钟一次，省电省 IO，流量累计不丢（只是粒度变粗）。
 			var nap time.Duration
 			if liveClients.Load() > 0 {
 				nap = time.Second
@@ -1192,7 +1061,6 @@ func startNetSpeedSampler() {
 				time.Sleep(nap)
 				continue
 			}
-			// 长睡期间可被“有人打开监控”唤醒，醒来后立即补测一次
 			timer := time.NewTimer(nap)
 			select {
 			case <-timer.C:
@@ -1203,16 +1071,12 @@ func startNetSpeedSampler() {
 	}()
 }
 
-// getNetSpeed 返回最近一次采样得到的整机网速快照（读锁保护）。
 func getNetSpeed() netSpeed {
 	netSpeedMu.RLock()
 	defer netSpeedMu.RUnlock()
 	return curNetSpeed
 }
 
-// ---------- 测速链接 ----------
-// 后台生成一次性/限次测速链接：/speed/<token>，下载 N 次后自动失效。
-// 令牌仅存内存（重启清空，属临时性质，无需落盘）。
 type speedToken struct {
 	Token   string
 	MaxUses int
@@ -1220,22 +1084,18 @@ type speedToken struct {
 	Created string
 }
 
-var speedTokens sync.Map // token -> *speedToken
+var speedTokens sync.Map
 
-// 测速链接有效期：创建 7 天后自动过期（惰性校验 + 定时清理）
 const speedTokenValidity = 7 * 24 * time.Hour
 
-// speedTokenExpired 判断测速链接是否已超过有效期。
-// 创建时间解析失败时按未过期处理，兼容历史数据。
 func speedTokenExpired(st *speedToken) bool {
 	t, err := time.Parse(time.RFC3339, st.Created)
 	if err != nil {
-		return false // 老数据解析失败则不过期，保持兼容
+		return false
 	}
 	return time.Since(t) > speedTokenValidity
 }
 
-// startSpeedTokenCleaner 每小时清理一次已过期 7 天的测速链接
 func startSpeedTokenCleaner() {
 	go func() {
 		for {
@@ -1255,9 +1115,6 @@ func startSpeedTokenCleaner() {
 	}()
 }
 
-// ---------- 测速链接持久化（bolt 落盘，重启不丢失） ----------
-
-// saveSpeedTokens 全量保存当前链接到 bolt（链接数量少，全量写开销可忽略）
 func saveSpeedTokens() {
 	type tokRec struct {
 		Token   string `json:"token"`
@@ -1281,7 +1138,6 @@ func saveSpeedTokens() {
 	})
 }
 
-// loadSpeedTokens 启动时从 bolt 恢复链接（含已用次数）
 func loadSpeedTokens() {
 	_ = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("speed_tokens"))
@@ -1310,7 +1166,6 @@ func loadSpeedTokens() {
 	})
 }
 
-// ---------- 测速结果历史（bolt 落盘，最多保留 100 条） ----------
 type speedResult struct {
 	Time     string  `json:"time"`
 	Token    string  `json:"token"`
@@ -1328,7 +1183,6 @@ var (
 
 const maxSpeedResults = 100
 
-// loadSpeedResults 从 bolt 载入历史测速结果（启动时调用一次）。
 func loadSpeedResults() {
 	speedResults = nil
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -1346,8 +1200,6 @@ func loadSpeedResults() {
 	})
 }
 
-// appendSpeedResult 追加一条测速结果并按上限裁剪，随后整体写盘。
-// 先拷贝快照再放锁写盘：写 bolt 比内存追加慢得多，不应占着锁影响测速请求。
 func appendSpeedResult(r speedResult) {
 	speedResultsMu.Lock()
 	speedResults = append(speedResults, r)
@@ -1367,35 +1219,24 @@ func appendSpeedResult(r speedResult) {
 	})
 }
 
-// ---------- 每小时数据上报（POST JSON + Bearer，失败本地排队重试） ----------
-//
-// 口径：每批 = 上一个统计周期的增量（当前累计 - 上次快照），
-// 服务器端自行按小时累加汇总。快照持久化到 bolt，重启不丢、不重不漏。
-
-// reportSnap 上次上报时的日累计快照（含三张明细 map，用于差分出周期增量）
 type reportSnap struct {
 	Date        string           `json:"date"`
-	At          string           `json:"at"` // 快照时间 RFC3339
+	At          string           `json:"at"`
 	Requests    int64            `json:"requests"`
 	Up          int64            `json:"up"`
 	Down        int64            `json:"down"`
 	BlockedCN   int64            `json:"blocked_cn"`
 	BlockedWL   int64            `json:"blocked_wl"`
 	BlockedBan  int64            `json:"blocked_ban"`
-	BlockedRate int64            `json:"blocked_rate"`
 	BlockedUA   int64            `json:"blocked_ua"`
 	Hosts       map[string]int64 `json:"hosts,omitempty"`
 	IPs         map[string]int64 `json:"ips,omitempty"`
 	Countries   map[string]int64 `json:"countries,omitempty"`
-	// 按 IP 的流量明细（用于上报每 IP 上下行增量）
 	IPBytes     map[string]int64 `json:"ip_bytes,omitempty"`
 	IPUpBytes   map[string]int64 `json:"ip_up_bytes,omitempty"`
 	IPDownBytes map[string]int64 `json:"ip_down_bytes,omitempty"`
 }
 
-// satSub 计算 a-b 并饱和到 0。统计值理论上单调递增，
-// 但快照被清空、跨天重置或进程重启都可能让当前值小于基准值，
-// 此时增量应视为 0 而不是负数。
 func satSub(a, b int64) int64 {
 	if a > b {
 		return a - b
@@ -1403,7 +1244,6 @@ func satSub(a, b int64) int64 {
 	return 0
 }
 
-// mapDelta 计算累计 map 的周期增量（cur-prev，负值与零值丢弃）
 func mapDelta(cur, prev map[string]int64) map[string]int64 {
 	out := make(map[string]int64, len(cur))
 	for k, v := range cur {
@@ -1414,49 +1254,39 @@ func mapDelta(cur, prev map[string]int64) map[string]int64 {
 	return out
 }
 
-// reportPayload 上报体：单个统计周期的增量
 type reportPayload struct {
-	BatchID     string `json:"batch_id"`
-	NodeKey     string `json:"node_key"`
-	Node        string `json:"node"`
-	Note        string `json:"note"`
-	Version     string `json:"version"`
-	PeriodStart string `json:"period_start"`
-	PeriodEnd   string `json:"period_end"`
-	PeriodDate  string `json:"period_date"`
-	PeriodHour  string `json:"period_hour"`
-	ReportedAt  string `json:"reported_at"`
-	Requests    int64  `json:"requests"`
-	UpBytes     int64  `json:"up_bytes"`
-	DownBytes   int64  `json:"down_bytes"`
-	Blocked     int64  `json:"blocked"`
-	BlockedCN   int64  `json:"blocked_cn"`
-	BlockedBan  int64  `json:"blocked_ban"`
-	BlockedRate int64  `json:"blocked_rate"`
-	BlockedUA   int64  `json:"blocked_ua"`
-	BlockedWL   int64  `json:"blocked_whitelist"`
-	// 明细 map 一律不加 omitempty：本周期没有数据时下发 {}，
-	// 让接收端能区分「这个周期确实没流量」和「服务端根本没实现该字段」。
-	Hosts      map[string]int64 `json:"hosts"`
-	IPs        map[string]int64 `json:"ips"`         // 每 IP 请求次数（历史字段，含义不变）
-	IPRequests map[string]int64 `json:"ip_requests"` // 与 ips 同值：语义化命名，避免被当成流量
-	Countries  map[string]int64 `json:"countries"`
-	// 按 IP 的流量增量（Top100，按「上行+下行」总量裁剪；三张表 key 集合严格一致）
+	BatchID     string           `json:"batch_id"`
+	NodeKey     string           `json:"node_key"`
+	Node        string           `json:"node"`
+	Note        string           `json:"note"`
+	Version     string           `json:"version"`
+	PeriodStart string           `json:"period_start"`
+	PeriodEnd   string           `json:"period_end"`
+	PeriodDate  string           `json:"period_date"`
+	PeriodHour  string           `json:"period_hour"`
+	ReportedAt  string           `json:"reported_at"`
+	Requests    int64            `json:"requests"`
+	UpBytes     int64            `json:"up_bytes"`
+	DownBytes   int64            `json:"down_bytes"`
+	Blocked     int64            `json:"blocked"`
+	BlockedCN   int64            `json:"blocked_cn"`
+	BlockedBan  int64            `json:"blocked_ban"`
+	BlockedUA   int64            `json:"blocked_ua"`
+	BlockedWL   int64            `json:"blocked_whitelist"`
+	Hosts       map[string]int64 `json:"hosts"`
+	IPs         map[string]int64 `json:"ips"`
+	IPRequests  map[string]int64 `json:"ip_requests"`
+	Countries   map[string]int64 `json:"countries"`
 	IPBytes     map[string]int64 `json:"ip_bytes"`
 	IPUpBytes   map[string]int64 `json:"ip_up_bytes"`
 	IPDownBytes map[string]int64 `json:"ip_down_bytes"`
-	// 自证字段：便于接收端与后台对账，排查「有请求无流量」这类缺口。
-	IPStatsOK   bool  `json:"ip_stats_ok"`   // 本批次是否含按 IP 流量数据
-	StatDropped int64 `json:"stats_dropped"` // 进程内统计通道累计丢弃条数（持续增长说明采集有缺口）
-	QueueDepth  int   `json:"queue_depth"`
+	IPStatsOK   bool             `json:"ip_stats_ok"`
+	StatDropped int64            `json:"stats_dropped"`
+	QueueDepth  int              `json:"queue_depth"`
 }
 
 var reportQueueMu sync.Mutex
 
-// buildCurrentSnap 生成当前日累计快照（含三张明细 map）。
-// 注意：必须在 statsMu 内完成 map 拷贝——原实现只把 Stats 结构体浅拷贝出锁，
-// 之后在锁外遍历 Daily/IPs 等 map，会与统计 worker 的并发写撞车
-// （Go runtime 直接抛 "concurrent map read and map write" 终止进程）。
 func buildCurrentSnap() reportSnap {
 	now := nowBeijing()
 	date := beijingDate(now)
@@ -1466,13 +1296,11 @@ func buildCurrentSnap() reportSnap {
 	if d := stats.Daily[date]; d != nil {
 		sn.Requests, sn.Up, sn.Down = d.Requests, d.UpBytes, d.DownBytes
 		sn.BlockedCN, sn.BlockedWL, sn.BlockedBan = d.BlockedCN, d.BlockedWL, d.BlockedBan
-		sn.BlockedRate, sn.BlockedUA = d.BlockedRate, d.BlockedUA
-		// map 为值引用，必须在锁内整体拷贝
+		sn.BlockedUA = d.BlockedUA
 		ensureDayMaps(d)
 		sn.Hosts = copyInt64Map(d.Hosts)
 		sn.IPs = copyInt64Map(d.IPs)
 		sn.Countries = copyInt64Map(d.Countries)
-		// 按 IP 流量明细
 		sn.IPBytes = copyInt64Map(d.IPBytes)
 		sn.IPUpBytes = copyInt64Map(d.IPUpBytes)
 		sn.IPDownBytes = copyInt64Map(d.IPDownBytes)
@@ -1480,7 +1308,6 @@ func buildCurrentSnap() reportSnap {
 	return sn
 }
 
-// loadReportSnaps / saveReportSnaps 整点快照链（bolt 持久化，保留最近 3 份）
 func loadReportSnaps() []reportSnap {
 	var list []reportSnap
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -1494,8 +1321,6 @@ func loadReportSnaps() []reportSnap {
 	return list
 }
 
-// saveReportSnaps 保存整份快照列表（与补传队列共用 report_queue bucket，键为 snaps）。
-// 快照是「上次上报时的日累计值」，据此做差分才能得到每个周期的增量。
 func saveReportSnaps(list []reportSnap) {
 	raw, _ := json.Marshal(list)
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -1507,8 +1332,6 @@ func saveReportSnaps(list []reportSnap) {
 	})
 }
 
-// startHourlySnapshotWorker 每个整点过 2 秒保存一份日累计快照。
-// 相邻两份快照的差分 = 恰好上一个完整自然小时（如 3 点存的两份差出 2 点档）。
 func startHourlySnapshotWorker() {
 	go func() {
 		for {
@@ -1530,7 +1353,6 @@ func startHourlySnapshotWorker() {
 	}()
 }
 
-// payloadFromDelta 由两份快照差分构造上报体
 func payloadFromDelta(base, cur reportSnap) reportPayload {
 	p := reportPayload{
 		NodeKey:    getNodeKey(),
@@ -1548,28 +1370,19 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 	p.BlockedCN = satSub(cur.BlockedCN, base.BlockedCN)
 	p.BlockedWL = satSub(cur.BlockedWL, base.BlockedWL)
 	p.BlockedBan = satSub(cur.BlockedBan, base.BlockedBan)
-	p.BlockedRate = satSub(cur.BlockedRate, base.BlockedRate)
 	p.BlockedUA = satSub(cur.BlockedUA, base.BlockedUA)
-	p.Blocked = p.BlockedCN + p.BlockedWL + p.BlockedBan + p.BlockedRate + p.BlockedUA
-	// 三张明细的周期增量：hosts/ips 取请求量 Top100，国家转中文名
+	p.Blocked = p.BlockedCN + p.BlockedWL + p.BlockedBan + p.BlockedUA
 	p.Hosts = mapDelta(cur.Hosts, base.Hosts)
 	pruneTopN(p.Hosts, 100)
 	p.IPs = mapDelta(cur.IPs, base.IPs)
 	pruneTopN(p.IPs, 100)
-	p.IPRequests = p.IPs // 同一份数据，另给一个不会被误读成「流量」的字段名
+	p.IPRequests = p.IPs
 	ctryDelta := mapDelta(cur.Countries, base.Countries)
-	p.Countries = make(map[string]int64, len(ctryDelta)) // 空也下发 {}，不出现 null
+	p.Countries = make(map[string]int64, len(ctryDelta))
 	for code, v := range ctryDelta {
 		name := countryName(code)
 		p.Countries[name] += v
 	}
-	// 按 IP 的流量增量。
-	// 旧实现用 ip_down_bytes 当唯一白名单去删另外两张表：一旦下行增量为 0
-	// （窗口内没有媒体流、快照被清空、请求刚发起还没结束……），
-	// keepIPs 为空集，ip_up_bytes 与 ip_bytes 会被逐条删光，
-	// 最终表现为「有 ips 请求次数、三个流量字段一起消失」。
-	// 现在改为：三张表各自算增量 → 按「上行+下行」总量统一选 Top100 →
-	// 保留的 IP 在三张表里都补齐（缺的写 0），key 集合严格一致、不丢数据。
 	p.IPBytes = mapDelta(cur.IPBytes, base.IPBytes)
 	p.IPUpBytes = mapDelta(cur.IPUpBytes, base.IPUpBytes)
 	p.IPDownBytes = mapDelta(cur.IPDownBytes, base.IPDownBytes)
@@ -1585,9 +1398,6 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 	return p
 }
 
-// topIPsByTotal 从三张按 IP 的明细表中挑出「合计流量最大」的前 n 个 IP。
-// 排序口径优先用 up+down（真实吞吐），缺失时回落到 bytes 字段，
-// 这样只上传、只下载、或只有合计的 IP 都不会被误杀。
 func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} {
 	score := make(map[string]int64, len(total)+len(up)+len(down))
 	for ip := range total {
@@ -1626,25 +1436,17 @@ func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} 
 	return out
 }
 
-// alignIPStats 把按 IP 的明细裁剪到 keep 集合并补齐缺失键（值为 0）。
-// 补齐而不是删除，是为了让接收端能对同一 IP 直接对齐 bytes / up / down 三个字段。
 func alignIPStats(m map[string]int64, keep map[string]struct{}) map[string]int64 {
 	out := make(map[string]int64, len(keep))
 	for ip := range keep {
-		out[ip] = m[ip] // 不存在时取零值
+		out[ip] = m[ip]
 	}
 	return out
 }
 
-// lastFullHourReport 取最近两个整点快照的差分 = 上一个完整自然小时的增量。
-// 快照不足两份（刚安装的第一个小时）返回 ok=false。
-// 停机恢复后相邻快照间隔可能大于 1 小时，差分会把积压时段合并成一批补报。
 func lastFullHourReport() (reportPayload, bool) {
 	snaps := loadReportSnaps()
 	if len(snaps) < 2 {
-		// 兜底：快照不足时立刻补齐——补出的两份快照严格对齐「上一个完整自然小时」：
-		// 基准零值快照标为上上个整点（如 14:00），当前日累计快照标为上个整点（如 15:00），
-		// 差分即 14→15 点档。手动上传时无需等满一个小时，立即就能拿到可上报的数据。
 		now := nowBeijing()
 		lastFull := now.Truncate(time.Hour)
 		prevFull := lastFull.Add(-time.Hour)
@@ -1664,14 +1466,11 @@ func lastFullHourReport() (reportPayload, bool) {
 	return payloadFromDelta(snaps[len(snaps)-2], snaps[len(snaps)-1]), true
 }
 
-// parseRFC3339 解析 RFC3339 时间。解析失败返回零值时间，
-// 调用方应把零值视为「未知」而不是「1970 年」，避免分桶出现 08 点这类异常键。
 func parseRFC3339(s string) time.Time {
 	t, _ := time.Parse(time.RFC3339, s)
 	return t
 }
 
-// detectNodeName 节点标识：优先本机公网 IP，其次主机名
 func detectNodeName() string {
 	if ip, _ := selfPublicIP.Load().(string); ip != "" {
 		return ip
@@ -1682,10 +1481,8 @@ func detectNodeName() string {
 	return "unknown"
 }
 
-var nodeKeyCache atomic.Value // string
+var nodeKeyCache atomic.Value
 
-// getNodeKey 节点唯一 Key：首次调用自动生成（24 位随机串），存入 bolt 永久保留，
-// 重启/重装程序不变（除非删除数据库文件），用于接收端区分不同服务器
 func getNodeKey() string {
 	if v, _ := nodeKeyCache.Load().(string); v != "" {
 		return v
@@ -1713,46 +1510,36 @@ func getNodeKey() string {
 	return key
 }
 
-// ---------- 上报记录（每次投递的结果留痕，保留 30 天） ----------
-//
-// 与上报队列相互独立：队列管「还没送出去的数据」，记录管「送出去的每一次结果」。
-// 无论自动整点上报、手动立即上报还是失败补传，只要发生一次 HTTP 投递就写一条记录。
 type reportRecord struct {
-	ID         string `json:"id"`          // 记录 ID（时间戳-随机）
-	Time       string `json:"time"`        // 投递时间（北京时间 RFC3339）
-	BatchID    string `json:"batch_id"`    // 批次 ID
-	Trigger    string `json:"trigger"`     // auto=整点自动 manual=手动 retry=补传
-	OK         bool   `json:"ok"`          // 是否成功
-	StatusCode int    `json:"status_code"` // 接收端 HTTP 状态码，0=未拿到响应
-	Error      string `json:"error,omitempty"`
-	RespBody   string `json:"resp_body,omitempty"` // 接收端响应片段（最多 512 字节）
-	Attempts   int    `json:"attempts"`            // 该批第几次尝试
-	PeriodDate string `json:"period_date"`         // 数据周期归属日期
-	PeriodHour string `json:"period_hour"`         // 数据周期归属小时
-	Requests   int64  `json:"requests"`
-	UpBytes    int64  `json:"up_bytes"`
-	DownBytes  int64  `json:"down_bytes"`
-	Blocked    int64  `json:"blocked"`
-	URL        string `json:"url"`  // 投递时的接收地址
-	Note       string `json:"note"` // 服务器备注
-	IP         string `json:"ip"`   // 触发来源 IP（手动上报时有值）
-	DurationMS int64  `json:"duration_ms"`
-	Size       int    `json:"size"` // 请求体字节数
-	// 原始上报报文（完整 JSON 原文）单独存放在 report_payloads bucket，
-	// key = 记录 ID，这里只标记是否已保存。
-	// 不把原文塞进记录结构：3000 条记录每次 append 都要整体 marshal 落盘，
-	// 带上原文会让单次写盘膨胀到几十 MB。
-	PayloadSaved bool `json:"payload_saved"`
+	ID           string `json:"id"`
+	Time         string `json:"time"`
+	BatchID      string `json:"batch_id"`
+	Trigger      string `json:"trigger"`
+	OK           bool   `json:"ok"`
+	StatusCode   int    `json:"status_code"`
+	Error        string `json:"error,omitempty"`
+	RespBody     string `json:"resp_body,omitempty"`
+	Attempts     int    `json:"attempts"`
+	PeriodDate   string `json:"period_date"`
+	PeriodHour   string `json:"period_hour"`
+	Requests     int64  `json:"requests"`
+	UpBytes      int64  `json:"up_bytes"`
+	DownBytes    int64  `json:"down_bytes"`
+	Blocked      int64  `json:"blocked"`
+	URL          string `json:"url"`
+	Note         string `json:"note"`
+	IP           string `json:"ip"`
+	DurationMS   int64  `json:"duration_ms"`
+	Size         int    `json:"size"`
+	PayloadSaved bool   `json:"payload_saved"`
 }
 
 const (
-	reportRecordKeepDays = 30               // 记录保留天数
-	maxReportRecords     = 3000             // 条数硬上限，防止极端情况下无限增长
-	reportRecordBucket   = "report_records" // bolt bucket
+	reportRecordKeepDays = 30
+	maxReportRecords     = 3000
+	reportRecordBucket   = "report_records"
 	reportPayloadBucket  = "report_payloads"
-	// 单条原文上限。正常一小时的上报体在 5~30KB，512KB 足以容纳
-	// Top100 全满的极端情况，同时防止异常报文把库撑爆。
-	maxReportPayloadLen = 512 << 10
+	maxReportPayloadLen  = 512 << 10
 )
 
 var (
@@ -1760,7 +1547,6 @@ var (
 	reportRecordsMu sync.Mutex
 )
 
-// loadReportRecords 启动时载入并顺带做一次 30 天清理
 func loadReportRecords() {
 	reportRecordsMu.Lock()
 	defer reportRecordsMu.Unlock()
@@ -1778,11 +1564,9 @@ func loadReportRecords() {
 	if pruneReportRecordsLocked() {
 		persistReportRecordsLocked()
 	}
-	// 顺带清掉没有对应记录的孤儿报文（异常退出、历史裁剪残留）
 	gcReportPayloadsLocked()
 }
 
-// pruneReportRecordsLocked 删除超过保留期或超出条数上限的记录，返回是否有变更（调用方需持锁）
 func pruneReportRecordsLocked() bool {
 	cutoff := nowBeijing().AddDate(0, 0, -reportRecordKeepDays).Format(time.RFC3339)
 	out := reportRecords[:0]
@@ -1811,9 +1595,6 @@ func pruneReportRecordsLocked() bool {
 	return false
 }
 
-// ---------- 上报原文（原始请求体，原样保存，不做解析） ----------
-
-// saveReportPayload 保存一条记录的原始上报报文，key = 记录 ID
 func saveReportPayload(id string, payload []byte) {
 	if id == "" || len(payload) == 0 {
 		return
@@ -1827,7 +1608,6 @@ func saveReportPayload(id string, payload []byte) {
 	})
 }
 
-// loadReportPayload 按记录 ID 读取原始上报报文（原样返回，不解析）
 func loadReportPayload(id string) (string, bool) {
 	if id == "" {
 		return "", false
@@ -1844,7 +1624,6 @@ func loadReportPayload(id string) (string, bool) {
 	return string(out), out != nil
 }
 
-// deleteReportPayloads 批量删除报文（与记录清理同步，避免库无限膨胀）
 func deleteReportPayloads(ids []string) {
 	if len(ids) == 0 {
 		return
@@ -1861,7 +1640,6 @@ func deleteReportPayloads(ids []string) {
 	})
 }
 
-// clearReportPayloads 清空全部报文（后台「清空上报记录」时调用）
 func clearReportPayloads() {
 	_ = db.Update(func(tx *bolt.Tx) error {
 		if tx.Bucket([]byte(reportPayloadBucket)) != nil {
@@ -1871,7 +1649,6 @@ func clearReportPayloads() {
 	})
 }
 
-// gcReportPayloadsLocked 删除没有对应记录的孤儿报文（调用方需持锁）
 func gcReportPayloadsLocked() {
 	keep := make(map[string]struct{}, len(reportRecords))
 	for _, r := range reportRecords {
@@ -1895,8 +1672,6 @@ func gcReportPayloadsLocked() {
 	deleteReportPayloads(orphan)
 }
 
-// persistReportRecordsLocked 把上报记录整体写盘（调用方需持 reportRecordsMu）。
-// 记录条数有上限，单次序列化体积可控，因此采用整体覆盖而不是增量追加。
 func persistReportRecordsLocked() {
 	snap := make([]reportRecord, len(reportRecords))
 	copy(snap, reportRecords)
@@ -1910,8 +1685,6 @@ func persistReportRecordsLocked() {
 	})
 }
 
-// appendReportRecord 追加一条上报记录（写盘在锁内完成，失败不影响业务）。
-// payload 是本次实际投递的请求体，原样存入 report_payloads，不做任何解析。
 func appendReportRecord(rec reportRecord, payload []byte) {
 	if rec.Time == "" {
 		rec.Time = beijingRFC3339(nowBeijing())
@@ -1928,7 +1701,6 @@ func appendReportRecord(rec reportRecord, payload []byte) {
 	rec.PayloadSaved = len(payload) > 0
 	reportRecordsMu.Lock()
 	defer reportRecordsMu.Unlock()
-	// 先落原文再落记录：记录存在则原文必定在，异常退出最多留下可被 GC 的孤儿
 	if rec.PayloadSaved {
 		saveReportPayload(rec.ID, payload)
 	}
@@ -1937,8 +1709,6 @@ func appendReportRecord(rec reportRecord, payload []byte) {
 	persistReportRecordsLocked()
 }
 
-// startReportRecordCleaner 每小时清理一次过期记录。
-// 服务长时间运行时即便没有新记录，也能保证 30 天外的数据被删掉。
 func startReportRecordCleaner() {
 	go func() {
 		for {
@@ -1952,9 +1722,7 @@ func startReportRecordCleaner() {
 	}()
 }
 
-// ---------- 上报队列（bolt 持久化，重启后继续补传） ----------
-
-const maxReportQueue = 24 // 最多积压 24 批（约一天）
+const maxReportQueue = 24
 
 type queuedReport struct {
 	ID       string `json:"id"`
@@ -1964,8 +1732,6 @@ type queuedReport struct {
 	LastErr  string `json:"last_err,omitempty"`
 }
 
-// loadReportQueue 载入待补传队列。队列在投递失败时写入，成功补传后移除，
-// 保证接收端宕机期间的数据不丢、且补传顺序与产生顺序一致。
 func loadReportQueue() []queuedReport {
 	var list []queuedReport
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -1981,7 +1747,6 @@ func loadReportQueue() []queuedReport {
 	return list
 }
 
-// saveReportQueue 保存整个待补传队列。
 func saveReportQueue(list []queuedReport) {
 	raw, _ := json.Marshal(list)
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -1993,7 +1758,6 @@ func saveReportQueue(list []queuedReport) {
 	})
 }
 
-// sendOnceResp 单次 HTTP 投递；返回接收端状态码与响应片段（失败时可用于回显与留痕）
 func sendOnceResp(url, token string, body []byte) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -2020,7 +1784,6 @@ func sendOnceResp(url, token string, body []byte) (int, string, error) {
 
 var reportClient = &http.Client{Timeout: 25 * time.Second}
 
-// errString 把 error 转成字符串，nil 时返回空串，便于直接放进 JSON 字段。
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -2028,7 +1791,6 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// flushReportQueue 依序补传队列；遇到失败即停止（保证顺序）
 func flushReportQueue() {
 	c := cfgPtr.Load()
 	if c == nil || c.ReportURL == "" {
@@ -2063,7 +1825,6 @@ func flushReportQueue() {
 	saveReportQueue(keep)
 }
 
-// recordFromPayload 由上报体生成一条投递记录（字段缺失时留零值，不影响主流程）
 func recordFromPayload(payload []byte, batchID, trigger string, status int, respBody string, err error, attempts int, start time.Time, ip, targetURL string) reportRecord {
 	var p reportPayload
 	_ = json.Unmarshal(payload, &p)
@@ -2094,7 +1855,6 @@ func recordFromPayload(payload []byte, batchID, trigger string, status int, resp
 	return rec
 }
 
-// enqueueAndSend 取上一完整自然小时的增量：入队 → 投递
 func enqueueAndSend() {
 	c := cfgPtr.Load()
 	if c == nil || c.ReportURL == "" || !c.ReportOn {
@@ -2102,12 +1862,10 @@ func enqueueAndSend() {
 	}
 	p, ok := lastFullHourReport()
 	if !ok {
-		return // 快照不足（刚安装的第一个小时），下个整点起正常上报
+		return
 	}
 	raw, _ := json.Marshal(p)
 
-	// 入队后立刻投递本轮这一批（并把队列里此前积压的一并补传），
-	// 每一次实际投递都会写一条上报记录
 	reportQueueMu.Lock()
 	list := loadReportQueue()
 	list = append(list, queuedReport{ID: p.BatchID, Payload: raw, Created: p.ReportedAt})
@@ -2120,9 +1878,6 @@ func enqueueAndSend() {
 	flushReportQueue()
 }
 
-// startReportWorker 每个整点过 5 秒上报一次「上一个自然小时」的增量
-// （差分基于上次上报快照，整点触发使 period 边界对齐自然小时）；
-// 另有协程每 10 分钟补传失败数据
 func startReportWorker() {
 	go func() {
 		for {
@@ -2143,21 +1898,14 @@ func startReportWorker() {
 	}()
 }
 
-// serveSpeedTest 处理测速链接：
-//
-//	GET /speed/<token>       测速页面（占用一次使用次数）
-//	GET /speed/<token>/dl    测速数据流（不计次数，仅页面会话内使用）
 func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/speed/")
 	if rest == "" {
 		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已失效。")
 		return
 	}
-	// 数据流端点：/speed/<token>/dl
 	if strings.HasSuffix(rest, "/dl") {
 		tok := strings.TrimSuffix(rest, "/dl")
-		// 允许“当前会话”：打开页面已消耗 1 次，Uses==MaxUses 时页面测速仍在进行，
-		// 不能拒绝（否则限 1 次的链接打开页面后测速恒为 0）；仅当超出后才失效。
 		if v, ok := speedTokens.Load(tok); !ok || v.(*speedToken).Uses.Load() > int64(v.(*speedToken).MaxUses) || speedTokenExpired(v.(*speedToken)) {
 			http.Error(w, "链接已失效", http.StatusGone)
 			return
@@ -2180,14 +1928,13 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 				n = remain
 			}
 			if _, err := w.Write(buf[:n]); err != nil {
-				return // 客户端停止读取（测速结束）即退出
+				return
 			}
 			remain -= n
 		}
 		return
 	}
 
-	// 上传测速端点：/speed/<token>/up（丢弃数据，仅统计字节数）
 	if strings.HasSuffix(rest, "/up") {
 		tok := strings.TrimSuffix(rest, "/up")
 		if v, ok := speedTokens.Load(tok); !ok || v.(*speedToken).Uses.Load() > int64(v.(*speedToken).MaxUses) || speedTokenExpired(v.(*speedToken)) {
@@ -2198,7 +1945,6 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "方法不支持", http.StatusMethodNotAllowed)
 			return
 		}
-		// 上限 512MB，防止滥用；边读边丢弃，不落盘不驻留
 		body := http.MaxBytesReader(w, r.Body, 512<<20)
 		buf := make([]byte, 64<<10)
 		var n int64
@@ -2206,7 +1952,7 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 			m, err := body.Read(buf)
 			if m > 0 {
 				n += int64(m)
-				traffic.up.Add(int64(m)) // 计入端口上行流量
+				traffic.up.Add(int64(m))
 			}
 			if err != nil {
 				break
@@ -2217,7 +1963,6 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 测速结果上报：/speed/<token>/report（页面测完自动上报）
 	if strings.HasSuffix(rest, "/report") {
 		tok := strings.TrimSuffix(rest, "/report")
 		if v, ok := speedTokens.Load(tok); !ok || speedTokenExpired(v.(*speedToken)) {
@@ -2247,7 +1992,6 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 测速页面
 	tok := rest
 	if strings.Contains(tok, "/") {
 		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已失效。")
@@ -2268,14 +2012,13 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.Uses.Add(1)
-	go saveSpeedTokens() // 异步落盘，不阻塞页面响应
+	go saveSpeedTokens()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(strings.ReplaceAll(speedtestHTML, "__TOKEN__", tok)))
 }
 
-// speedtestHTML 测速页：输入令牌后渲染，自动完成延迟→下载测速，仪表盘样式。
 const speedtestHTML = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>测速</title><style>
@@ -2337,12 +2080,12 @@ body{min-height:100dvh;background:linear-gradient(180deg,#f0f7ff 0%,var(--bg) 60
 </div>
 <script>
 const TOKEN='__TOKEN__', DL='/speed/'+TOKEN+'/dl';
-const CIRC=653.4, MAX_DISPLAY=1000; // 仪表满刻度 Mbps
+const CIRC=653.4, MAX_DISPLAY=1000;
 const $=id=>document.getElementById(id);
 let running=false;
 function setGauge(mbps){
   const pct=Math.min(1,mbps/MAX_DISPLAY);
-  $('gbar').style.strokeDashoffset=CIRC*(1-pct*0.75); // 最大到 3/4 圈更有冲刺感
+  $('gbar').style.strokeDashoffset=CIRC*(1-pct*0.75);
   $('gval').textContent=mbps>=100?Math.round(mbps):mbps.toFixed(1);
 }
 function grade(m){return m>=200?['g-g','极佳']:m>=50?['g-g','良好']:m>=20?['g-m','一般']:['g-b','较差']}
@@ -2382,7 +2125,7 @@ async function downTest(seconds){
       }
     }
   };
-  await pump(1); // 单线程测试
+  await pump(1);
   if(bytes===0){
     const msg=downErr||'未收到数据';
     if(/410/.test(msg)) throw new Error('链接已失效，请重新生成测速链接');
@@ -2394,8 +2137,6 @@ async function downTest(seconds){
 
 async function upTest(seconds){
   const t0=performance.now(), deadline=t0+seconds*1000;
-  // 8MB 随机块：随机内容防止中间层压缩，预生成一次反复使用；
-  // 用 XHR 的 upload.onprogress 逐块回报已发字节，仪表才能平滑跳动
   const chunk=new Uint8Array(8*1048576);
   for(let off=0;off<chunk.length;off+=65536){
     crypto.getRandomValues(chunk.subarray(off,Math.min(off+65536,chunk.length)));
@@ -2422,7 +2163,7 @@ async function upTest(seconds){
     const el=(performance.now()-t0)/1000;
     if(el>0) setGauge(total*8/el/1e6);
   },250);
-  await worker(); // 单线程测试
+  await worker();
   done=true; clearInterval(meter);
   const secs=(performance.now()-t0)/1000;
   if(total===0){
@@ -2456,7 +2197,6 @@ $('go').addEventListener('click',async()=>{
     $('phase').innerHTML='测速完成 <span class="grade '+gc+'">'+gt+'</span>';
     $('sub').textContent='';
     try{ await fetch('/speed/'+TOKEN+'/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:ping,jitter:jit,down:mbps,up:upMbps})}); }catch(e){}
-    // 完成态：隐藏仪表（避免误读为实时速率），按 Speedtest 风格展示结果
     $('gauge').style.display='none'; $('phase').style.display='none'; $('sub').style.display='none';
     $('dGrade').className='grade '+gc; $('dGrade').textContent=gt;
     const fmt=v=>v>=100?Math.round(v).toString():v.toFixed(2);
@@ -2471,18 +2211,13 @@ $('go').addEventListener('click',async()=>{
 </script></body></html>`
 
 var wsUpgrader = websocket.Upgrader{
-	// 后台实时监控是单向小包推送（服务端→浏览器，每秒一帧），
-	// 默认 4KB 读缓冲对“只发不收”的场景属于纯浪费，调小到 1KB；
-	// 写缓冲保持 4KB 以合并一帧内的多次小写入，避免逐条 syscall。
-	ReadBufferSize:  1024,
-	WriteBufferSize: 4096,
-	// 不做 per-message 压缩：帧很小，压缩收益抵不过 CPU 开销
+	ReadBufferSize:    1024,
+	WriteBufferSize:   4096,
 	EnableCompression: false,
 	CheckOrigin: func(r *http.Request) bool {
-		// 仅允许同源，降低 CSRF / 跨站连接风险
 		origin := r.Header.Get("Origin")
 		if origin == "" {
-			return true // 非浏览器客户端
+			return true
 		}
 		u, err := url.Parse(origin)
 		if err != nil {
@@ -2492,10 +2227,8 @@ var wsUpgrader = websocket.Upgrader{
 	},
 }
 
-// statDropped：统计通道满时丢弃计数
 var statDropped atomic.Int64
 
-// pruneTopN：仅保留 map 中值最大的前 n 条。
 func pruneTopN[K comparable](m map[K]int64, n int) {
 	if len(m) <= n {
 		return
@@ -2523,7 +2256,6 @@ func pruneTopN[K comparable](m map[K]int64, n int) {
 	}
 }
 
-// 裁剪过大的统计数据，防止内存与磁盘耗尽
 func pruneStatsLocked() {
 	pruneTopN(stats.IPCounts, 1000)
 	pruneTopN(stats.IPBytes, 1000)
@@ -2549,7 +2281,6 @@ func pruneStatsLocked() {
 	}
 }
 
-// startStatsWorker 单消费者聚合统计，避免多协程抢 statsMu；通道满则丢弃并计数。
 func startStatsWorker() {
 	go func() {
 		for ev := range statChan {
@@ -2586,10 +2317,24 @@ func startStatsWorker() {
 				if ev.Host != "" {
 					d.Hosts[ev.Host]++
 				}
+				if ev.UAClass != "" {
+					d.UAClass[ev.UAClass]++
+				}
+				if ev.UARaw != "" {
+					d.UARaw[ev.UARaw]++
+					if len(d.UARaw) > uaRawCap {
+						minK, minV := "", int64(1<<62)
+						for k, v := range d.UARaw {
+							if v < minV {
+								minK, minV = k, v
+							}
+						}
+						delete(d.UARaw, minK)
+					}
+				}
 			} else if ev.Bytes > 0 || ev.UpBytes > 0 || ev.DownBytes > 0 {
 				up, down := ev.UpBytes, ev.DownBytes
 				if up == 0 && down == 0 {
-					// 兼容旧调用：只传合计
 					down = ev.Bytes
 				}
 				total := up + down
@@ -2623,17 +2368,13 @@ func startStatsWorker() {
 	}()
 }
 
-// recordRequestStart 上报一次「请求开始」事件，用于按 IP / 国家 / 域名累加请求次数。
-// 非阻塞：统计通道满时直接计数丢弃并返回，绝不把统计压力传导到请求路径上。
-func recordRequestStart(ip, country, host string) {
+func recordRequestStart(ip, country, host, ua string) {
 	select {
-	case statChan <- statEvent{IP: ip, Country: country, Host: host, IsStart: true}:
+	case statChan <- statEvent{IP: ip, Country: country, Host: host, UAClass: uaClassOfEx(ua), UARaw: uaRawKey(ua), IsStart: true}:
 	default:
-		statDropped.Add(1) // 通道满：丢弃但不阻塞请求
+		statDropped.Add(1)
 	}
 }
-
-// 磁盘分桶：stats_meta / stats_daily / stats_blocks（兼容旧版 stats/data 迁移）
 
 type statsMetaDisk struct {
 	SchemaVersion    int    `json:"schema_version"`
@@ -2649,12 +2390,10 @@ type statsMetaDisk struct {
 	BlockedCN        int64  `json:"blocked_cn"`
 	BlockedWhitelist int64  `json:"blocked_whitelist"`
 	BlockedBan       int64  `json:"blocked_ban"`
-	BlockedRate      int64  `json:"blocked_rate"`
 	BlockedUA        int64  `json:"blocked_ua"`
 	LastProxyAt      string `json:"last_proxy_at"`
 }
 
-// emptyStats 构造空统计对象（含全部 map 初始化），用于首次启动与加载失败兜底。
 func emptyStats() Stats {
 	return Stats{
 		SchemaVersion: 2,
@@ -2670,8 +2409,6 @@ func emptyStats() Stats {
 	}
 }
 
-// rebuildAggregatesFromDaily 用 Daily 明细重算全局聚合（国家/ IP 的次数与流量）。
-// 全局聚合是 Daily 的冗余视图，重建后统一裁到 Top1000，避免旧库累积过多键。
 func rebuildAggregatesFromDaily() {
 	stats.CountryCounts = map[string]int64{}
 	stats.IPCounts = map[string]int64{}
@@ -2705,8 +2442,6 @@ func rebuildAggregatesFromDaily() {
 	pruneTopN(stats.IPDownBytes, 1000)
 }
 
-// loadStats 从 bolt 载入统计：优先读分桶后的新结构（stats_meta / stats_daily / stats_blocks），
-// 同时兼容旧版单键结构并在成功后迁移。加载完成后补齐缺失的明细 map 与全局聚合。
 func loadStats() {
 	stats = emptyStats()
 	if db == nil {
@@ -2714,7 +2449,6 @@ func loadStats() {
 	}
 	migrated := false
 	_ = db.View(func(tx *bolt.Tx) error {
-		// 新结构：meta
 		if b := tx.Bucket([]byte("stats_meta")); b != nil {
 			if data := b.Get([]byte("data")); data != nil {
 				var m statsMetaDisk
@@ -2732,13 +2466,11 @@ func loadStats() {
 					stats.BlockedCN = m.BlockedCN
 					stats.BlockedWhitelist = m.BlockedWhitelist
 					stats.BlockedBan = m.BlockedBan
-					stats.BlockedRate = m.BlockedRate
 					stats.BlockedUA = m.BlockedUA
 					stats.LastProxyAt = m.LastProxyAt
 				}
 			}
 		}
-		// 新结构：daily 分键
 		if b := tx.Bucket([]byte("stats_daily")); b != nil {
 			_ = b.ForEach(func(k, v []byte) error {
 				d := newDayStat()
@@ -2749,7 +2481,6 @@ func loadStats() {
 				return nil
 			})
 		}
-		// 新结构：blocks
 		if b := tx.Bucket([]byte("stats_blocks")); b != nil {
 			if data := b.Get([]byte("data")); data != nil {
 				var bl []BlockEvent
@@ -2758,7 +2489,6 @@ func loadStats() {
 				}
 			}
 		}
-		// 旧版整包迁移
 		if len(stats.Daily) == 0 && stats.TotalRequests == 0 {
 			if b := tx.Bucket([]byte("stats")); b != nil {
 				if data := b.Get([]byte("data")); data != nil {
@@ -2799,14 +2529,12 @@ func loadStats() {
 	for _, d := range stats.Daily {
 		ensureDayMaps(d)
 	}
-	// 若从旧包迁入或 daily 有数据但全局 IP/国家为空，按日重算聚合
 	if migrated || (len(stats.IPCounts) == 0 && len(stats.Daily) > 0) {
 		rebuildAggregatesFromDaily()
 	}
 	if stats.TodayDate == "" {
 		stats.TodayDate = beijingDate(time.Now())
 	}
-	// 今日计数与 daily 对齐（避免跨进程后今日字段漂移）
 	if d := stats.Daily[stats.TodayDate]; d != nil {
 		if stats.TodayRequests == 0 && d.Requests > 0 {
 			stats.TodayRequests = d.Requests
@@ -2815,7 +2543,6 @@ func loadStats() {
 			stats.TodayBytes = d.Bytes
 		}
 	}
-	// 旧数据无 schema_version：标记为 1（旧口径），保留但不与新数据混算语义
 	if stats.SchemaVersion == 0 {
 		stats.SchemaVersion = 1
 	}
@@ -2831,9 +2558,6 @@ func loadStats() {
 	}
 }
 
-// statsSnapshot 统计落盘快照：锁内序列化（纯内存、快）→ 锁外写盘（磁盘 IO）。
-// 原实现 db.Update 全程持 statsMu，慢盘时统计 worker 与 recordBlocked 全部阻塞，
-// 极端情况下 statChan 塞满导致丢实时数据。
 type statsSnapshot struct {
 	meta       []byte
 	blocks     []byte
@@ -2844,7 +2568,6 @@ type statsSnapshot struct {
 	dailyKeys map[string]struct{}
 }
 
-// marshalStatsLocked 持锁序列化统计快照（调用方必须已持有 statsMu）
 func marshalStatsLocked() *statsSnapshot {
 	meta := statsMetaDisk{
 		SchemaVersion:    stats.SchemaVersion,
@@ -2860,7 +2583,6 @@ func marshalStatsLocked() *statsSnapshot {
 		BlockedCN:        stats.BlockedCN,
 		BlockedWhitelist: stats.BlockedWhitelist,
 		BlockedBan:       stats.BlockedBan,
-		BlockedRate:      stats.BlockedRate,
 		BlockedUA:        stats.BlockedUA,
 		LastProxyAt:      stats.LastProxyAt,
 	}
@@ -2884,7 +2606,6 @@ func marshalStatsLocked() *statsSnapshot {
 	return snap
 }
 
-// persistStats 锁外写盘（磁盘 IO 不阻塞统计）
 func persistStats(snap *statsSnapshot) {
 	if db == nil || snap == nil {
 		return
@@ -2901,7 +2622,6 @@ func persistStats(snap *statsSnapshot) {
 		if err != nil {
 			return err
 		}
-		// 先清掉已过期键（与快照一致）
 		_ = dbkt.ForEach(func(k, _ []byte) error {
 			if _, ok := snap.dailyKeys[string(k)]; !ok {
 				_ = dbkt.Delete(k)
@@ -2919,7 +2639,6 @@ func persistStats(snap *statsSnapshot) {
 	})
 }
 
-// saveStatsOnce 常规落盘入口：锁内序列化快照 → 释放锁 → 锁外写盘
 func saveStatsOnce() {
 	statsMu.Lock()
 	snap := marshalStatsLocked()
@@ -2927,9 +2646,6 @@ func saveStatsOnce() {
 	persistStats(snap)
 }
 
-// startStatsSaver 启动周期落盘协程：每 5 分钟清理过期明细、序列化快照并写盘，
-// 顺带清理过期的 IP 地理位置缓存。统计是「内存累加 + 周期落盘」，
-// 因此进程被强杀最多丢一个周期的增量。
 func startStatsSaver() {
 	go func() {
 		t := time.NewTicker(5 * time.Minute)
@@ -2944,30 +2660,16 @@ func startStatsSaver() {
 	}()
 }
 
-// getClientIP 取客户端 IP。
-//
-// 安全模型：
-//  1. 直连方（RemoteAddr）不是 loopback/私网时，它是唯一可信来源，直接返回，
-//     完全忽略请求头——否则任何公网客户端都能靠伪造 XFF 冒充任意 IP。
-//  2. 直连方是 loopback/私网时，说明前面有反代（Nginx/宝塔/1Panel 等）。
-//     此时 X-Forwarded-For 形如 "客户端, 代理1, 代理2"，**左侧内容可被客户端完全伪造**，
-//     必须从右往左逐跳回溯：跳过所有可信（私网/loopback）代理，取第一个不可信地址。
-//     例：真实客户端 1.2.3.4 经 Nginx 转发并伪造 XFF，到达时头为 "9.9.9.9, 1.2.3.4"
-//     —— 左侧 9.9.9.9 是伪造值，从右往左第一个不可信地址才是 1.2.3.4。
-//  3. 全部为可信地址（如健康检查、本机管理）时，回退到 X-Real-IP（由反代 302 覆盖写入，
-//     客户端无法伪造），最后回退到直连地址。
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	peer := net.ParseIP(host)
-	// 直连方不可信（公网直连）：不采信任何转发头
 	if peer == nil || !isTrustedProxy(peer) {
 		return host
 	}
 
-	// 有反代：从右往左找第一个不可信地址
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
@@ -2977,7 +2679,6 @@ func getClientIP(r *http.Request) string {
 			}
 			p := net.ParseIP(s)
 			if p == nil {
-				// 非法值：不再向左回溯（左侧更不可信），直接中断
 				break
 			}
 			if !isTrustedProxy(p) {
@@ -2986,7 +2687,6 @@ func getClientIP(r *http.Request) string {
 		}
 	}
 
-	// 兜底：X-Real-IP 由反代写入（proxy_set_header 会覆盖客户端原值）
 	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
 		if p := net.ParseIP(xri); p != nil && !isTrustedProxy(p) {
 			return xri
@@ -2995,18 +2695,12 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
-// isTrustedProxy 判断地址是否属于可信反代（loopback / 私网 / 链路本地）。
-// 说明：这里用「地址段」而非「精确 IP 列表」，覆盖同机、Docker 网桥、
-// 内网反代集群等常见拓扑；代价是内网内任意主机都被视为可信，
-// 因此 VPS 必须禁止外部直接访问内网网段（云厂商默认已隔离）。
 func isTrustedProxy(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 var selfPublicIP atomic.Value
 
-// detectSelfPublicIP 异步探测本机公网 IP，结果存入 selfPublicIP 供后续判断使用
-// （用于把本机自检流量从统计与拦截记录里排除）。多个探测源依次尝试，全部失败则保持为空。
 func detectSelfPublicIP() {
 	go func() {
 		client := &http.Client{Timeout: 4 * time.Second}
@@ -3030,7 +2724,6 @@ func detectSelfPublicIP() {
 	}()
 }
 
-// countryOf 使用嵌入的 iploc 本地库，不发起网络请求；失败返回 "??"。
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -3300,8 +2993,6 @@ var countryNames = map[string]string{
 	"ZZ": "未知",
 }
 
-// countryName 把两位国家码转成中文名；未知码原样返回，便于发现数据源变化。
-// 空码与 ZZ 统一显示为「未知」。
 func countryName(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if code == "" || code == "ZZ" {
@@ -3313,14 +3004,11 @@ func countryName(code string) string {
 	return code
 }
 
-// countryCodeByName 由国家中文名反查两位国家码（ip9 等接口偶尔只给名字不给码）。
-// 首次调用时构建反向表，之后只读。
 var (
 	countryCodeOnce sync.Once
 	countryCodeRev  map[string]string
 )
 
-// countryCodeByEnglishName 常见英文国名 → 两位国家码（ip-api 兜底时只给英文名）
 var countryCodeByEnglishName = map[string]string{
 	"China": "CN", "United States": "US", "United States of America": "US",
 	"Japan": "JP", "South Korea": "KR", "Korea": "KR", "North Korea": "KP",
@@ -3342,8 +3030,6 @@ var countryCodeByEnglishName = map[string]string{
 	"Morocco": "MA", "Algeria": "DZ", "Tunisia": "TN", "Ethiopia": "ET",
 }
 
-// countryCodeByName 用国家中文名反查两位国家码。
-// 部分查询接口只给名字不给码，需要这一步归一。反向表首次调用时构建，之后只读。
 func countryCodeByName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -3369,8 +3055,6 @@ func countryCodeByName(name string) string {
 	return ""
 }
 
-// isSelfOrLocalIP 判断是否为本机公网 IP 或本地/内网地址。
-// 这类来源的自检、探活请求不计入拦截统计，否则后台会被自己的健康检查刷屏。
 func isSelfOrLocalIP(ip, country string) bool {
 	if country == "LO" || country == "PV" {
 		return true
@@ -3387,8 +3071,6 @@ func isSelfOrLocalIP(ip, country string) bool {
 	return false
 }
 
-// recordBlocked 记录一次拦截：同时累加全局计数与当天计数，并写入拦截事件列表。
-// 本机与内网来源不计入。注释里的五类原因与后台「安全与访问控制」的开关一一对应。
 func recordBlocked(ip, country, path, reason, ua string) {
 	if isSelfOrLocalIP(ip, country) {
 		return
@@ -3396,8 +3078,6 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	statsMu.Lock()
 	defer statsMu.Unlock()
 	day := dayOf(beijingDate(time.Now()))
-	// 五类拦截原因全部计数并展示到拦截记录（对应"安全与访问控制"各开关）：
-	// cn=地区限制 whitelist=域名白名单 ban=IP黑名单 rate_limit=限流 ua=UA白名单
 	switch reason {
 	case "cn":
 		stats.BlockedCN++
@@ -3405,14 +3085,10 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	case "ban":
 		stats.BlockedBan++
 		day.BlockedBan++
-	case "rate_limit":
-		stats.BlockedRate++
-		day.BlockedRate++
 	case "ua":
 		stats.BlockedUA++
 		day.BlockedUA++
 	case "login_fail":
-		// 登录失败单独记入拦截列表，不计入白名单类计数
 	default:
 		stats.BlockedWhitelist++
 		day.BlockedWL++
@@ -3428,15 +3104,12 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	}
 }
 
-// blockReasonText 拦截原因中文描述（后端落盘 ReasonText，前端按 reason 实时渲染）
 func blockReasonText(reason string) string {
 	switch reason {
 	case "cn":
 		return "仅允许中国大陆 IP 访问"
 	case "ban":
 		return "IP 在黑名单中"
-	case "rate_limit":
-		return "请求超过限流阈值"
 	case "ua":
 		return "User-Agent 不在允许列表"
 	case "login_fail":
@@ -3464,11 +3137,10 @@ type geoEntry struct {
 
 var (
 	geoMu    sync.RWMutex
-	geoMap   = map[string]geoEntry{} // 纯内存，进程退出即丢弃，不落盘
+	geoMap   = map[string]geoEntry{}
 	geoGroup singleflight.Group
 )
 
-// geoPrune：清理过期与超量 geo 缓存（纯内存，不涉及磁盘）
 func geoPrune() {
 	const geoMaxEntries = 50000
 	now := time.Now().Unix()
@@ -3478,25 +3150,16 @@ func geoPrune() {
 			delete(geoMap, k)
 		}
 	}
-	// 极端情况兜底：仍超上限则整体重置（下次请求会重新按需拉取）
 	if len(geoMap) > geoMaxEntries {
 		geoMap = map[string]geoEntry{}
 	}
 	geoMu.Unlock()
 }
 
-// geoParseGeneric 把上游 JSON 归一化成 geoEntry。
-//
-//	· 主接口 ip9.com.cn：{ret:200, data:{country, country_code, prov, city, isp, ...}}
-//	· 兜底 ip-api.com：{status:"success", country, countryCode, regionName, city, isp, org, as}
-//
-// 两种结构字段名不同（country_code vs countryCode、prov vs regionName），这里统一兼容。
 func geoParseGeneric(m map[string]any) (geoEntry, error) {
-	// ip9 把业务数据放在 data 里；ip-api 是平铺结构
 	if data, ok := m["data"].(map[string]any); ok {
 		m = data
 	}
-	// ip9 的失败标记：ret != 200
 	if ret, ok := m["ret"]; ok {
 		if n, ok2 := toFloat(ret); ok2 && int(n) != 200 {
 			msg, _ := m["msg"].(string)
@@ -3506,7 +3169,6 @@ func geoParseGeneric(m map[string]any) (geoEntry, error) {
 			return geoEntry{}, fmt.Errorf("ip9 failed: %d %s", int(n), msg)
 		}
 	}
-	// ip-api 的失败标记：status == fail
 	if st, ok := m["status"].(string); ok && (st == "fail" || st == "error") {
 		msg, _ := m["message"].(string)
 		return geoEntry{}, fmt.Errorf("ip-api failed: %s", msg)
@@ -3521,10 +3183,9 @@ func geoParseGeneric(m map[string]any) (geoEntry, error) {
 		return ""
 	}
 
-	raw := str("country") // 国家名（ip9 为中文，ip-api 为英文）
+	raw := str("country")
 	code := strings.ToUpper(str("countryCode", "country_code"))
 	if len(code) > 2 {
-		// 某些接口把国家名塞进国家码字段，长度异常则直接丢弃（下方会用国家名反查）
 		code = ""
 	}
 	region := str("regionName", "prov", "region", "big_area")
@@ -3537,14 +3198,11 @@ func geoParseGeneric(m map[string]any) (geoEntry, error) {
 		return geoEntry{}, fmt.Errorf("no code")
 	}
 	if code == "" {
-		// 只有国家名时反查国家码，失败则标记为未知
 		code = countryCodeByName(raw)
 		if code == "" {
 			code = "??"
 		}
 	}
-	// 统一成中文国家名：ip-api 只给英文（China / United States），ip9 给中文。
-	// isASCII 判断：只要原始名是纯 ASCII，就用国家码换成中文名。
 	if zh := countryName(code); code != "??" && zh != code && (raw == "" || isASCIIName(raw)) {
 		raw = zh
 	}
@@ -3554,7 +3212,6 @@ func geoParseGeneric(m map[string]any) (geoEntry, error) {
 	return geoEntry{Code: code, Name: raw, Region: region, City: city, ISP: isp, Org: org, AS: asn, At: time.Now().Unix()}, nil
 }
 
-// isASCIIName 判断国家名是否为纯 ASCII（即英文名，需要转中文）
 func isASCIIName(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 0x80 {
@@ -3564,7 +3221,6 @@ func isASCIIName(s string) bool {
 	return true
 }
 
-// toFloat 把任意 JSON 数字（float64 / int / json.Number）转成 float64
 func toFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -3580,7 +3236,6 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
-// geoEndpoints 返回按优先级排列的查询地址：ip9 优先，失效再由 ip-api.com 兜底
 func geoEndpoints(ipEscaped string) []string {
 	return []string{
 		"https://ip9.com.cn/get?ip=" + ipEscaped,
@@ -3588,15 +3243,12 @@ func geoEndpoints(ipEscaped string) []string {
 	}
 }
 
-// geoFetch 查询 IP 的地理位置，按 geoEndpoints 给出的优先级依次尝试，任一成功即返回。
 func geoFetch(ipStr string) (geoEntry, error) {
 	return geoFetchVia(geoEndpoints(url.QueryEscape(ipStr)), ipStr)
 }
 
-// 共享 Geo Client，复用连接
 var geoClient = &http.Client{Timeout: 6 * time.Second}
 
-// geoFetchVia 按给定地址顺序逐个尝试，任一成功即返回（便于测试与自定义顺序）
 func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
 	var last error
 	for _, u := range urls {
@@ -3625,13 +3277,11 @@ func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
 	return geoEntry{}, last
 }
 
-// ipLabelSync 返回 (国家码, 中文名)。先查缓存/本地库，必要时 singleflight 拉 geo API。
 func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
 		return "??", "未知"
 	}
-	// 严禁 isSelfOrLocalIP(ip, "LO")：传入 "LO" 会恒为 true
 	if ip.IsLoopback() {
 		return "LO", "本机"
 	}
@@ -3677,13 +3327,11 @@ var (
 
 type adminCred struct {
 	User     string
-	PassHash string // bcrypt hash；兼容迁移期可能短暂存明文再被覆盖
+	PassHash string
 }
 
-// setAdminCred 原子替换管理账号快照（用户名 + 密码哈希）。
 func setAdminCred(u, hash string) { adminCredPtr.Store(&adminCred{User: u, PassHash: hash}) }
 
-// getAdminUser 返回当前管理用户名，未初始化时回落 admin。
 func getAdminUser() string {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -3692,7 +3340,6 @@ func getAdminUser() string {
 	return c.User
 }
 
-// getAdminHash 返回当前密码哈希，未设置时返回空串（调用方据此判断是否需要引导设置密码）。
 func getAdminHash() string {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -3701,7 +3348,6 @@ func getAdminHash() string {
 	return c.PassHash
 }
 
-// hashPassword 用 bcrypt 生成密码哈希。bcrypt 自带随机盐，同一密码每次结果不同。
 func hashPassword(plain string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
 	if err != nil {
@@ -3710,20 +3356,16 @@ func hashPassword(plain string) (string, error) {
 	return string(b), nil
 }
 
-// verifyPassword 校验密码。兼容旧版明文存储：非 bcrypt 格式时做常量时间比较，
-// 登录成功后由调用方重写为 bcrypt 哈希。
 func verifyPassword(hash, plain string) bool {
 	if hash == "" || plain == "" {
 		return false
 	}
-	// 兼容旧版明文：若不是 bcrypt 格式则做常量时间比较并提示升级
 	if !strings.HasPrefix(hash, "$2a$") && !strings.HasPrefix(hash, "$2b$") && !strings.HasPrefix(hash, "$2y$") {
 		return subtle.ConstantTimeCompare([]byte(hash), []byte(plain)) == 1
 	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 
-// isBcryptHash 判断字符串是否为 bcrypt 哈希（用于识别并迁移旧的明文密码）。
 func isBcryptHash(s string) bool {
 	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }
@@ -3745,16 +3387,12 @@ var (
 	captchas sync.Map
 )
 
-// randToken 生成 n 字节的随机十六进制串，用于会话令牌、记录 ID、验证码 ID。
-// 取自 crypto/rand，不可用 math/rand 替代。
 func randToken(n int) string {
 	b := make([]byte, n)
 	_, _ = io.ReadFull(rand.Reader, b)
 	return hex.EncodeToString(b)
 }
 
-// initSessionsCleanup 启动后台清理协程，定期移除过期的会话与验证码，
-// 防止内存 map 随登录次数无界增长。
 func initSessionsCleanup() {
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
@@ -3776,15 +3414,12 @@ func initSessionsCleanup() {
 	}()
 }
 
-// createSession 创建一次管理会话并返回令牌，同时把同一账号的旧会话清掉
-// （单点登录：新登录会挤掉旧登录，避免令牌被长期复用）。
 func createSession() string {
 	tok := randToken(16)
 	sessions.Store(tok, sessionEntry{Expires: time.Now().Add(sessionTTL)})
 	return tok
 }
 
-// validSession 校验会话令牌是否有效且未过期，过期即删除。
 func validSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -3799,14 +3434,12 @@ func validSession(tok string) bool {
 		sessions.Delete(tok)
 		return false
 	}
-	// 滑动续期：剩余不足一半 TTL 时自动延长
 	if e.Expires.Sub(now) < sessionTTL/2 {
 		sessions.Store(tok, sessionEntry{Expires: now.Add(sessionTTL)})
 	}
 	return true
 }
 
-// destroyOtherSessions 踢出除当前外的所有会话
 func destroyOtherSessions(keep string) {
 	sessions.Range(func(k, _ interface{}) bool {
 		if ks, ok := k.(string); ok && ks != keep {
@@ -3816,14 +3449,12 @@ func destroyOtherSessions(keep string) {
 	})
 }
 
-// destroySession 注销指定会话（登出）。
 func destroySession(tok string) {
 	if tok != "" {
 		sessions.Delete(tok)
 	}
 }
 
-// getSessionToken 从 Cookie 读取会话令牌，不存在时返回空串。
 func getSessionToken(r *http.Request) string {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
@@ -3832,8 +3463,6 @@ func getSessionToken(r *http.Request) string {
 	return c.Value
 }
 
-// requestIsHTTPS 判断当前请求是否为 HTTPS：直连看 TLS，反向代理后看 X-Forwarded-Proto。
-// 决定会话 Cookie 是否加 Secure 属性。
 func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -3844,8 +3473,6 @@ func requestIsHTTPS(r *http.Request) bool {
 	return false
 }
 
-// setSessionCookie 写入管理会话 Cookie：HttpOnly + SameSite=Lax，路径限定 /admin，
-// HTTPS 时追加 Secure。
 func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	c := &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/admin",
@@ -3858,12 +3485,10 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	http.SetCookie(w, c)
 }
 
-// clearSessionCookie 让浏览器立即失效会话 Cookie（MaxAge=-1）。
 func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
 }
 
-// generateCaptchaSVG 生成 5 位干扰验证码 SVG（更多噪声点与干扰线），答案存 captchas map，TTL 5 分钟。
 func generateCaptchaSVG() (id, answer, svg string) {
 	const digits = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 	rb := make([]byte, 16)
@@ -3875,7 +3500,6 @@ func generateCaptchaSVG() (id, answer, svg string) {
 	answer = string(ans)
 	id = randToken(8)
 	var lines, dots, texts strings.Builder
-	// 干扰线
 	for i := 0; i < 8; i++ {
 		x1 := int(rb[i%16]) % 160
 		y1 := int(rb[(i+1)%16]) % 52
@@ -3883,7 +3507,6 @@ func generateCaptchaSVG() (id, answer, svg string) {
 		y2 := int(rb[(i+3)%16]) % 52
 		lines.WriteString(fmt.Sprintf(`<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#94a3b8" stroke-width="1"/>`, x1, y1, x2, y2))
 	}
-	// 噪声点
 	for i := 0; i < 40; i++ {
 		x := int(rb[i%16]) % 170
 		y := int(rb[(i+5)%16]) % 50
@@ -3901,8 +3524,6 @@ func generateCaptchaSVG() (id, answer, svg string) {
 	return id, answer, svg
 }
 
-// verifyCaptcha 校验图形验证码，忽略大小写与首尾空白。
-// 无论成功与否都立即删除该验证码，做到一次性使用，防止同码重放。
 func verifyCaptcha(id, input string) bool {
 	if id == "" || input == "" {
 		return false
@@ -3919,11 +3540,8 @@ func verifyCaptcha(id, input string) bool {
 	return strings.EqualFold(strings.TrimSpace(input), e.Answer)
 }
 
-// ---------- 管理端认证 ----------
-// 会话：Cookie emby_admin_sid，内存 map，TTL 24h；登录需图形验证码。
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// CSRF: 写操作要求自定义头（前端全局 fetch 已自动附加）
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 			if r.Header.Get("X-Emby-CSRF") != "1" && r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
 				w.Header().Set("Content-Type", "application/json")
@@ -4056,8 +3674,6 @@ loadCaptcha();
 </body>
 </html>`
 
-// saveAdminPassHash 把密码哈希写入 bolt 的 auth bucket，并删除遗留的明文键。
-// 幂等：重复调用只覆盖哈希，可安全用于启动引导与改密。
 func saveAdminPassHash(hash string) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -4067,13 +3683,11 @@ func saveAdminPassHash(hash string) error {
 		if err != nil {
 			return err
 		}
-		// 清除旧明文键，只保留哈希
 		_ = bk.Delete([]byte("admin_pass"))
 		return bk.Put([]byte("admin_pass_hash"), []byte(hash))
 	})
 }
 
-// recordAudit 写入管理操作审计（持锁或不持锁均可，内部自取锁）
 func recordAudit(ip, action, detail string) {
 	statsMu.Lock()
 	defer statsMu.Unlock()
@@ -4084,28 +3698,24 @@ func recordAudit(ip, action, detail string) {
 	}
 }
 
-// loginFail 登录失败拦截：短窗口计数 + 逐步加长锁定 + 多次锁定后自动拉黑
 type loginFailEntry struct {
 	Count    atomic.Int64
-	Window   atomic.Int64 // UnixNano，计数窗口起点
-	Locked   atomic.Int64 // 锁定截止 UnixNano
-	Lockouts atomic.Int64 // 累计被锁定次数（用于自动拉黑）
+	Window   atomic.Int64
+	Locked   atomic.Int64
+	Lockouts atomic.Int64
 }
 
-var loginFailers sync.Map // ip -> *loginFailEntry
+var loginFailers sync.Map
 
 const (
-	loginFailLimit   = 5                // 窗口内失败次数上限
-	loginFailWindow  = 10 * time.Minute // 计数窗口
-	loginLockBase    = 15 * time.Minute // 首次锁定时长
-	loginLockMax     = 2 * time.Hour    // 锁定上限
-	captchaRateLimit = 30               // 每分钟每 IP 验证码请求上限
+	loginFailLimit   = 5
+	loginFailWindow  = 10 * time.Minute
+	loginLockBase    = 15 * time.Minute
+	loginLockMax     = 2 * time.Hour
+	captchaRateLimit = 30
 )
 
-// loginLockDuration 计算第 n 次锁定的时长：15m 起逐次翻倍，封顶 2 小时。
-// 递增锁定让暴力破解的时间成本快速上升，同时正常用户第一次误锁只等 15 分钟。
 func loginLockDuration(lockouts int64) time.Duration {
-	// 15m → 30m → 60m → 120m（封顶）
 	d := loginLockBase
 	for i := int64(1); i < lockouts && d < loginLockMax; i++ {
 		d *= 2
@@ -4116,7 +3726,6 @@ func loginLockDuration(lockouts int64) time.Duration {
 	return d
 }
 
-// checkLoginAllowed 判断该 IP 当前是否允许尝试登录；被锁定时返回还需等待的秒数。
 func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
 	now := time.Now().UnixNano()
 	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
@@ -4127,7 +3736,6 @@ func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
 	return true, 0
 }
 
-// recordLoginFail 记录一次失败；返回 (已锁定, 还需等待秒数, 本窗失败次数)
 func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails int64) {
 	now := time.Now().UnixNano()
 	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
@@ -4144,7 +3752,6 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 		fails = e.Count.Add(1)
 	}
 
-	// 写入拦截记录 + 审计，便于在后台查看暴力尝试
 	ua := ""
 	recordBlocked(ip, countryOf(ip), "/admin/api/login", "login_fail", ua)
 	recordAudit(ip, "login_fail", reason)
@@ -4163,12 +3770,10 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 	return false, 0, fails
 }
 
-// clearLoginFail 登录成功后清除该 IP 的失败记录，避免正常用户被历史失败拖累。
 func clearLoginFail(ip string) {
 	loginFailers.Delete(ip)
 }
 
-// captcha 接口限流，防止刷验证码
 type captchaRateEntry struct {
 	Count       atomic.Int64
 	WindowStart atomic.Int64
@@ -4176,8 +3781,6 @@ type captchaRateEntry struct {
 
 var captchaLimiters sync.Map
 
-// checkCaptchaRate 对验证码接口做每分钟每 IP 的滑动窗口限流，防止被刷爆。
-// 验证码生成本身有开销且无鉴权，是最容易被滥用的入口。
 func checkCaptchaRate(ip string) bool {
 	val, _ := captchaLimiters.LoadOrStore(ip, &captchaRateEntry{})
 	e := val.(*captchaRateEntry)
@@ -4194,8 +3797,6 @@ func checkCaptchaRate(ip string) bool {
 
 type switchTransport struct{ v atomic.Value }
 
-// RoundTrip 每次请求都从原子变量取当前 Transport，
-// 从而实现「不重启进程、不打断在途连接」的传输层参数热更新。
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t, _ := s.v.Load().(*http.Transport)
 	if t == nil {
@@ -4206,7 +3807,6 @@ func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 type bufferPool struct{ pool sync.Pool }
 
-// Get 从池中取一块 32KB 缓冲区，池空时新建。
 func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
@@ -4214,7 +3814,6 @@ func (b *bufferPool) Get() []byte {
 	return make([]byte, 32*1024)
 }
 
-// Put 归还缓冲区；容量不足的直接丢弃，避免池里混入越来越小的碎片。
 func (b *bufferPool) Put(p []byte) {
 	if cap(p) >= 32*1024 {
 		b.pool.Put(p[:32*1024])
@@ -4223,10 +3822,6 @@ func (b *bufferPool) Put(p []byte) {
 
 var proxyBufPool = &bufferPool{}
 
-// newTransport 构造反代用的 Transport。
-// 关键取舍：禁用自动压缩（否则字节统计与 Range 语义都会失真）、
-// 开启 HTTP/2、放大空闲连接池（媒体流场景连接复用收益很高）、
-// TLS 最低 1.2 并缓存会话票据。
 func newTransport() *http.Transport {
 	return &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
@@ -4239,9 +3834,6 @@ func newTransport() *http.Transport {
 
 var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
 
-// rewriteOriginHeaders 把 Origin/Referer 改写成上游自己的域名。
-// 上游若启用了来源校验，客户端带来的本站域名会被判为跨站而拒绝，
-// 因此转发前统一替换；Cookie 的 Domain 属性也一并剥掉，避免浏览器据其串域。
 func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	if o := out.Header.Get("Origin"); o != "" && o != "null" {
 		if u, err := url.Parse(o); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) {
@@ -4257,17 +3849,8 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	}
 }
 
-// buildProxy 构造反向代理（纯透传）：
-//
-//	Rewrite        把路径中的目标写到 Out.URL
-//	ModifyResponse 只改写 Location / Set-Cookie Domain，不包装响应体
-//	ErrorHandler   上游失败时返回统一错误页
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		// FlushInterval = 0：不做定时强制 flush，由底层 bufio 写满自然下发。
-		// 这样下游读取慢时写操作会阻塞，形成真实背压，上游随之被按住；
-		// 而流式响应（ContentLength == -1，媒体流/SSE）标准库会自动用 -1 立即 flush，
-		// 播放不会因为该设置变卡。
 		Transport: tr, FlushInterval: 0, BufferPool: proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
@@ -4280,9 +3863,6 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			pr.Out.URL.RawPath = ""
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 			pr.Out.Host = t.Host
-			// 转发头必须由本机重写，不能沿用 pr.SetXForwarded()：
-			// 它会把 Out 上已存在的（客户端伪造的）X-Forwarded-For 原样拼在前面，
-			// 使伪造链路直达上游。这里先清空，再用已校验的客户端 IP 重新写入。
 			outIP := getClientIP(pr.In)
 			pr.Out.Header.Del("X-Forwarded-For")
 			pr.Out.Header.Del("X-Real-IP")
@@ -4295,11 +3875,8 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 				pr.Out.Header.Set("X-Forwarded-Proto", "https")
 			}
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
-			// 请求体不做上下行统计（客户端上传量不属于上下行定义）
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// 响应体包一层计数 Reader：仅统计真正经过本服务的下行字节。
-			// 不改变传输语义（纯流式透传，不缓冲、不预读）。
 			if resp.Body != nil {
 				rb := reqBytesFrom(resp.Request.Context())
 				resp.Body = struct {
@@ -4343,13 +3920,8 @@ type adminConfigResp struct {
 	EffectivePort int `json:"effective_port"`
 }
 
-// ---------- PWA：manifest 与 Service Worker ----------
-// iconVer 图标资源版本参数：URL 带版本可强制浏览器/系统刷新顽固的 favicon 缓存。
-// 更换图标时递增版本号即可。
-const iconVer = "?v=3"
+const iconVer = "?v=4"
 
-// pwaHeadExtra 返回注入到 <head> 的图标/PWA 标签。
-// PWA 已固化为常开（不再提供后台开关），因此这里恒定输出完整标签。
 func pwaHeadExtra() string {
 	return "<link rel=\"icon\" href=\"/favicon.ico" + iconVer + "\">\n" +
 		"<link rel=\"apple-touch-icon\" href=\"/admin/icon-192.png" + iconVer + "\">\n" +
@@ -4361,12 +3933,10 @@ func pwaHeadExtra() string {
 		"<meta name=\"apple-mobile-web-app-title\" content=\"Emby Proxy\">\n"
 }
 
-// pwaBodyExtra 返回注入到 </body> 前的 SW 注册脚本（PWA 常开，始终注入）。
 func pwaBodyExtra() string {
 	return "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/admin/sw.js').catch(function(){})})}</script>"
 }
 
-// pwaManifestJSON 生成 Web App Manifest（start_url 指向秒开的静态启动页）。
 func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
@@ -4388,14 +3958,12 @@ func pwaManifestJSON() []byte {
 	return b
 }
 
-// splashHTML PWA 启动页：纯静态、极轻量（无外链脚本、无 API 阻塞渲染），
-// 渲染后直接探测登录态并跳转（不做任何预缓存/预热）。
 const splashHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<link rel="icon" href="/favicon.ico?v=3">
+<link rel="icon" href="/favicon.ico?v=4">
 <title>启动中 · Emby Proxy</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -4418,17 +3986,11 @@ h1{font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-.3px}
   <div class="tip" id="tip">正在加载…</div>
 </div>
 <script>
-/* 启动流程：
- * 1. 页面本身零外链依赖，立即渲染；
- * 2. 直接探测登录态（不做任何缓存/预热）：
- *    已登录 → /admin/，未登录 → /admin/login。
- * 3. 最短展示 400ms，避免闪烁；跳转用 replace，避免后退键回到启动页。 */
 (function () {
   var t0 = Date.now();
   var tip = document.getElementById('tip');
   var wait = Math.max(0, 400 - (Date.now() - t0));
   setTimeout(function () {
-    // 探测登录态：config 需要会话，401/302 → 登录页
     fetch('/admin/api/config', { cache: 'no-store' }).then(function (r) {
       location.replace(r.ok ? '/admin/' : '/admin/login');
     }).catch(function () {
@@ -4441,28 +4003,18 @@ h1{font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-.3px}
 </html>
 `
 
-// swSource 管理后台 Service Worker（仅保留 PWA 安装能力，不做任何缓存）：
-//
-//	· 不预缓存应用壳、不缓存导航请求、不缓存 CDN 脚本、不调用 caches API
-//	· fetch 事件直接放行（浏览器默认行为），保证页面与数据永远是最新版本
-//	· install 时立即激活并清理历史版本遗留的缓存（老版本 SW 缓存的旧页面）
 const swSource = `self.addEventListener('install', function (e) {
   e.waitUntil(self.skipWaiting());
 });
 self.addEventListener('activate', function (e) {
   e.waitUntil((self.caches ? caches.keys().then(function (ks) {
-    // 清掉任意遗留缓存（含本 SW 之前的各版本应用壳缓存）
     return Promise.all(ks.map(function (k) { return caches.delete(k); }));
   }) : Promise.resolve()).then(function () { return self.clients.claim(); }));
 });
 `
 
-// ---------- gzip 压缩中间件 ----------
-// 仅用于管理后台路由（HTML ~80KB / JSON 统计可达 MB 级，压缩后传输量降 70%+）。
-// 代理流量（视频流等）不经过本中间件；WS 升级与图片等不可压缩类型自动跳过。
 var gzipWriterPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
 
-// gzipCompressible 是否为可压缩类型
 func gzipCompressible(ct string) bool {
 	ct = strings.ToLower(ct)
 	for _, p := range []string{"text/", "application/json", "application/javascript", "application/manifest", "image/svg"} {
@@ -4473,20 +4025,16 @@ func gzipCompressible(ct string) bool {
 	return false
 }
 
-// gzipResponseWriter 惰性压缩：首个 Write/WriteHeader 时按 Content-Type 决定
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	gz      *gzip.Writer
-	decided bool // 已决定是否压缩
-	gzOn    bool // 实际启用压缩
+	decided bool
+	gzOn    bool
 }
 
-// WriteHeader 在首次写出时决定是否压缩：仅对可压缩类型、且处理器未自行压缩时启用。
-// 判断放在这里而不是构造时，是因为 Content-Type 往往要等处理器写完才确定。
 func (g *gzipResponseWriter) WriteHeader(code int) {
 	if !g.decided {
 		g.decided = true
-		// 处理器已自行输出压缩内容则直接透传，避免二次压缩
 		if gzipCompressible(g.Header().Get("Content-Type")) && g.Header().Get("Content-Encoding") == "" {
 			h := g.Header()
 			h.Set("Content-Encoding", "gzip")
@@ -4499,8 +4047,6 @@ func (g *gzipResponseWriter) WriteHeader(code int) {
 	g.ResponseWriter.WriteHeader(code)
 }
 
-// Write 写出响应体；已启用压缩时写入 gzip 流，否则直接透传。
-// 首次 Write 前若未调用 WriteHeader，先补一次以触发压缩决策。
 func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	if !g.decided {
 		g.WriteHeader(http.StatusOK)
@@ -4511,7 +4057,6 @@ func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	return g.ResponseWriter.Write(b)
 }
 
-// Flush 流式响应透传（压缩时先 flush gzip 缓冲）
 func (g *gzipResponseWriter) Flush() {
 	if g.gzOn {
 		_ = g.gz.Flush()
@@ -4521,7 +4066,6 @@ func (g *gzipResponseWriter) Flush() {
 	}
 }
 
-// Hijack WebSocket 升级透传（升级后数据绕过 gzip 直写底层连接）
 func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	h, ok := g.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -4532,7 +4076,6 @@ func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return h.Hijack()
 }
 
-// gzipMiddleware 包装管理后台处理器：客户端支持且非升级请求时启用压缩
 func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || r.Header.Get("Upgrade") != "" {
@@ -4543,17 +4086,13 @@ func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		gw := &gzipResponseWriter{ResponseWriter: w, gz: gz}
 		next(gw, r)
 		if gw.gzOn {
-			_ = gz.Close() // 写入 gzip 尾部
+			_ = gz.Close()
 			gz.Reset(io.Discard)
 		}
 		gzipWriterPool.Put(gz)
 	}
 }
 
-// ---------- 压缩输出 HTML ----------
-// 不做任何进程内缓存：每次请求现场 gzip（仅管理后台几处低频页面，CPU 开销可忽略）。
-
-// serveHTML 输出 HTML：客户端支持 gzip 时现场压缩后写出。
 func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheControl string) {
 	w.Header().Set("Content-Type", contentType)
 	if cacheControl != "" {
@@ -4572,13 +4111,8 @@ func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheC
 	_, _ = w.Write([]byte(html))
 }
 
-// ---------- 系统信息辅助 ----------
-
-// diskUsage 返回磁盘剩余/总量（仅 unix，用 syscall.Statfs；失败返回 0）
 type diskSpace struct{ free, total uint64 }
 
-// diskUsage 返回指定路径所在分区的可用与总容量（字节）。
-// 仅支持 unix：走 syscall.Statfs，非 unix 平台或调用失败时返回错误由调用方降级。
 func diskUsage(path string) (diskSpace, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
@@ -4590,20 +4124,8 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-// appVersion 程序版本号（发版时改这里即可，后台「系统信息」会展示）
 const appVersionStr = "2.2.0"
 
-// appVersion 返回程序版本号，供后台「系统信息」与上报 UA 使用。
-func appVersion() string { return appVersionStr }
-
-// blockedAll 五种拦截之和（调用方需自行持有 statsMu 或接受轻微误差）
-func blockedAll() int64 {
-	statsMu.Lock()
-	defer statsMu.Unlock()
-	return stats.BlockedCN + stats.BlockedWhitelist + stats.BlockedBan + stats.BlockedRate + stats.BlockedUA
-}
-
-// activeSessionCount 当前未过期的后台登录会话数
 func activeSessionCount() int {
 	now := time.Now()
 	n := 0
@@ -4616,7 +4138,6 @@ func activeSessionCount() int {
 	return n
 }
 
-// adminHandler 注册 /admin 下全部路由（登录页、API、静态后台页）。
 func adminHandler() http.HandlerFunc {
 	mux := http.NewServeMux()
 
@@ -4648,7 +4169,6 @@ func adminHandler() http.HandlerFunc {
 		}
 		clientIP := getClientIP(r)
 		w.Header().Set("Content-Type", "application/json")
-		// 已被代理黑名单拦截的 IP 直接拒绝登录
 		if isBannedIP(clientIP, net.ParseIP(clientIP)) {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"error":"您的 IP 已被加入黑名单，无法登录"}`))
@@ -4698,7 +4218,6 @@ func adminHandler() http.HandlerFunc {
 			failMsg("用户名或密码不正确，请注意大小写", "password")
 			return
 		}
-		// 旧明文迁移：登录成功后升级为 bcrypt
 		if hash != "" && !isBcryptHash(hash) {
 			if nh, err := hashPassword(req.Password); err == nil {
 				_ = saveAdminPassHash(nh)
@@ -4726,7 +4245,6 @@ func adminHandler() http.HandlerFunc {
 			http.Error(w, "请求方法不支持，请刷新页面后重试", http.StatusMethodNotAllowed)
 			return
 		}
-		// 复用 Config 结构体（与 saveReq 字段完全一致，去掉重复定义）
 		var req Config
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "提交的配置格式有误，请检查各项输入后重新保存", http.StatusBadRequest)
@@ -4734,6 +4252,10 @@ func adminHandler() http.HandlerFunc {
 		}
 		oldCfg := currentCfg()
 		newCfg := &req
+		if err := validateAdminAllow(newCfg.AdminAllow, getClientIP(r)); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err := saveConfig(newCfg); err != nil {
 			http.Error(w, "配置保存失败，可能是磁盘写入异常，请稍后重试", http.StatusInternalServerError)
 			return
@@ -4743,7 +4265,6 @@ func adminHandler() http.HandlerFunc {
 		recordAudit(getClientIP(r), "save_config", "保存网关设置")
 		if newCfg.Port > 0 && newCfg.Port != currentPort() && globalSrv != nil {
 			if err := startListen(globalSrv, newCfg.Port); err != nil {
-				// 端口切换失败：回滚配置。Transport 与配置无关，无需重建。
 				cfgPtr.Store(oldCfg)
 				_ = saveConfig(oldCfg)
 				http.Error(w, "新端口 "+strconv.Itoa(newCfg.Port)+" 监听失败，可能被其他程序占用或无权限；已自动恢复为原端口 "+strconv.Itoa(oldCfg.Port), http.StatusBadRequest)
@@ -4753,12 +4274,10 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
 	})
-	// /admin/api/system：概览「系统信息」卡片的运行态数据（全部来自本进程与 os，不依赖外部命令）
 	mux.HandleFunc("/admin/api/system", func(w http.ResponseWriter, r *http.Request) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 
-		// 构建信息：优先取 embed 的 buildinfo（Go 1.18+ 自动写入）
 		goVer := runtime.Version()
 		buildSum := ""
 		if bi, ok := debug.ReadBuildInfo(); ok {
@@ -4775,7 +4294,6 @@ func adminHandler() http.HandlerFunc {
 			buildSum = buildSum[:8]
 		}
 
-		// 数据库文件大小与所在磁盘剩余空间
 		var dbSize int64
 		if fi, err := os.Stat(dbPath); err == nil {
 			dbSize = fi.Size()
@@ -4785,17 +4303,14 @@ func adminHandler() http.HandlerFunc {
 			diskFree, diskTotal = du.free, du.total
 		}
 
-		// 独立 IP 数（快速估算，避免再复制全量 map）
-		statsMu.Lock()
-		uniqueIPs := len(stats.IPCounts)
-		totalReqs := stats.TotalRequests
-		totalBytes := stats.TotalBytes
-		statsMu.Unlock()
+		sv := currentStatsView()
+		uniqueIPs := len(sv.ipCounts)
+		totalReqs := sv.totalRequests
+		totalBytes := sv.totalBytes
 
-		// 命中率：允许的请求 / 总请求
 		allowRate := 0.0
 		if totalReqs > 0 {
-			allowRate = 100 * float64(totalReqs-blockedAll()) / float64(totalReqs)
+			allowRate = 100 * float64(totalReqs-blockedTotal(sv)) / float64(totalReqs)
 			if allowRate < 0 {
 				allowRate = 0
 			}
@@ -4803,7 +4318,7 @@ func adminHandler() http.HandlerFunc {
 
 		c := currentCfg()
 		resp := map[string]any{
-			"version":        appVersion(),
+			"version":        appVersionStr,
 			"go_version":     goVer,
 			"build_rev":      buildSum,
 			"os_arch":        runtime.GOOS + "/" + runtime.GOARCH,
@@ -4828,16 +4343,16 @@ func adminHandler() http.HandlerFunc {
 			"allow_rate":     allowRate,
 			"whitelist":      len(c.Whitelist),
 			"ban_list":       len(c.BanList),
-			"rate_limit":     c.RateLimit,
 			"china_only":     c.ChinaOnly,
-			"auto_ban":       c.AutoBan,
 			"allowed_uas":    len(c.AllowedUAs),
 			"logins":         activeSessionCount(),
+			"stat_dropped":   statDropped.Load(),
+			"live_clients":   liveClients.Load(),
+			"admin_allow":    len(c.AdminAllow),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	})
-	// /admin/api/realtime/ws：进入页面才开始收集，断开即清空；增量推送
 	mux.HandleFunc("/admin/api/realtime/ws", func(w http.ResponseWriter, r *http.Request) {
 		if !validSession(getSessionToken(r)) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -4849,7 +4364,6 @@ func adminHandler() http.HandlerFunc {
 		}
 		defer conn.Close()
 		liveClients.Add(1)
-		// 立即唤醒采样器：否则它会睡满 5 分钟空闲周期，页面长时间没有网速数据
 		wakeNetSpeedSampler()
 		defer func() {
 			if liveClients.Add(-1) == 0 {
@@ -4871,9 +4385,8 @@ func adminHandler() http.HandlerFunc {
 					}
 				}
 				if len(delta) > 0 {
-					lastSeq = delta[0].Seq // events 是 newest-first
+					lastSeq = delta[0].Seq
 				}
-				// 每秒采样一次各 IP 近期字节，换算成实时网速
 				ipRates := snapshotIPRates()
 				type ipSpeed struct {
 					IP string `json:"ip"`
@@ -4882,9 +4395,8 @@ func adminHandler() http.HandlerFunc {
 				}
 				var speeds []ipSpeed
 				for ip, b := range ipRates {
-					speeds = append(speeds, ipSpeed{IP: ip, Rx: b[1], Tx: b[0]}) // down=rx, up=tx
+					speeds = append(speeds, ipSpeed{IP: ip, Rx: b[1], Tx: b[0]})
 				}
-				// 按总速率排序，取前 20
 				sort.Slice(speeds, func(i, j int) bool {
 					return speeds[i].Rx+speeds[i].Tx > speeds[j].Rx+speeds[j].Tx
 				})
@@ -4909,29 +4421,21 @@ func adminHandler() http.HandlerFunc {
 		}
 	})
 	mux.HandleFunc("/admin/api/traffic", func(w http.ResponseWriter, r *http.Request) {
-		// slim=1 轻量模式：概览页 5 秒轮询专用——trend 只含每日汇总（不带分时/主机/IP/国家明细），
-		// 避免每次轮询都序列化/传输全量历史明细（长周期下可达 MB 级）；流量页用完整模式。
 		slim := r.URL.Query().Get("slim") == "1"
 		w.Header().Set("Content-Type", "application/json")
-		statsMu.Lock()
-		var ips, ipBytes, ctry map[string]int64
-		var uniqueIPs int
-		if slim {
-			uniqueIPs = len(stats.IPCounts)
-		} else {
-			ips = copyInt64Map(stats.IPCounts)
-			if ips == nil {
-				ips = map[string]int64{}
-			}
-			ipBytes = copyInt64Map(stats.IPBytes)
-			if ipBytes == nil {
-				ipBytes = map[string]int64{}
-			}
-			ctry = copyInt64Map(stats.CountryCounts)
-			if ctry == nil {
-				ctry = map[string]int64{}
-			}
+
+		v := currentStatsView()
+		ips, ipBytes, ctry := v.ipCounts, v.ipBytes, v.countryCounts
+		if ips == nil {
+			ips = map[string]int64{}
 		}
+		if ipBytes == nil {
+			ipBytes = map[string]int64{}
+		}
+		if ctry == nil {
+			ctry = map[string]int64{}
+		}
+		uniqueIPs := len(v.ipCounts)
 
 		type TrendItem struct {
 			Date          string           `json:"date"`
@@ -4949,19 +4453,19 @@ func adminHandler() http.HandlerFunc {
 			Hosts         map[string]int64 `json:"hosts,omitempty"`
 			IPs           map[string]int64 `json:"ips,omitempty"`
 			Countries     map[string]int64 `json:"countries,omitempty"`
+			UAClass       map[string]int64 `json:"ua_class,omitempty"`
+			UARaw         map[string]int64 `json:"ua_raw,omitempty"`
 		}
 		var trend []TrendItem
 		hostAll := map[string]int64{}
-		for k, d := range stats.Daily {
+		for k, d := range v.daily {
 			if d == nil {
 				continue
 			}
 			if slim {
-				// 轻量模式：只带每日汇总 + 分时汇总（概览「单日」视图按 0~23 点画图，
-				// 缺了 hours/hour_*_bytes 就会退化成一条全 0 的直线）；IP/国家/主机明细仍跳过。
 				trend = append(trend, TrendItem{
 					Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
-					Blocked:   d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
+					Blocked:   d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedUA,
 					BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
 					Hours:         hour24(d.Hours),
 					HourBytes:     hour24(d.HourBytes),
@@ -4970,27 +4474,22 @@ func adminHandler() http.HandlerFunc {
 				})
 				continue
 			}
-			ensureDayMaps(d)
 			for hk, hv := range d.Hosts {
 				hostAll[hk] += hv
 			}
-			hoursCopy := copyInt64Map(d.Hours)
-			hourBytesCopy := copyInt64Map(d.HourBytes)
-			hourUpCopy := copyInt64Map(d.HourUpBytes)
-			hourDownCopy := copyInt64Map(d.HourDownBytes)
-			hostsCopy := copyInt64Map(d.Hosts)
-			ipsCopy := copyInt64Map(d.IPs)
-			ctryCopy := copyInt64Map(d.Countries)
-			pruneTopN(ipsCopy, 100)
-			pruneTopN(ctryCopy, 50)
-			pruneTopN(hostsCopy, 50)
 			trend = append(trend, TrendItem{
 				Date: k, Requests: d.Requests, Bytes: d.Bytes, UpBytes: d.UpBytes, DownBytes: d.DownBytes,
-				Blocked:   d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedRate + d.BlockedUA,
+				Blocked:   d.BlockedCN + d.BlockedWL + d.BlockedBan + d.BlockedUA,
 				BlockedCN: d.BlockedCN, BlockedWL: d.BlockedWL,
-				Hours: hoursCopy, HourBytes: hourBytesCopy,
-				HourUpBytes: hourUpCopy, HourDownBytes: hourDownCopy, Hosts: hostsCopy,
-				IPs: ipsCopy, Countries: ctryCopy,
+				Hours:         hour24(d.Hours),
+				HourBytes:     hour24(d.HourBytes),
+				HourUpBytes:   hour24(d.HourUpBytes),
+				HourDownBytes: hour24(d.HourDownBytes),
+				Hosts:         topNMap(d.Hosts, 50),
+				IPs:           topNMap(d.IPs, 100),
+				Countries:     topNMap(d.Countries, 50),
+				UAClass:       topNMap(d.UAClass, 30),
+				UARaw:         topNMap(d.UARaw, 20),
 			})
 		}
 		sort.Slice(trend, func(i, j int) bool { return trend[i].Date < trend[j].Date })
@@ -5000,8 +4499,8 @@ func adminHandler() http.HandlerFunc {
 			labels[code] = countryName(code)
 		}
 		today := beijingDate(time.Now())
-		todayReqs, todayBytes := stats.TodayRequests, stats.TodayBytes
-		if d := stats.Daily[today]; d != nil {
+		todayReqs, todayBytes := v.todayReqs, v.todayBytes
+		if d := v.daily[today]; d != nil {
 			if todayReqs == 0 {
 				todayReqs = d.Requests
 			}
@@ -5009,57 +4508,45 @@ func adminHandler() http.HandlerFunc {
 				todayBytes = d.Bytes
 			}
 		}
-		reqs, byts := stats.TotalRequests, stats.TotalBytes
-		totalUp, totalDown := stats.TotalUpBytes, stats.TotalDownBytes
-		todayUp, todayDown := stats.TodayUpBytes, stats.TodayDownBytes
-		cn, wl := stats.BlockedCN, stats.BlockedWhitelist
-		ban, rate, ua := stats.BlockedBan, stats.BlockedRate, stats.BlockedUA
-		schemaVersion := stats.SchemaVersion
-		ipUp := copyInt64Map(stats.IPUpBytes)
-		ipDown := copyInt64Map(stats.IPDownBytes)
-		pruneTopN(hostAll, 50)
-		statsMu.Unlock()
+		hostTop := topNMap(hostAll, 50)
 
 		resp := map[string]any{
-			"schema_version": schemaVersion,
-			"total_requests": reqs, "total_bytes": byts,
-			"total_up_bytes": totalUp, "total_down_bytes": totalDown,
-			"today_date": today, "requests": reqs, "bytes": byts,
-			"blocked_cn": cn, "blocked_whitelist": wl,
-			"blocked_ban": ban, "blocked_rate": rate, "blocked_ua": ua,
-			"blocked_total":  cn + wl + ban + rate + ua,
+			"schema_version": v.schemaVersion,
+			"total_requests": v.totalRequests, "total_bytes": v.totalBytes,
+			"total_up_bytes": v.totalUpBytes, "total_down_bytes": v.totalDownBytes,
+			"today_date": today, "requests": v.totalRequests, "bytes": v.totalBytes,
+			"blocked_cn": v.blockedCN, "blocked_whitelist": v.blockedWL,
+			"blocked_ban": v.blockedBan, "blocked_ua": v.blockedUA,
+			"blocked_total":  v.blockedCN + v.blockedWL + v.blockedBan + v.blockedUA,
 			"today_requests": todayReqs, "today_bytes": todayBytes,
-			"today_up_bytes": todayUp, "today_down_bytes": todayDown,
+			"today_up_bytes": v.todayUp, "today_down_bytes": v.todayDown,
 			"trend":        trend,
 			"uptime_sec":   int64(time.Since(startedAt).Seconds()),
 			"stat_dropped": statDropped.Load(),
+			"viewed_at":    beijingRFC3339(v.at),
 		}
 		if slim {
 			resp["unique_ips"] = uniqueIPs
 		} else {
 			resp["ip_counts"] = ips
 			resp["ip_bytes"] = ipBytes
-			resp["ip_up_bytes"] = ipUp
-			resp["ip_down_bytes"] = ipDown
+			resp["ip_up_bytes"] = v.ipUpBytes
+			resp["ip_down_bytes"] = v.ipDownBytes
 			resp["country_counts"] = ctry
 			resp["country_labels"] = labels
-			resp["host_counts"] = hostAll
+			resp["host_counts"] = hostTop
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/admin/api/blocks", func(w http.ResponseWriter, r *http.Request) {
-		limit := 1000
-		if s := r.URL.Query().Get("limit"); s != "" {
-			if n, err := strconv.Atoi(s); err == nil && n >= 0 {
-				limit = n
-			}
-		}
+		limit, offset := pageParams(r, 50)
 		qIP := strings.TrimSpace(r.URL.Query().Get("ip"))
 		qReason := strings.TrimSpace(r.URL.Query().Get("reason"))
 		qSearch := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 		w.Header().Set("Content-Type", "application/json")
-		statsMu.Lock()
-		all := stats.Blocks
+
+		v := currentStatsView()
+		all := v.blocks
 		matched := make([]BlockEvent, 0, len(all))
 		for i := len(all) - 1; i >= 0; i-- {
 			ev := all[i]
@@ -5078,24 +4565,28 @@ func adminHandler() http.HandlerFunc {
 			matched = append(matched, ev)
 		}
 		total := len(matched)
-		n := total
-		if limit > 0 && n > limit {
-			n = limit
+		start := offset
+		if start > total {
+			start = total
 		}
-		items := make([]map[string]any, n)
-		for i := 0; i < n; i++ {
-			ev := matched[i]
+		end := total
+		if limit > 0 && start+limit < end {
+			end = start + limit
+		}
+		page := matched[start:end]
+		items := make([]map[string]any, len(page))
+		for i, ev := range page {
 			items[i] = map[string]any{
 				"time": ev.Time, "ip": ev.IP, "country": ev.Country,
 				"country_name": countryName(ev.Country),
 				"path":         ev.Path, "reason": ev.Reason, "reason_text": ev.ReasonText, "ua": ev.UA,
 			}
 		}
-		statsMu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "returned": len(items), "items": items})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total": total, "returned": len(items), "offset": start, "limit": limit, "items": items,
+		})
 	})
 
-	// 一键将 IP 加入黑名单
 	mux.HandleFunc("/admin/api/ban-ip", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -5135,25 +4626,26 @@ func adminHandler() http.HandlerFunc {
 	})
 
 	mux.HandleFunc("/admin/api/audit", func(w http.ResponseWriter, r *http.Request) {
-		limit := 200
-		if s := r.URL.Query().Get("limit"); s != "" {
-			if n, err := strconv.Atoi(s); err == nil && n > 0 {
-				limit = n
-			}
-		}
+		limit, offset := pageParams(r, 200)
+		qAction := strings.TrimSpace(r.URL.Query().Get("action"))
 		w.Header().Set("Content-Type", "application/json")
-		statsMu.Lock()
-		all := stats.Audit
-		n := len(all)
-		if n > limit {
-			n = limit
+
+		v := currentStatsView()
+		all := v.audit
+		items := make([]AuditEvent, 0, limit)
+		for i := len(all) - 1; i >= 0 && len(items) < limit; i-- {
+			if qAction != "" && all[i].Action != qAction {
+				continue
+			}
+			if offset > 0 {
+				offset--
+				continue
+			}
+			items = append(items, all[i])
 		}
-		items := make([]AuditEvent, n)
-		for i := 0; i < n; i++ {
-			items[i] = all[len(all)-1-i]
-		}
-		statsMu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": items, "total": len(all), "returned": len(items),
+		})
 	})
 	mux.HandleFunc("/admin/api/ip-detail", func(w http.ResponseWriter, r *http.Request) {
 		ip := strings.TrimSpace(r.URL.Query().Get("ip"))
@@ -5162,7 +4654,6 @@ func adminHandler() http.HandlerFunc {
 			return
 		}
 		code, name := ipLabelSync(ip)
-		// IP 归属查询：固定走 ip9.com.cn，失效自动回落 ip-api.com（见 geoFetch）
 		geo := geoEntry{}
 		v, err, _ := geoGroup.Do(ip, func() (interface{}, error) {
 			geoMu.RLock()
@@ -5193,19 +4684,16 @@ func adminHandler() http.HandlerFunc {
 		if geo.City != "" && geo.City != geo.Region {
 			locParts = append(locParts, geo.City)
 		}
-		statsMu.Lock()
-		reqs := stats.IPCounts[ip]
-		upBytes := stats.IPUpBytes[ip]
-		downBytes := stats.IPDownBytes[ip]
-		// 被拦截的 IP 请求不会进入代理统计，IPCounts 恒为 0；
-		// 从拦截事件中统计该 IP 的拦截次数（仅限保留的最近事件窗口内）。
+		sv := currentStatsView()
+		reqs := sv.ipCounts[ip]
+		upBytes := sv.ipUpBytes[ip]
+		downBytes := sv.ipDownBytes[ip]
 		blocked := 0
-		for _, ev := range stats.Blocks {
+		for _, ev := range sv.blocks {
 			if ev.IP == ip {
 				blocked++
 			}
 		}
-		statsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ip": ip, "country": code, "country_name": name,
@@ -5237,14 +4725,12 @@ func adminHandler() http.HandlerFunc {
 			return
 		}
 		setAdminCred(getAdminUser(), nh)
-		// 踢出其他会话，强制重新登录
 		tok := getSessionToken(r)
 		destroyOtherSessions(tok)
 		recordAudit(getClientIP(r), "change_password", "管理员修改了密码")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
-	// 测速链接管理：列出 / 生成 / 删除
 	mux.HandleFunc("/admin/api/speed-tokens", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodGet {
@@ -5298,7 +4784,6 @@ func adminHandler() http.HandlerFunc {
 		http.Error(w, "方法不支持", http.StatusMethodNotAllowed)
 	})
 
-	// 测速结果历史（最新在前，最多 100 条）
 	mux.HandleFunc("/admin/api/speed-results", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodGet {
@@ -5315,7 +4800,6 @@ func adminHandler() http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": list, "total": len(list)})
 	})
 
-	// 数据上报：POST {"action":"test"} 立即上报一次并返回投递结果
 	mux.HandleFunc("/admin/api/report", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost {
@@ -5324,17 +4808,15 @@ func adminHandler() http.HandlerFunc {
 		}
 		var req struct {
 			Action string `json:"action"`
-			ID     string `json:"id"` // action=payload 时指定要取哪条记录的原文
+			ID     string `json:"id"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
 
-		// 查看上报记录列表：不依赖上报开关，未配置地址时也能看到历史
 		if req.Action == "records" {
 			reportRecordsMu.Lock()
 			list := make([]reportRecord, len(reportRecords))
 			copy(list, reportRecords)
 			reportRecordsMu.Unlock()
-			// 最近的在前
 			for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
 				list[i], list[j] = list[j], list[i]
 			}
@@ -5348,7 +4830,6 @@ func adminHandler() http.HandlerFunc {
 			})
 			return
 		}
-		// 取某条记录的原始上报报文：原样返回 JSON 文本，不做任何解析重组
 		if req.Action == "payload" {
 			text, ok := loadReportPayload(req.ID)
 			if !ok {
@@ -5360,22 +4841,20 @@ func adminHandler() http.HandlerFunc {
 				"saved":   true,
 				"id":      req.ID,
 				"size":    len(text),
-				"payload": text, // 字符串原文，前端直接展示
+				"payload": text,
 			})
 			return
 		}
-		// 清空上报记录
 		if req.Action == "clearrec" {
 			reportRecordsMu.Lock()
 			reportRecords = nil
 			persistReportRecordsLocked()
-			clearReportPayloads() // 原文一并清掉，否则库只增不减
+			clearReportPayloads()
 			reportRecordsMu.Unlock()
 			recordAudit(getClientIP(r), "report_clear_records", "清空上报记录")
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 			return
 		}
-		// 补传先前失败的批次
 		if req.Action == "retry" {
 			c := cfgPtr.Load()
 			if c == nil || c.ReportURL == "" {
@@ -5399,8 +4878,6 @@ func adminHandler() http.HandlerFunc {
 			flushReportQueue()
 		}
 		if req.Action == "clear" {
-			// 清空整点快照链（不影响排队中的待重试批次），
-			// 清空后到下一个整点会重新开始记录
 			_ = db.Update(func(tx *bolt.Tx) error {
 				if b := tx.Bucket([]byte("report_queue")); b != nil {
 					return b.Delete([]byte("snaps"))
@@ -5420,8 +4897,6 @@ func adminHandler() http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(map[string]any{"queue": out, "depth": len(q), "url": c.ReportURL, "on": c.ReportOn})
 			return
 		}
-		// 手动上报与自动上报完全同口径：都取上一个完整自然小时的快照差分。
-		// 失败则入队补传，保证数据不丢
 		p, ok := lastFullHourReport()
 		if !ok {
 			http.Error(w, `{"error":"上个小时的快照还没生成（服务刚启动不足一小时），到下一个整点后再试"}`, http.StatusBadRequest)
@@ -5444,7 +4919,6 @@ func adminHandler() http.HandlerFunc {
 			saveReportQueue(list)
 			reportQueueMu.Unlock()
 		}
-		// 无论成败都回显：发送的数据 + 接收端返回，便于后台核对
 		var payloadObj any
 		_ = json.Unmarshal(raw, &payloadObj)
 		w.WriteHeader(http.StatusOK)
@@ -5465,15 +4939,15 @@ func adminHandler() http.HandlerFunc {
 		stats = emptyStats()
 		snap := marshalStatsLocked()
 		statsMu.Unlock()
+		invalidateStatsView()
 		persistStats(snap)
 		recordAudit(getClientIP(r), "clear_stats", "清空全部统计与拦截记录")
-		// 物理清空分桶，避免残留日键
 		if db != nil {
 			_ = db.Update(func(tx *bolt.Tx) error {
 				_ = tx.DeleteBucket([]byte("stats_daily"))
 				_ = tx.DeleteBucket([]byte("stats_meta"))
 				_ = tx.DeleteBucket([]byte("stats_blocks"))
-				_ = tx.DeleteBucket([]byte("stats")) // 旧桶兜底
+				_ = tx.DeleteBucket([]byte("stats"))
 				return nil
 			})
 			statsMu.Lock()
@@ -5483,9 +4957,10 @@ func adminHandler() http.HandlerFunc {
 		}
 		w.Write([]byte(`{"ok":true}`))
 	})
+	registerExtraRoutes(mux)
+
 	mux.HandleFunc("/admin/api/flag/", func(w http.ResponseWriter, r *http.Request) {
 		code := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/admin/api/flag/"))
-		// 本机 / 内网 / 未知：内置 SVG 图标
 		if code == "lo" || code == "pv" || code == "??" || code == "%3f%3f" {
 			w.Header().Set("Content-Type", "image/svg+xml")
 			w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -5507,8 +4982,6 @@ func adminHandler() http.HandlerFunc {
 		}
 		http.Redirect(w, r, "https://flagcdn.com/w40/"+code+".png", http.StatusFound)
 	})
-	// ---------- PWA 静态资源（免鉴权：图标/清单/Worker 不含敏感信息，且安装时浏览器可能无 Cookie 拉取）----------
-	// 图标本地不做任何缓存，直接 302 到源站。
 	mux.HandleFunc("/admin/logo.png", func(w http.ResponseWriter, r *http.Request) {
 		redirectIcon(w, r, iconLogoURL)
 	})
@@ -5528,6 +5001,11 @@ func adminHandler() http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(swSource))
 	})
+	mux.HandleFunc("/admin/chart.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		_, _ = w.Write(chartJS)
+	})
 	mux.HandleFunc("/admin/splash", func(w http.ResponseWriter, r *http.Request) {
 		serveHTML(w, r, splashHTML, "text/html; charset=utf-8", "no-store")
 	})
@@ -5538,10 +5016,14 @@ func adminHandler() http.HandlerFunc {
 		serveHTML(w, r, html, "text/html; charset=utf-8", "no-cache")
 	})
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !adminIPAllowed(getClientIP(r)) {
+			http.Error(w, "当前来源 IP 不在后台允许访问范围内", http.StatusForbidden)
+			return
+		}
 		path := r.URL.Path
 		if path == "/admin/login" || path == "/admin/api/captcha" || path == "/admin/api/login" || path == "/admin/api/logout" ||
 			path == "/admin/splash" || path == "/admin/logo.png" || path == "/admin/icon-192.png" || path == "/admin/icon-512.png" ||
-			path == "/admin/manifest.webmanifest" || path == "/admin/sw.js" {
+			path == "/admin/manifest.webmanifest" || path == "/admin/sw.js" || path == "/admin/chart.js" {
 			mux.ServeHTTP(w, r)
 			return
 		}
@@ -5549,25 +5031,17 @@ func adminHandler() http.HandlerFunc {
 	}
 }
 
-// startGeoDBUpdater 启动时确保本地 IP 库存在，并每 24h 尝试更新一次。
-// 当前使用 phuslu/iploc（已嵌入）；此处预留从网络拉取更新包的扩展点。
 func startGeoDBUpdater() {
 	go func() {
-		// 首次延迟 30s，避免启动高峰
 		time.Sleep(30 * time.Second)
 		for {
-			// 可在此下载新的 iploc 数据或 ip2region.xdb 等
-			// 示例：检查并下载 https://github.com/phuslu/iploc 相关更新
 			log.Println("[geo] local IP database ready (embedded iploc); next check in 24h")
 			time.Sleep(24 * time.Hour)
 		}
 	}()
 }
 
-// runServer 进程入口（systemd：… run -port … -admin-pass …）：
-// 打开 DB → 迁移旧 JSON → 加载配置/统计 → 启动后台协程 → 监听并阻塞等信号。
 func runServer(port int, adminUser, adminPass, dbFile string) {
-	// Transport 与配置无关，只在启动时创建一次（见 newTransport 上方说明）
 	proxyTr.v.Store(newTransport())
 	var err error
 	dbPath = dbFile
@@ -5577,7 +5051,6 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	}
 	defer db.Close()
 
-	// 数据迁移
 	_ = db.Update(func(tx *bolt.Tx) error {
 		cfgB := tx.Bucket([]byte("config"))
 		if cfgB == nil || cfgB.Get([]byte("data")) == nil {
@@ -5603,14 +5076,11 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		return nil
 	})
 
-	// 清理历史版本遗留在数据目录里的本地缓存文件（只保留 emby.db 这一份必要数据库）。
-	// 旧版曾把 geo 结果落盘成 geo_cache.json，现已改为纯内存，直接删除不再保留 .bak。
 	for _, legacy := range []string{"geo_cache.json", "geo_cache.json.bak", "stats.json.bak", "config.json.bak", "admin.pass.bak"} {
 		_ = os.Remove(filepath.Join(filepath.Dir(dbFile), legacy))
 	}
 
 	loadConfig()
-	// 密码：优先使用 DB 中的 bcrypt 哈希；兼容旧明文 admin_pass；无则用启动参数写入哈希
 	var storedHash string
 	var legacyPlain string
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -5657,14 +5127,12 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	startHourlySnapshotWorker()
 	startReportWorker()
 	detectSelfPublicIP()
+	publishStatsView()
 	initSessionsCleanup()
-	startGeoDBUpdater() // 定时更新本地 IP 库
-	// 图标不再预热/缓存：/favicon.ico 与 /admin/*.png 均直接 302 到源站
+	startGeoDBUpdater()
 	defer saveStatsOnce()
 
 	proxy := buildProxy(proxyTr)
-	// 代理主处理：静态资源 → ACL → 地区 → 解析目标 → 白名单 → 反代并记流量
-	// 纯透传：不包装响应，不统计字节
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.png" || r.URL.Path == "/favicon.svg" {
 			redirectIcon(w, r, iconFaviconURL)
@@ -5681,7 +5149,6 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		ip := getClientIP(r)
 		c := currentCfg()
 
-		// 黑名单 & 限流 & UA（ACL 已在保存配置时预编译）；拦截全部记入拦截记录
 		clientIP := net.ParseIP(ip)
 		if isBannedIP(ip, clientIP) {
 			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), "ban", r.UserAgent())
@@ -5694,10 +5161,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
-		// 地区：热路径优先本地库；仅在需要展示名或 ChinaOnly 不确定时再走 geo
 		country := countryOf(ip)
 		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
-			// 本地库已能判定非 CN 时不再同步拉 geo API
 			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent())
 			serveError(w, http.StatusForbidden, "访问被拒绝", "当前请求无法继续。")
 			return
@@ -5714,29 +5179,19 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
-		// CORS 跨域功能已移除：不再注入任何 Access-Control-* 响应头，
-		// 跨域预检（OPTIONS）按普通请求转发到上游，由上游自行决定如何响应。
-		// 注意：这会让部分依赖宽松 CORS 头的播放器无法跨域拉流，属预期行为。
-
-		recordRequestStart(ip, country, target.Host)
+		recordRequestStart(ip, country, target.Host, r.UserAgent())
 
 		concurrent.Add(1)
 		defer concurrent.Add(-1)
 		rb := &reqBytes{ip: ip}
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
 		ctx = withReqBytes(ctx, rb)
-		// 包一层计数 Writer 统计上行字节（本机→客户端）。
-		// Hijack 场景（如内部 WebSocket 升级）不经过这里，但媒体流均为普通 HTTP，
-		// 其计数落点就是客户端的 TCP 写出。
 		proxy.ServeHTTP(&countingWriter{ResponseWriter: w, rb: rb}, r.WithContext(ctx))
-		// 请求结束，按 IP 上报本次上下行字节（累计统计）
 		up, down := rb.up.Load(), rb.down.Load()
 		if up > 0 || down > 0 {
 			select {
 			case statChan <- statEvent{IP: ip, UpBytes: up, DownBytes: down, Bytes: up + down}:
 			default:
-				// 通道满时丢弃必须计数：否则「有请求次数、没有按 IP 流量」
-				// 这种缺口在后台完全看不出来（stat_dropped 永远是 0）。
 				statDropped.Add(1)
 			}
 		}
@@ -5744,7 +5199,6 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	})
 
 	adminSrv := adminHandler()
-	// 管理后台全部走 gzip（HTML/JSON 压缩 70%+，WS 与图片自动跳过）
 	adminGz := gzipMiddleware(adminSrv)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
@@ -5781,7 +5235,6 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	_ = srv.Close()
 }
 
-// main 二进制入口。安装脚本以「emby-proxy run -port … -admin-pass …」拉起。
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "run" {
@@ -5793,14 +5246,1337 @@ func main() {
 	adminPass := fs.String("admin-pass", "", "密码")
 	dbFile := fs.String("db", "/etc/emby-proxy/emby.db", "数据库")
 	_ = fs.Parse(args)
-	// 这里不能强制要求 --admin-pass：首次安装后脚本会把明文密码从 unit 中剥离，
-	// 之后完全依赖数据库里的 admin_pass_hash。若在此 Log.Fatal，
-	// 任何一次重启（update / 系统重启 / systemd 拉起）都会陷入
-	// "必须指定 --admin-pass" → 退出 → Restart=on-failure → 再退出的死循环。
-	// 密码是否可用由 runServer 统一判定（DB 有哈希则无需参数）。
 	runServer(*port, *adminUser, *adminPass, *dbFile)
 }
 GO_SOURCE
+  cat > "$dir/features.go" <<'FEATURES_GO'
+package main
+
+import (
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
+)
+
+func uaClassOf(ua string) string {
+	if strings.TrimSpace(ua) == "" {
+		return "未知"
+	}
+	l := strings.ToLower(ua)
+	switch {
+	case strings.Contains(l, "infuse"):
+		return "Infuse"
+	case strings.Contains(l, "fileball"):
+		return "FileBall"
+	case strings.Contains(l, "senplayer"):
+		return "SenPlayer"
+	case strings.Contains(l, "vidhub"):
+		return "VidHub"
+	case strings.Contains(l, "emby theater") || strings.Contains(l, "embytheater"):
+		return "Emby Theater"
+	case strings.Contains(l, "emby"):
+		return "Emby 客户端"
+	case strings.Contains(l, "jellyfin"):
+		return "Jellyfin 客户端"
+	case strings.Contains(l, "android tv") || strings.Contains(l, "googletv") || strings.Contains(l, "bravia"):
+		return "Android TV"
+	case strings.Contains(l, "appletv") || strings.Contains(l, "apple tv"):
+		return "Apple TV"
+	case strings.Contains(l, "iphone") || strings.Contains(l, "ipad") || strings.Contains(l, "ios") || strings.Contains(l, "cfnetwork"):
+		return "iOS"
+	case strings.Contains(l, "android"):
+		return "Android"
+	case strings.Contains(l, "vlc") || strings.Contains(l, "potplayer") || strings.Contains(l, "mpv") || strings.Contains(l, "kodi"):
+		return "播放器"
+	case strings.Contains(l, "dandanplay"):
+		return "弹弹play"
+	case strings.Contains(l, "yamby"):
+		return "Yamby"
+	case strings.Contains(l, "evermedia"):
+		return "EverMedia"
+	case strings.Contains(l, "nplayer"):
+		return "nPlayer"
+	case strings.Contains(l, "mxplayer"):
+		return "MX Player"
+	case strings.Contains(l, "ffmpeg") || strings.Contains(l, "lavf") || strings.Contains(l, "libav"):
+		return "FFmpeg"
+	case strings.Contains(l, "exoplayer") || strings.Contains(l, "okhttp") || strings.Contains(l, "dalvik"):
+		return "Android 应用"
+	case strings.Contains(l, "mozilla") || strings.Contains(l, "chrome") || strings.Contains(l, "safari") ||
+		strings.Contains(l, "firefox") || strings.Contains(l, "edg"):
+		return "浏览器"
+	case strings.Contains(l, "curl") || strings.Contains(l, "wget") || strings.Contains(l, "python") || strings.Contains(l, "go-http"):
+		return "脚本/探针"
+	default:
+		return "其他"
+	}
+}
+
+type statsView struct {
+	at time.Time
+
+	schemaVersion int
+	lastProxyAt   string
+
+	totalRequests  int64
+	totalBytes     int64
+	totalUpBytes   int64
+	totalDownBytes int64
+
+	todayDate  string
+	todayReqs  int64
+	todayBytes int64
+	todayUp    int64
+	todayDown  int64
+
+	blockedCN  int64
+	blockedWL  int64
+	blockedBan int64
+	blockedUA  int64
+
+	countryCounts map[string]int64
+	ipCounts      map[string]int64
+	ipBytes       map[string]int64
+	ipUpBytes     map[string]int64
+	ipDownBytes   map[string]int64
+
+	daily  map[string]*DayStat
+	blocks []BlockEvent
+	audit  []AuditEvent
+}
+
+var (
+	statsViewPtr   atomic.Pointer[statsView]
+	statsViewMu    sync.Mutex
+	statsViewEvery = 2 * time.Second
+)
+
+func cloneInt64Map(src map[string]int64) map[string]int64 {
+	dst := make(map[string]int64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneDayStat(d *DayStat) *DayStat {
+	if d == nil {
+		return nil
+	}
+	n := *d
+	n.Countries = cloneInt64Map(d.Countries)
+	n.IPs = cloneInt64Map(d.IPs)
+	n.IPBytes = cloneInt64Map(d.IPBytes)
+	n.IPUpBytes = cloneInt64Map(d.IPUpBytes)
+	n.IPDownBytes = cloneInt64Map(d.IPDownBytes)
+	n.Hours = cloneInt64Map(d.Hours)
+	n.HourBytes = cloneInt64Map(d.HourBytes)
+	n.HourUpBytes = cloneInt64Map(d.HourUpBytes)
+	n.HourDownBytes = cloneInt64Map(d.HourDownBytes)
+	n.Hosts = cloneInt64Map(d.Hosts)
+	n.UAClass = cloneInt64Map(d.UAClass)
+	return &n
+}
+
+func buildStatsViewLocked() *statsView {
+	v := &statsView{
+		at:             time.Now(),
+		schemaVersion:  stats.SchemaVersion,
+		lastProxyAt:    stats.LastProxyAt,
+		totalRequests:  stats.TotalRequests,
+		totalBytes:     stats.TotalBytes,
+		totalUpBytes:   stats.TotalUpBytes,
+		totalDownBytes: stats.TotalDownBytes,
+		todayDate:      stats.TodayDate,
+		todayReqs:      stats.TodayRequests,
+		todayBytes:     stats.TodayBytes,
+		todayUp:        stats.TodayUpBytes,
+		todayDown:      stats.TodayDownBytes,
+		blockedCN:      stats.BlockedCN,
+		blockedWL:      stats.BlockedWhitelist,
+		blockedBan:     stats.BlockedBan,
+		blockedUA:      stats.BlockedUA,
+		countryCounts:  cloneInt64Map(stats.CountryCounts),
+		ipCounts:       cloneInt64Map(stats.IPCounts),
+		ipBytes:        cloneInt64Map(stats.IPBytes),
+		ipUpBytes:      cloneInt64Map(stats.IPUpBytes),
+		ipDownBytes:    cloneInt64Map(stats.IPDownBytes),
+		daily:          make(map[string]*DayStat, len(stats.Daily)),
+	}
+	for k, d := range stats.Daily {
+		if d == nil {
+			continue
+		}
+		ensureDayMaps(d)
+		v.daily[k] = cloneDayStat(d)
+	}
+	v.blocks = append([]BlockEvent(nil), stats.Blocks...)
+	v.audit = append([]AuditEvent(nil), stats.Audit...)
+	return v
+}
+
+func publishStatsView() *statsView {
+	statsViewMu.Lock()
+	defer statsViewMu.Unlock()
+	if cur := statsViewPtr.Load(); cur != nil && time.Since(cur.at) < statsViewEvery {
+		return cur
+	}
+	statsMu.Lock()
+	v := buildStatsViewLocked()
+	statsMu.Unlock()
+	statsViewPtr.Store(v)
+	return v
+}
+
+func currentStatsView() *statsView {
+	if v := statsViewPtr.Load(); v != nil && time.Since(v.at) < statsViewEvery {
+		return v
+	}
+	return publishStatsView()
+}
+
+func invalidateStatsView() { statsViewPtr.Store(nil) }
+
+func blockedTotal(v *statsView) int64 {
+	if v == nil {
+		return 0
+	}
+	return v.blockedCN + v.blockedWL + v.blockedBan + v.blockedUA
+}
+
+func adminAllowList(c *Config) []string {
+	if c == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.AdminAllow))
+	for _, s := range c.AdminAllow {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func adminIPAllowed(ipStr string) bool {
+	return adminAllowContains(currentCfg(), ipStr)
+}
+
+func validateAdminAllow(list []string, currentIP string) error {
+	cleaned := make([]string, 0, len(list))
+	for _, s := range list {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if strings.Contains(s, "/") {
+			if _, _, err := net.ParseCIDR(s); err != nil {
+				return fmt.Errorf("“%s”不是合法的 CIDR，例如 192.168.1.0/24", s)
+			}
+		} else if net.ParseIP(s) == nil {
+			return fmt.Errorf("“%s”不是合法的 IP 地址", s)
+		}
+		cleaned = append(cleaned, s)
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	tmp := &Config{AdminAllow: cleaned}
+	if !adminAllowContains(tmp, currentIP) {
+		return fmt.Errorf("当前访问来源 %s 不在列表中，保存后将无法再登录后台；请先把本机 IP 加进去", currentIP)
+	}
+	return nil
+}
+
+func adminAllowContains(c *Config, ipStr string) bool {
+	list := adminAllowList(c)
+	if len(list) == 0 {
+		return true
+	}
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return false
+	}
+	for _, rule := range list {
+		if strings.Contains(rule, "/") {
+			if _, ipnet, err := net.ParseCIDR(rule); err == nil && ipnet.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if r := net.ParseIP(rule); r != nil && r.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func registerExtraRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/admin/api/rules/test", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"方法不支持"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			IP   string `json:"ip"`
+			UA   string `json:"ua"`
+			Host string `json:"host"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+			http.Error(w, `{"error":"请求格式有误"}`, http.StatusBadRequest)
+			return
+		}
+		ip := strings.TrimSpace(req.IP)
+		if ip == "" {
+			ip = getClientIP(r)
+		}
+		if net.ParseIP(ip) == nil {
+			http.Error(w, `{"error":"IP 地址格式无效"}`, http.StatusBadRequest)
+			return
+		}
+		c := currentCfg()
+		ua := req.UA
+		host := strings.TrimSpace(req.Host)
+
+		type step struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Detail string `json:"detail"`
+		}
+		steps := make([]step, 0, 6)
+		final := "pass"
+
+		if isBannedIP(ip, net.ParseIP(ip)) {
+			steps = append(steps, step{"IP 黑名单", "block", "命中黑名单规则（IP 或 CIDR）"})
+			final = "block"
+		} else {
+			steps = append(steps, step{"IP 黑名单", "pass", "未命中"})
+		}
+		if final == "pass" {
+			switch {
+			case len(c.AllowedUAs) == 0:
+				steps = append(steps, step{"UA 白名单", "pass", "未启用（空=不限制）"})
+			case uaAllowed(ua):
+				steps = append(steps, step{"UA 白名单", "pass", "命中白名单关键字"})
+			default:
+				steps = append(steps, step{"UA 白名单", "block", "User-Agent 不包含任何白名单关键字"})
+				final = "block"
+			}
+		}
+		country := countryOf(ip)
+		cname := countryName(country)
+		if final == "pass" {
+			if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
+				steps = append(steps, step{"地区限制", "block", "来源地区为 " + cname + "，不在中国大陆放行范围"})
+				final = "block"
+			} else if c.ChinaOnly {
+				steps = append(steps, step{"地区限制", "pass", "来源地区 " + cname + "，允许访问"})
+			} else {
+				steps = append(steps, step{"地区限制", "pass", "未开启（仅记录来源：" + cname + "）"})
+			}
+		}
+		if final == "pass" {
+			if host == "" {
+				steps = append(steps, step{"域名白名单", "pass", "未填写目标域名，跳过校验"})
+			} else if len(c.Whitelist) == 0 {
+				steps = append(steps, step{"域名白名单", "pass", "未启用（空=不限制）"})
+			} else if whitelistMatch(c.Whitelist, host) {
+				steps = append(steps, step{"域名白名单", "pass", host + " 在白名单内"})
+			} else {
+				steps = append(steps, step{"域名白名单", "block", host + " 不在白名单内"})
+				final = "block"
+			}
+		}
+		if len(adminAllowList(c)) > 0 {
+			if adminAllowContains(c, ip) {
+				steps = append(steps, step{"后台访问限制", "pass", "可访问 /admin"})
+			} else {
+				steps = append(steps, step{"后台访问限制", "block", "不可访问 /admin（仅影响后台，不影响代理）"})
+			}
+		}
+
+		cls := uaClassOfEx(ua)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "ip": ip, "ua": ua, "host": host,
+			"country": country, "country_name": cname, "ua_class": cls,
+			"result": final, "steps": steps,
+		})
+	})
+
+	mux.HandleFunc("/admin/api/backup", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			http.Error(w, "数据库未就绪", http.StatusServiceUnavailable)
+			return
+		}
+		tmp, err := os.CreateTemp("", "emby-backup-*.db")
+		if err != nil {
+			http.Error(w, "创建临时文件失败", http.StatusInternalServerError)
+			return
+		}
+		tmpName := tmp.Name()
+		defer func() { _ = os.Remove(tmpName) }()
+		if err := db.View(func(tx *bolt.Tx) error {
+			_, e := tx.WriteTo(tmp)
+			return e
+		}); err != nil {
+			tmp.Close()
+			http.Error(w, "导出失败："+errString(err), http.StatusInternalServerError)
+			return
+		}
+		if err := tmp.Close(); err != nil {
+			http.Error(w, "导出失败", http.StatusInternalServerError)
+			return
+		}
+		f, err := os.Open(tmpName)
+		if err != nil {
+			http.Error(w, "读取备份失败", http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		fi, _ := f.Stat()
+		name := "emby-" + beijingDate(nowBeijing()) + ".db"
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+		if fi != nil {
+			w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
+		}
+		recordAudit(getClientIP(r), "backup_db", "下载数据库快照")
+		_, _ = io.Copy(w, f)
+	})
+
+	mux.HandleFunc("/admin/api/config/export", func(w http.ResponseWriter, r *http.Request) {
+		b, err := json.MarshalIndent(currentCfg(), "", "  ")
+		if err != nil {
+			http.Error(w, "导出失败", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=\"emby-config-"+
+			beijingDate(nowBeijing())+".json\"")
+		recordAudit(getClientIP(r), "config_export", "导出配置")
+		_, _ = w.Write(b)
+	})
+
+	mux.HandleFunc("/admin/api/config/import", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"方法不支持"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var in Config
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
+			http.Error(w, `{"error":"配置文件不是合法的 JSON"}`, http.StatusBadRequest)
+			return
+		}
+		clientIP := getClientIP(r)
+		if err := validateAdminAllow(in.AdminAllow, clientIP); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		old := currentCfg()
+		in.Port = old.Port
+		if err := saveConfig(&in); err != nil {
+			http.Error(w, `{"error":"写入失败，请检查磁盘"}`, http.StatusInternalServerError)
+			return
+		}
+		cfgPtr.Store(&in)
+		rebuildACL(&in)
+		recordAudit(clientIP, "config_import", "导入配置")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "port_kept": in.Port})
+	})
+
+	mux.HandleFunc("/admin/api/blocks.csv", func(w http.ResponseWriter, r *http.Request) {
+		qIP := strings.TrimSpace(r.URL.Query().Get("ip"))
+		qReason := strings.TrimSpace(r.URL.Query().Get("reason"))
+		qSearch := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+
+		v := currentStatsView()
+		rows := make([][]string, 0, len(v.blocks))
+		for _, ev := range v.blocks {
+			if qIP != "" && ev.IP != qIP {
+				continue
+			}
+			if qReason != "" && ev.Reason != qReason {
+				continue
+			}
+			if qSearch != "" {
+				blob := strings.ToLower(ev.IP + " " + ev.Path + " " + ev.UA + " " + ev.ReasonText + " " + ev.Country)
+				if !strings.Contains(blob, qSearch) {
+					continue
+				}
+			}
+			rows = append(rows, []string{ev.Time, ev.IP, ev.Country, countryName(ev.Country),
+				blockReasonText(ev.Reason), ev.Path, ev.UA})
+		}
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
+
+		name := "blocked-" + beijingDate(nowBeijing()) + ".csv"
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+		_, _ = w.Write([]byte("\xEF\xBB\xBF"))
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"时间", "IP", "国家/地区码", "国家/地区", "拦截原因", "访问路径", "User-Agent"})
+		for _, row := range rows {
+			_ = cw.Write(row)
+		}
+		cw.Flush()
+		recordAudit(getClientIP(r), "blocks_export", fmt.Sprintf("导出拦截记录 %d 条", len(rows)))
+	})
+
+	mux.HandleFunc("/admin/api/ua-stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		from := strings.TrimSpace(r.URL.Query().Get("from"))
+		to := strings.TrimSpace(r.URL.Query().Get("to"))
+		v := currentStatsView()
+		agg := map[string]int64{}
+		for date, d := range v.daily {
+			if d == nil {
+				continue
+			}
+			if from != "" && date < from {
+				continue
+			}
+			if to != "" && date > to {
+				continue
+			}
+			for k, n := range d.UAClass {
+				agg[k] += n
+			}
+		}
+		type kv struct {
+			Name  string `json:"name"`
+			Count int64  `json:"count"`
+		}
+		list := make([]kv, 0, len(agg))
+		var total int64
+		for k, n := range agg {
+			list = append(list, kv{k, n})
+			total += n
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].Count > list[j].Count })
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": list, "total": total})
+	})
+}
+
+func topNMap(m map[string]int64, n int) map[string]int64 {
+	if len(m) == 0 {
+		return map[string]int64{}
+	}
+	if n <= 0 || len(m) <= n {
+		return m
+	}
+	type kv struct {
+		k string
+		v int64
+	}
+	list := make([]kv, 0, len(m))
+	for k, v := range m {
+		list = append(list, kv{k, v})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].v != list[j].v {
+			return list[i].v > list[j].v
+		}
+		return list[i].k < list[j].k
+	})
+	out := make(map[string]int64, n)
+	for i := 0; i < n && i < len(list); i++ {
+		out[list[i].k] = list[i].v
+	}
+	return out
+}
+
+func ensureDir(p string) error { return os.MkdirAll(filepath.Dir(p), 0o755) }
+FEATURES_GO
+  base64 -d <<'CHART_GZ_B64' | gzip -d > "$dir/chart.umd.min.js"
+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
+CHART_GZ_B64
   cat > "$dir/admin.html" <<'ADMIN_HTML'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -5808,12 +6584,11 @@ GO_SOURCE
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>管理后台</title>
-<script defer src="https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script defer src="/admin/chart.js" onerror="this.onerror=null;this.src='https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js'"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--mono:Consolas,monospace;--r:12px}
 body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;height:100dvh;overflow:hidden}
-/* 侧边栏 */
 .sb{width:240px;background:var(--card);border-right:1px solid var(--bd);display:flex;flex-direction:column;transition:transform .3s ease;z-index:100;flex-shrink:0}
 .sb-h{padding:24px 20px 16px;display:flex;align-items:center}
 .sb-brand{min-width:0;display:flex;flex-direction:column;gap:3px}
@@ -5831,7 +6606,6 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .sb-f{padding:14px 20px;border-top:1px solid var(--bd);font-size:12px;color:var(--t3)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;box-shadow:0 0 0 2px rgba(16,185,129,.2)}
 .sb-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.4);z-index:90;opacity:0;transition:opacity .3s ease;border:0;padding:0;cursor:pointer;backdrop-filter:blur(2px)}
-/* 主内容区 */
 .mc{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
 .tb{height:64px;background:var(--card);border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0;z-index:10}
 .tb-l{display:flex;align-items:center;gap:16px}
@@ -5839,24 +6613,19 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .mmb:hover{background:#f1f5f9}
 .tb-t{font-size:18px;font-weight:600;letter-spacing:-.3px}
 .tb-r{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--t2)}
-.chip{display:inline-flex;align-items:center;padding:4px 10px;border-radius:6px;background:#f1f5f9;font-family:var(--mono);font-size:12px;font-weight:500}
-.chip.p{background:var(--ps);color:var(--pd);border:1px solid #dbeafe}
 .sc{flex:1;overflow-y:auto;padding:24px;scroll-behavior:smooth}
 .pg{display:none}
 .pg.on{display:block;animation:fadeUp .3s cubic-bezier(0.16, 1, 0.3, 1) forwards}
 @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-/* 卡片 */
 .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:24px;margin-bottom:24px;box-shadow:0 2px 8px -2px rgba(15,23,42,.04);transition:box-shadow .3s ease, transform .3s ease}
 .card:hover{box-shadow:0 8px 24px -4px rgba(15,23,42,.08);transform:translateY(-2px)}
 .ch{display:flex;justify-content:space-between;margin-bottom:20px;gap:16px;flex-wrap:wrap;align-items:flex-start}
 .ct{font-size:16px;font-weight:600;color:var(--t);letter-spacing:-.2px}
 .cd{font-size:13px;color:var(--t3);margin-top:4px}
-/* 栅格系统 */
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:24px}
 .g2 .card{margin-bottom:0}
 .g3{display:grid;grid-template-columns:2fr 1fr;gap:24px}
 .sg{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:24px}
-/* 状态卡片 */
 .stc{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:20px;position:relative;overflow:hidden;transition:.3s}
 .stc:hover{transform:translateY(-2px);box-shadow:0 6px 16px -4px rgba(0,0,0,.06)}
 .stc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:4px 0 0 4px}
@@ -5865,14 +6634,12 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .sv{font-size:28px;font-weight:700;margin:8px 0 6px;font-variant-numeric:tabular-nums;letter-spacing:-1px;line-height:1.1;color:var(--t)}
 .ss{font-size:12px;color:var(--t3);display:flex;justify-content:space-between;align-items:center}
 .ss b{font-weight:600;color:var(--t2)}
-/* 表单控件 */
 .fi{margin-bottom:20px}
 .fl{display:block;font-size:13px;font-weight:600;margin-bottom:8px;color:var(--t2)}
 .inp,.tarea{width:100%;padding:12px 16px;font-size:14px;background:#f8fafc;border:1px solid var(--bd);border-radius:10px;font-family:inherit;outline:none;transition:.2s}
 .inp:focus,.tarea:focus{background:#fff;border-color:var(--p);box-shadow:0 0 0 4px var(--ps)}
 .inp.m,.tarea{font-family:var(--mono);font-size:13px}
 .tarea{resize:vertical;min-height:100px;line-height:1.6}
-/* 按钮 */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 18px;border-radius:10px;font-size:14px;font-weight:500;cursor:pointer;border:1px solid transparent;font-family:inherit;transition:all .2s;white-space:nowrap}
 .btn:active{transform:scale(.97)}
 .btn.b{background:var(--p);color:#fff;box-shadow:0 2px 4px rgba(59,130,246,.2)}
@@ -5883,36 +6650,29 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .btn.s{padding:8px 14px;font-size:13px}
 .btn.d:hover{background:#fee2e2}
 .acts{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:16px}
-/* 行内设置 */
 .row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 0;border-top:1px solid var(--bd)}
 .row:first-child{border-top:0;padding-top:0}
 .rl{font-size:14px;font-weight:600;color:var(--t)}
 .rd{font-size:13px;color:var(--t3);margin-top:4px}
-/* 开关 */
 .sw{position:relative;width:48px;height:28px;flex-shrink:0}
 .sw input{opacity:0;width:0;height:0}
 .tr2{position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:99px;transition:.3s cubic-bezier(0.4, 0, 0.2, 1)}
 .tr2::after{content:"";position:absolute;height:22px;width:22px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s cubic-bezier(0.4, 0, 0.2, 1);box-shadow:0 1px 3px rgba(0,0,0,.15)}
 .sw input:checked+.tr2{background:var(--p)}
 .sw input:checked+.tr2::after{transform:translateX(20px)}
-/* 其他 */
 .hint{font-size:12.5px;color:var(--t3);margin-top:8px;line-height:1.6}
 .emp{padding:48px 20px;text-align:center;color:var(--t3);font-size:14px}
 .emp b{display:block;color:var(--t2);font-size:15px;margin-bottom:6px}
-/* 拦截原因标签：五类拦截（地区/白名单/黑名单/限流/UA）统一配色 */
 .pill{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:1.4;white-space:nowrap}
 .pill.pc{background:#fff7ed;color:#c2410c;border:1px solid #fed7aa}
 .pill.pw{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
 .pill.pb{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
-.pill.pl{background:#fdf4ff;color:#a21caf;border:1px solid #f5d0fe}
 .pill.pu{background:#ecfeff;color:#0e7490;border:1px solid #a5f3fc}
 .flg{width:22px;height:16px;object-fit:cover;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.08);background:#e2e8f0;margin-right:8px;vertical-align:middle}
-/* 分段器 */
 .flt{display:inline-flex;background:#f1f5f9;padding:4px;border-radius:12px;border:1px solid var(--bd);gap:4px;align-items:center;flex-wrap:wrap}
 .filter{border:0;background:transparent;color:var(--t2);padding:8px 16px;border-radius:8px;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;transition:all .2s ease}
 .filter:hover{color:var(--t)}
 .filter.on{background:#ffffff;color:var(--pd);font-weight:600;box-shadow:0 2px 4px rgba(0,0,0,.05),0 1px 2px rgba(0,0,0,.05)}
-/* 进度条 */
 .dr{display:flex;align-items:center;gap:12px;padding:10px 0;flex-wrap:nowrap}
 .dn{width:110px;flex-shrink:0;display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden}
 .dn .tx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -5922,9 +6682,7 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
 .dv{width:80px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0;white-space:nowrap}
 .dv span{color:var(--t3);font-size:12px;margin-left:4px;font-weight:normal}
-/* IP 排行的流量列：独立于次数列，固定宽度右对齐，空值占位保证各行右边缘对齐 */
 .dbt{width:74px;flex-shrink:0;text-align:right;font-size:11.5px;color:var(--t3);font-weight:normal;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* 表格 */
 .table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--bd);-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;text-align:left;min-width:600px}
 th{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:12.5px;font-weight:600;color:var(--t2);background:#f8fafc;white-space:nowrap}
@@ -5933,7 +6691,6 @@ tbody tr:last-child td{border-bottom:0}
 tbody tr:hover td{background:#f8fafc}
 .cell-v{display:inline}
 td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
-/* 弹窗 */
 .mo{position:fixed;inset:0;z-index:1000;display:none;background:rgba(15,23,42,.5);padding:20px;overflow-y:auto;backdrop-filter:blur(4px)}
 .mo.on{display:flex;align-items:center;justify-content:center;animation:moFadeIn .2s ease}
 @keyframes moFadeIn{from{opacity:0}to{opacity:1}}
@@ -5949,7 +6706,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .kk{width:70px;flex-shrink:0;color:var(--t3)}
 .kvv{flex:1;word-break:break-all;font-weight:500;color:var(--t)}
 .kvv.m{font-family:var(--mono);font-size:13px}
-/* --- 系统信息卡片 --- */
 .svg-title{font-size:11.5px;font-weight:600;letter-spacing:.4px;color:var(--t3);text-transform:uppercase;margin:0 0 8px}
 .sv-list + .svg-title{margin-top:16px}
 .kvr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px dashed var(--bd);font-size:13px;min-width:0}
@@ -5957,7 +6713,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .kvl{color:var(--t3);font-size:12.5px;flex-shrink:0;line-height:1.4}
 .kvv{font-weight:600;color:var(--t);text-align:right;min-width:0;word-break:break-word;line-height:1.4;font-variant-numeric:tabular-nums}
 
-/* --- 响应式适配 --- */
 @media(max-width:1024px){
   .sb{position:fixed;top:0;bottom:0;left:0;transform:translateX(-100%);box-shadow:20px 0 40px rgba(0,0,0,.1)}
   .sb.open{transform:translateX(0)}
@@ -6024,7 +6779,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   .sb{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
 }
 
-/* ===== 美化增强 + 手机端优化 ===== */
 .card{box-shadow:0 1px 3px rgba(15,23,42,.04),0 4px 12px -2px rgba(15,23,42,.05);transition:box-shadow .25s ease,transform .25s ease}
 .card:hover{box-shadow:0 4px 16px -2px rgba(15,23,42,.08);transform:translateY(-1px)}
 .stc{border-radius:14px;transition:transform .2s ease}
@@ -6036,7 +6790,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .inp,.tarea{border-radius:10px;transition:border-color .2s,box-shadow .2s}
 .inp:focus,.tarea:focus{box-shadow:0 0 0 3px var(--ps)}
 
-/* 手机端进一步优化 */
 @media(max-width:600px){
   body{font-size:15px}
   .tb{height:52px;box-shadow:0 1px 0 var(--bd)}
@@ -6057,15 +6810,11 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   .btn.s{min-height:34px;padding:6px 12px}
   .inp,.tarea{min-height:42px;padding:10px 12px}
   .row{padding:12px 0}
-  /* 表格卡片化已有，增强间距 */
   tr{margin-bottom:10px;border-radius:14px}
   td{padding:8px 12px}
-  /* 底部安全区 */
   .sc{padding-bottom:max(20px,env(safe-area-inset-bottom))}
-  /* 侧边栏更宽一点方便点击 */
   .sb{width:min(280px,85vw)}
   .nav-i{padding:12px 14px;font-size:15px}
-  /* 模态框全屏感 */
   .mbox{border-radius:16px 16px 0 0;max-height:88dvh}
   .mo{align-items:flex-end;padding:0}
 }
@@ -6074,7 +6823,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   .sv{font-size:22px}
 }
 
-/* ===== 数据上报页 ===== */
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:12px;margin-bottom:4px}
 .stat-b{background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:12px 14px}
 .stat-b .k{font-size:12px;color:var(--t3);margin-bottom:4px}
@@ -6092,6 +6840,105 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .rp-row:hover td{background:#f8fafc}
 .rp-pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px;font:12px/1.6 var(--mono);overflow:auto;max-height:300px;white-space:pre-wrap;word-break:break-all;margin-top:6px}
 .pgbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;font-size:12.5px;color:var(--t3);flex-wrap:wrap}
+
+.tbtn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:9px;border:1px solid var(--bd);background:var(--card);color:var(--t2);cursor:pointer;font-size:15px;transition:.2s;padding:0}
+.tbtn:hover{background:#f1f5f9;color:var(--t)}
+html[data-theme="dark"] .tbtn:hover{background:#17243a}
+
+html[data-theme="dark"]{--bg:#0b1220;--card:#111a2b;--bd:#1f2b3d;--t:#e6edf7;--t2:#a8b6c9;--t3:#71809a;--p:#3b82f6;--pd:#7db2ff;--ps:#152742;--d:#f87171;--w:#fbbf24;--ok:#34d399}
+html[data-theme="dark"] body{background:var(--bg)}
+html[data-theme="dark"] .card,html[data-theme="dark"] .tb,html[data-theme="dark"] .sb,html[data-theme="dark"] .stc{background:var(--card)}
+html[data-theme="dark"] .card:hover{box-shadow:0 4px 16px -2px rgba(0,0,0,.45)}
+html[data-theme="dark"] .btn.g{background:var(--card);color:var(--t2);border-color:var(--bd)}
+html[data-theme="dark"] .btn.g:hover{background:#17243a;color:var(--t)}
+html[data-theme="dark"] .btn.d{background:#2a1418;border-color:#4c2027;color:#fca5a5}
+html[data-theme="dark"] .btn.d:hover{background:#361a1f}
+html[data-theme="dark"] .inp,html[data-theme="dark"] .tarea{background:#0e1726;color:var(--t);border-color:var(--bd)}
+html[data-theme="dark"] .inp:focus,html[data-theme="dark"] .tarea:focus{background:#0e1726;border-color:var(--p);box-shadow:0 0 0 4px rgba(59,130,246,.15)}
+html[data-theme="dark"] th{background:#0e1726;color:var(--t2)}
+html[data-theme="dark"] td{color:var(--t2)}
+html[data-theme="dark"] tbody tr:hover td{background:#152136}
+html[data-theme="dark"] .flt{background:#0e1726}
+html[data-theme="dark"] .filter{color:var(--t2)}
+html[data-theme="dark"] .filter.on{background:#1b2a42;color:#9ec5ff}
+html[data-theme="dark"] .mo{background:rgba(2,6,15,.72)}
+html[data-theme="dark"] .mbox{background:var(--card)}
+html[data-theme="dark"] .mh,html[data-theme="dark"] .kv,html[data-theme="dark"] .kvr{border-color:var(--bd)}
+html[data-theme="dark"] .mcl,html[data-theme="dark"] .mmb{background:#17243a;color:var(--t2)}
+html[data-theme="dark"] .bar{background:#1b2a42}
+html[data-theme="dark"] .nav-i:hover{background:#17243a;color:var(--t)}
+html[data-theme="dark"] .nav-i.on{background:var(--ps);color:#9ec5ff}
+html[data-theme="dark"] tr{border-color:var(--bd)}
+html[data-theme="dark"] .table-wrap{border-color:var(--bd)}
+html[data-theme="dark"] .pill.pc{background:#3a2415;color:#fdba74;border-color:#5a3a1d}
+html[data-theme="dark"] .pill.pw{background:#12274a;color:#93c5fd;border-color:#1e3f70}
+html[data-theme="dark"] .pill.pb{background:#331519;color:#fca5a5;border-color:#57242b}
+html[data-theme="dark"] .pill.pu{background:#0d2b33;color:#67e8f9;border-color:#164e5c}
+html[data-theme="dark"] .pill.pg{background:#0f2d22;color:#6ee7b7;border-color:#1b5340}
+html[data-theme="dark"] .stat-b{border-color:var(--bd)}
+html[data-theme="dark"] .rp-pre{background:#0a1220;color:#c7d4e6}
+html[data-theme="dark"] .act-tag{background:#17243a;color:var(--t2)}
+html[data-theme="dark"] .hm-cell{background:#0e1726}
+html[data-theme="dark"] .dr:hover{background:transparent}
+
+.act-tag{display:inline-flex;align-items:center;padding:2px 9px;border-radius:6px;background:#f1f5f9;color:var(--t2);font-size:12px;font-weight:500;white-space:nowrap}
+.act-tag.warn{background:#fff7ed;color:#c2410c}
+html[data-theme="dark"] .act-tag.warn{background:#3a2415;color:#fdba74}
+
+.tl{display:grid;gap:0;margin-top:4px}
+.tl-i{display:flex;gap:12px;padding:11px 0;border-bottom:1px dashed var(--bd);font-size:13.5px}
+.tl-i:last-child{border-bottom:0}
+.tl-d{width:10px;height:10px;border-radius:50%;margin-top:6px;flex-shrink:0}
+.tl-i.pass .tl-d{background:var(--ok)}
+.tl-i.block .tl-d{background:var(--d)}
+.tl-n{font-weight:600;color:var(--t);min-width:96px;flex-shrink:0}
+.tl-v{color:var(--t2);flex:1;word-break:break-word}
+.tl-res{margin-top:14px;padding:12px 14px;border-radius:10px;font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px}
+.tl-res.pass{background:#ecfdf5;color:#047857;border:1px solid #b7e8d5}
+.tl-res.block{background:#fef2f2;color:#b91c1c;border:1px solid #fbd5d5}
+html[data-theme="dark"] .tl-res.pass{background:#0d2b22;color:#6ee7b7;border-color:#1b5340}
+html[data-theme="dark"] .tl-res.block{background:#331519;color:#fca5a5;border-color:#57242b}
+
+.hm{display:grid;grid-template-columns:56px repeat(24,1fr);gap:3px;font-size:11px;align-items:center;min-width:0}
+.hm-h{color:var(--t3);text-align:center;font-variant-numeric:tabular-nums;font-size:10.5px;overflow:hidden}
+.hm-d{color:var(--t2);font-size:11.5px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.hm-cell{height:22px;border-radius:4px;background:#f1f5f9;position:relative;cursor:default;transition:transform .12s ease}
+.hm-cell:hover{transform:scale(1.12);z-index:2;box-shadow:0 2px 8px rgba(0,0,0,.18)}
+.hm-wrap{overflow-x:auto;padding-bottom:4px}
+.hm-legend{display:flex;align-items:center;gap:6px;margin-top:12px;font-size:11.5px;color:var(--t3);justify-content:flex-end}
+.hm-legend i{width:16px;height:10px;border-radius:2px;display:inline-block}
+
+.set-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+.set-tab{padding:8px 18px;border-radius:9px;border:1px solid var(--bd);background:var(--card);color:var(--t2);font-size:13.5px;font-weight:500;cursor:pointer;transition:.15s}
+.set-tab:hover{color:var(--t);border-color:#c9d6e8}
+.set-tab.on{background:var(--p);border-color:var(--p);color:#fff}
+html[data-theme="dark"] .set-tab:hover{border-color:#33507e}
+.bk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:20px;max-width:960px}
+.bk-card{display:flex;flex-direction:column;margin-bottom:0;padding:22px;transition:box-shadow .2s,transform .2s,border-color .2s}
+.bk-card:hover{transform:translateY(-2px);border-color:#c9d6e8;box-shadow:0 8px 24px rgba(15,23,42,.08)}
+html[data-theme="dark"] .bk-card:hover{border-color:#33507e;box-shadow:0 8px 24px rgba(0,0,0,.35)}
+.bk-ic{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+.bk-ic svg{width:21px;height:21px}
+.bk-ic-a{background:rgba(59,130,246,.1);color:var(--p)}
+.bk-ic-b{background:rgba(16,185,129,.12);color:#0ea371}
+.bk-ic-c{background:rgba(245,158,11,.14);color:#d97706}
+html[data-theme="dark"] .bk-ic-b{color:#34d399}
+html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
+.bk-t{font-size:15px;font-weight:600;color:var(--t);margin-bottom:6px}
+.bk-d{font-size:12.5px;line-height:1.7;color:var(--t3);flex:1}
+.bk-btn{margin-top:16px;align-self:flex-start;gap:7px;padding:9px 16px;font-size:13px}
+.bk-btn .bk-dl{width:14px;height:14px}
+
+.ua-raw{margin-top:10px;padding:10px 12px;background:var(--bg);border:1px solid var(--bd);border-radius:8px}
+.ua-raw-h{font-size:12px;color:var(--t2);font-weight:600;margin-bottom:8px}
+.ua-raw-i{display:flex;gap:10px;align-items:baseline;padding:4px 0;font-size:12px;border-top:1px dashed var(--bd)}
+.ua-raw-i:first-of-type{border-top:0}
+.ua-raw-n{min-width:52px;text-align:right;color:var(--t3);font-variant-numeric:tabular-nums;flex-shrink:0}
+.ua-raw-u{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--t2);word-break:break-all;font-size:11.5px}
+
+.pgbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;font-size:12.5px;color:var(--t3);flex-wrap:wrap}
+.pgbar .acts{margin-top:0}
+@media(max-width:600px){.hm{grid-template-columns:44px repeat(24,1fr);gap:2px}.hm-cell{height:16px}}
 </style>
 </head>
 <body>
@@ -6105,8 +6952,9 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <li><button class="nav-i on" data-t="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>概览</button></li>
 <li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量请求</button></li>
 <li><button class="nav-i" data-t="realtime"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>实时监控</button></li>
-<li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
 <li><button class="nav-i" data-t="speedm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>测速管理</button></li>
+<li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
+<li><button class="nav-i" data-t="audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/></svg>操作审计</button></li>
 <li><button class="nav-i" data-t="report"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5-7 5 7"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>数据上报</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
@@ -6118,7 +6966,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="mc">
 <header class="tb">
 <div class="tb-l"><button class="mmb" id="mmb">☰</button><h1 class="tb-t" id="pt">概览</h1></div>
-<div class="tb-r"><span class="chip p" id="portChip">:—</span></div>
+<div class="tb-r"><button type="button" class="tbtn" id="themeBtn" title="切换深色/浅色" aria-label="切换主题">◐</button></div>
 </header>
 <div class="sc">
 <section id="overview" class="pg on">
@@ -6200,6 +7048,10 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 <div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="ipDist"></div></div>
 <div class="card"><div class="ch"><div><h2 class="ct">地区来源分布</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="regionDist"></div></div>
 </div>
+<div class="g2" style="margin-top:22px">
+<div class="card"><div class="ch"><div><h2 class="ct">客户端分布</h2><div class="cd">按 User-Agent 归类 · 点击行查看原始 UA 采样，识别「其他」里的请求</div></div></div><div id="uaDist"></div></div>
+<div class="card"><div class="ch"><div><h2 class="ct">时段热力图</h2><div class="cd" id="hourHeatSub">粒度随时间范围变化：单日按小时 · ≤31 天按天 · 更长按月</div></div></div><div class="hm-wrap" id="hourHeat"></div></div>
+</div>
 </section>
 <section id="realtime" class="pg">
 <div class="sg" style="margin-bottom:18px">
@@ -6219,7 +7071,7 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </section>
 <section id="blocks" class="pg">
 <div class="card">
-<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区、白名单、限流或 UA 策略被拒绝的请求 · 每 5 秒自动刷新</div></div></div>
+<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区、白名单或 UA 策略被拒绝的请求 · 服务端分页 · 每 5 秒自动刷新</div></div></div>
 <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;align-items:center">
   <input id="blkQ" class="inp m" type="search" placeholder="搜索 IP / 路径 / UA" style="max-width:220px">
   <select id="blkReason" class="inp m" style="width:auto;max-width:160px">
@@ -6227,7 +7079,6 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
     <option value="cn">地区限制</option>
     <option value="whitelist">域名未授权</option>
     <option value="ban">IP 黑名单</option>
-    <option value="rate_limit">触发限流</option>
     <option value="ua">UA 不允许</option>
     <option value="login_fail">登录失败</option>
   </select>
@@ -6235,30 +7086,76 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
   <button type="button" class="btn b s" id="blkFilterBtn">筛选</button>
   <button type="button" class="btn g s" id="blkResetBtn">重置</button>
   <span id="blkCount" style="font-size:12.5px;color:var(--t3)"></span>
+  <span style="flex:1"></span>
+  <button type="button" class="btn g s" id="blkExport">导出 CSV</button>
 </div>
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
-</div>
-</section>
-<section id="speedm" class="pg">
-<div class="g2">
-  <div style="display:flex;flex-direction:column;gap:24px;">
-    <div class="card" style="margin-bottom:0;">
-      <div class="ch"><div><h2 class="ct">测速链接</h2><div class="cd">生成可视化测速页链接（类似 Speedtest），可限制使用次数</div></div></div>
-      <div class="fi"><label class="fl">可使用次数</label>
-        <div style="display:flex;gap:12px;align-items:center">
-          <input id="spdUses" class="inp m" type="number" min="1" max="10000" value="5" style="max-width:120px">
-          <button class="btn b" id="spdCreate">生成链接</button>
-        </div>
-      </div>
-      <div id="spdList" style="display:grid;gap:10px"></div>
+  <div class="pgbar">
+    <span id="blkPageInfo"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn g s" id="blkPrev">上一页</button>
+      <button class="btn g s" id="blkNext">下一页</button>
     </div>
   </div>
+</div>
+</section>
 
-  <div class="card" style="margin-bottom:0;">
-    <div class="ch"><div><h2 class="ct">测速结果</h2><div class="cd">最多保留最近 100 条，重启不丢失</div></div></div>
-    <div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th><th>延迟</th><th>抖动</th><th>下载</th><th>上传</th><th>评级</th></tr></thead><tbody id="spdResBody"></tbody></table></div>
+<section id="audit" class="pg">
+<div class="card">
+  <div class="ch">
+    <div><div class="cd" style="font-size:13px;color:var(--t2)">登录、改密、保存配置、拉黑 IP、上报与清空等后台动作留痕 · 保留最近 1000 条</div></div>
+    <button type="button" class="btn g s" id="auditRefresh">刷新</button>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;align-items:center">
+    <select id="auditAction" class="inp m" style="width:auto;max-width:180px">
+      <option value="">全部动作</option>
+      <option value="login">登录</option>
+      <option value="change_password">修改密码</option>
+      <option value="save_config">保存配置</option>
+      <option value="ban_ip">拉黑 IP</option>
+      <option value="clear_stats">清空统计</option>
+      <option value="speed_create">生成测速链接</option>
+      <option value="speed_delete">删除测速链接</option>
+      <option value="report_test">手动上报</option>
+      <option value="report_retry">补传上报</option>
+      <option value="report_clear">清空上报快照</option>
+      <option value="report_clear_records">清空上报记录</option>
+      <option value="backup_db">下载备份</option>
+      <option value="config_export">导出配置</option>
+      <option value="config_import">导入配置</option>
+      <option value="blocks_export">导出拦截记录</option>
+    </select>
+    <span id="auditCount" style="font-size:12.5px;color:var(--t3)"></span>
+  </div>
+  <div class="table-wrap">
+    <table><thead><tr><th>时间</th><th>动作</th><th>详情</th><th>来源 IP</th></tr></thead><tbody id="auditBody"></tbody></table>
+  </div>
+  <div class="pgbar">
+    <span id="auditPageInfo"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn g s" id="auditPrev">上一页</button>
+      <button class="btn g s" id="auditNext">下一页</button>
+    </div>
   </div>
 </div>
+</section>
+
+<section id="speedm" class="pg">
+  <div class="card" style="margin-bottom:24px">
+    <div class="ch">
+      <div><h2 class="ct">测速链接</h2><div class="cd">生成可视化测速页链接（类似 Speedtest）· 链接 7 天后自动过期，单文件占 1 次使用次数</div></div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <input id="spdUses" class="inp m" type="number" min="1" max="10000" value="5" style="width:90px" title="可使用次数">
+        <button class="btn b" id="spdCreate">生成链接</button>
+      </div>
+    </div>
+    <div id="spdList" style="display:grid;gap:10px"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:0">
+    <div class="ch"><div><h2 class="ct">测速结果</h2><div class="cd">最多保留最近 100 条 · 重启不丢失</div></div></div>
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th><th>延迟</th><th>抖动</th><th>下载</th><th>上传</th><th>评级</th></tr></thead><tbody id="spdResBody"></tbody></table></div>
+  </div>
 </section>
 <section id="report" class="pg">
 <div class="card">
@@ -6326,17 +7223,34 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 </div>
 </section>
 <section id="settings" class="pg">
-<div class="g2">
-  <div style="display:flex;flex-direction:column;gap:24px;">
+<div class="set-tabs" role="tablist">
+  <button type="button" class="set-tab on" data-st="acl">访问控制</button>
+  <button type="button" class="set-tab" data-st="base">网关与账号</button>
+  <button type="button" class="set-tab" data-st="rule">规则测试</button>
+  <button type="button" class="set-tab" data-st="ops">备份迁移</button>
+</div>
+
+<div class="set-pane" id="pane-acl">
+  <div class="card" style="margin-bottom:0;">
+    <div class="ch"><div><h2 class="ct">安全与访问控制</h2><div class="cd">代理转发的准入规则；保存后立即生效并预编译匹配</div></div></div>
+    <div class="row"><div><div class="rl">仅允许中国大陆 IP</div><div class="rd">非大陆来源将被拒绝</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
+    <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
+    <div class="fi"><label class="fl">域名白名单</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
+    <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
+    <div class="fi"><label class="fl">后台访问来源</label><div class="hint" style="margin-bottom:8px">留空表示不限制；填写后只有这些 IP/CIDR 能打开管理后台（不影响代理转发）。保存时会校验本机 IP 是否在列表内，避免把自己锁在门外。</div><textarea id="adminAllow" class="tarea" style="min-height:70px" placeholder="192.168.1.0/24&#10;203.0.113.8"></textarea></div>
+    <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
+  </div>
+</div>
+
+<div class="set-pane" id="pane-base" style="display:none">
+  <div class="g2">
     <div class="card" style="margin-bottom:0;">
       <div class="ch"><div><h2 class="ct">基础服务设置</h2></div></div>
       <div class="fi"><label class="fl">监听端口</label><div style="display:flex;gap:12px;align-items:center"><input id="portInput" class="inp m" type="number" style="max-width:140px"><button class="btn b" id="savePort">保存并重启监听</button></div></div>
-      <div class="row"><div><div class="rl">PWA 安装</div><div class="rd">后台已内置 PWA，可安装到手机/电脑桌面，全屏运行</div></div><button type="button" class="btn b s" id="pwaInstallBtn">安装应用</button></div>
     </div>
 
-    
     <div class="card" style="border-color:#fecaca;margin-bottom:0;">
-      <div class="ch"><div><h2 class="ct" style="color:var(--d)">安全设置</h2></div></div>
+      <div class="ch"><div><h2 class="ct" style="color:var(--d)">账号与数据</h2></div></div>
       <div class="fi"><label class="fl">修改管理密码</label>
         <div style="display:grid;gap:10px">
           <input id="oldPass" class="inp m" type="password" placeholder="当前密码">
@@ -6347,33 +7261,73 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
       <div class="row" style="margin-top:20px"><div><div class="rl" style="color:var(--d)">清空统计数据</div><div class="rd">将删除请求、流量与拦截记录，不可恢复</div></div><button class="btn d" id="clearStatsBtn">清空数据</button></div>
     </div>
   </div>
-  
-  <div class="card" style="margin-bottom:0;">
-    <div class="ch"><div><h2 class="ct">安全与访问控制</h2></div></div>
-    <div class="row"><div><div class="rl">仅允许中国大陆 IP</div><div class="rd">非大陆来源将被拒绝</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
-    <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
-    <div class="fi"><label class="fl">域名白名单</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
-    <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
-    <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
+</div>
+
+<div class="set-pane" id="pane-rule" style="display:none">
+  <div class="g2">
+    <div class="card" style="margin-bottom:0">
+      <div class="ch"><div><h2 class="ct">规则命中测试</h2><div class="cd">按当前配置跑一遍判定链，调白名单/UA 时不用拿播放器反复试</div></div></div>
+      <div class="fi"><label class="fl">来源 IP</label><input id="rtIP" class="inp m" placeholder="留空则用当前浏览器出口 IP"></div>
+      <div class="fi"><label class="fl">目标上游</label><input id="rtHost" class="inp m" placeholder="例如 emby.example.com:8096"></div>
+      <div class="fi"><label class="fl">User-Agent</label><textarea id="rtUA" class="tarea" style="min-height:70px" placeholder="粘贴客户端的 UA，例如 Infuse/7.8 (iPhone; iOS 17.0)"></textarea></div>
+      <div class="acts"><button class="btn b" id="rtRun">开始测试</button><button class="btn g" id="rtFillUA">填入本浏览器 UA</button></div>
+      <div id="rtResult" style="margin-top:6px"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:0;align-self:start">
+      <div class="ch"><div><h2 class="ct">判定链顺序</h2><div class="cd">请求按以下顺序依次校验，命中即拦截</div></div></div>
+      <div class="tl">
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">IP 黑名单</div><div class="tl-v">来源 IP 精确匹配或命中 CIDR 段</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">地区限制</div><div class="tl-v">开启「仅允许中国大陆 IP」时，非大陆来源被拒</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">域名白名单</div><div class="tl-v">目标域名需匹配白名单（支持根域名），空=不限制</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">UA 白名单</div><div class="tl-v">客户端 UA 需包含白名单关键字，空=不限制</div></div>
+        <div class="tl-i pass"><div class="tl-d"></div><div class="tl-n">放行转发</div><div class="tl-v">全部通过后反代到上游，并计入流量统计</div></div>
+      </div>
+      <div class="hint" style="margin-top:14px">被拦截的请求可在「拦截记录」页查看明细，操作变更可在「操作审计」页追溯。</div>
+    </div>
   </div>
+</div>
+
+<div class="set-pane" id="pane-ops" style="display:none">
+  <div class="bk-grid">
+    <div class="card bk-card">
+      <div class="bk-ic bk-ic-a"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/></svg></div>
+      <div class="bk-t">数据库快照</div>
+      <div class="bk-d">在线导出 bolt 库，包含配置、统计数据与账号信息，可直接用于完整恢复或整机搬迁。</div>
+      <button class="btn g bk-btn" id="btnBackup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="bk-dl"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>下载 .db</button>
+    </div>
+    <div class="card bk-card">
+      <div class="bk-ic bk-ic-b"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><polyline points="12 18 12 12"/><polyline points="9 15 12 18 15 15"/></svg></div>
+      <div class="bk-t">导出配置</div>
+      <div class="bk-d">仅导出网关配置项（JSON），体积小、易读，适合快速搬到另一台机器或留档比对。</div>
+      <button class="btn g bk-btn" id="btnExportCfg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="bk-dl"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>下载 JSON</button>
+    </div>
+    <div class="card bk-card">
+      <div class="bk-ic bk-ic-c"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><polyline points="12 12 12 18"/><polyline points="9 15 12 12 15 15"/></svg></div>
+      <div class="bk-t">导入配置</div>
+      <div class="bk-d">选择之前导出的 JSON 覆盖当前网关设置，监听端口保持不变，导入成功后自动刷新。</div>
+      <label class="btn g bk-btn" style="cursor:pointer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="bk-dl"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>选择文件<input type="file" id="importCfgFile" accept=".json,application/json" style="display:none"></label>
+    </div>
+  </div>
+  <div id="backupMsg" style="margin-top:14px;font-size:12.5px;color:var(--t3);word-break:break-all;max-width:960px"></div>
 </div>
 </section>
 </div>
 </div>
 <div class="mo" id="modal"><div class="mbox"><div class="mh"><h3 id="modalTitle">记录详情</h3><button class="mcl" id="modalClose">×</button></div><div class="mb" id="modalBody"></div></div></div>
 <script>
-/* ========== 管理后台前端逻辑 ==========
- * 页面：overview / traffic / blocks / settings
- * 时间：fmtBeijing → Asia/Shanghai；流量图大跨度按周/月聚合
- * 上下行口径：下行=上游→本机，上行=本机→客户端
- */
+(function initTheme(){
+  let t=null;
+  try{ t=localStorage.getItem('ep_theme') }catch(e){}
+  if(!t) t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+function currentTheme(){ return document.documentElement.getAttribute('data-theme') || 'light' }
+
 const state={port:0,labels:{},ovRange:'today',ovFrom:'',ovTo:'',tfRange:'today',tfFrom:'',tfTo:'',schemaVersion:2,cfgCache:null};
 let ovTrendData=[];
 
-// 字节数转可读文本（B/KB/MB/GB），用于所有流量展示
 function fmtBytes(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
-/* 字节坐标轴：先按数据最大值定一个统一单位，再在该单位下取整齐步长，
-   避免 Chart.js 自动步长造成「1000 B / 1.95 KB」这类同轴混排 */
 function bytesAxis(maxVal, tickCount){
   const units=[1,1024,1048576,1073741824,1099511627776];
   const names=['B','KB','MB','GB','TB'];
@@ -6387,7 +7341,6 @@ function bytesAxis(maxVal, tickCount){
   const norm=raw/(mag||1);
   const stepN=(norm<=1?1:(norm<=2?2:(norm<=5?5:10)))*mag;
   const fmt=n=>{
-    // 整数直接输出，小数保留 1~2 位，去掉尾随 0
     const s=(Number.isInteger(n)? String(n) : (n>=10? n.toFixed(1) : n.toFixed(2)));
     return (s.indexOf('.')>=0 ? s.replace(/0+$/,'').replace(/\.$/,'') : s) + ' ' + label;
   };
@@ -6398,11 +7351,6 @@ function bytesAxis(maxVal, tickCount){
     ticks:{stepSize: stepN*scale, maxTicksLimit: ticks+1, callback:v=>fmt(v/scale)}
   };
 }
-/**
- * 统一按北京时间展示。
- * @param {string|Date} iso
- * @param {'full'|'date'|'time'|'hm'} [mode]
- */
 function fmtBeijing(iso, mode){
   if(iso==null||iso==='') return '-';
   let d;
@@ -6439,15 +7387,11 @@ function fmtBeijing(iso, mode){
   if(mode==='hm') return `${g('hour')}:${g('minute')}`;
   return `${date} ${time}`;
 }
-// 取今天的北京时间日期（YYYY-MM-DD），作为各页面区间的默认终点
 function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
-/* 拦截原因统一映射：cn=地区限制 whitelist=域名白名单 ban=IP黑名单 rate_limit=限流 ua=UA白名单 */
-function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ban:'IP 黑名单',rate_limit:'触发限流',ua:'UA 不允许',login_fail:'登录失败'}[r]||'其他拦截'}
-function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',rate_limit:'pl',ua:'pu',login_fail:'pb'}[r]||'pw'}
-function reasonFull(r){return {cn:'地区限制：仅允许中国大陆 IP',whitelist:'域名未授权：目标域名不在白名单',ban:'IP 黑名单：命中黑名单规则',rate_limit:'触发限流：超过每分钟请求上限',ua:'UA 不允许：User-Agent 不在白名单'}[r]||'其他拦截'}
+function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ban:'IP 黑名单',ua:'UA 不允许',login_fail:'登录失败'}[r]||'其他拦截'}
+function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',ua:'pu',login_fail:'pb'}[r]||'pw'}
 
-// 国家码转显示名：优先用后端下发的中文映射，其次本地兜底表，最后原样返回
 function countryLabel(code){  if(!code) return '未知';
   const c = String(code).toUpperCase();
   if(state.labels && (state.labels[c]||state.labels[code])) return state.labels[c]||state.labels[code];
@@ -6455,16 +7399,14 @@ function countryLabel(code){  if(!code) return '未知';
   return fallback[c] || code;
 }
 
-const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',speedm:'测速管理',report:'数据上报',settings:'网关设置'};
+const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',audit:'操作审计',speedm:'测速管理',report:'数据上报',settings:'网关设置'};
 let blocksTimer=null, realtimeWS=null, reportTimer=null;
-// 清空实时监控界面的数值与表格（断线或退出时调用，避免残留旧数据）
 function clearRealtimeUI(){
   const ids=['rtConc','rtRps','rtRx','rtTx'];
   ids.forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='-';});
   const tb=document.getElementById('rtTable'); if(tb) tb.innerHTML='';
   const st=document.getElementById('rtStatus'); if(st) st.textContent='已退出，数据已清空';
 }
-// 切换左侧导航：切换页面、清理上一页的定时器与 WebSocket，并按需加载数据
 function switchTab(id){
   document.querySelectorAll('.nav-i').forEach(b=>b.classList.toggle('on',b.dataset.t===id));
   document.querySelectorAll('.pg').forEach(el=>el.classList.toggle('on',el.id===id));
@@ -6479,12 +7421,12 @@ function switchTab(id){
   if(id==='speedm'){loadSpeedTokens();loadSpeedResults();}
   if(id==='settings')loadSpeedTokens();
   if(id==='report')loadReportPage();
+  if(id==='audit')loadAudit();
   if(id==='blocks'){
     loadBlocks();
     blocksTimer=setInterval(()=>{if(!document.hidden)loadBlocks()},5000);
   }
 }
-// 建立实时监控 WebSocket，断线后自动重连；收到消息即刷新并发/RPS/流量与事件表
 function connectRealtime(){
   clearRealtimeUI();
   const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
@@ -6503,7 +7445,6 @@ function connectRealtime(){
       document.getElementById('rtRps').textContent=(d.rps||0).toLocaleString();
       document.getElementById('rtRx').textContent=fmtBytes(d.rx_bps||0)+'/s';
       document.getElementById('rtTx').textContent=fmtBytes(d.tx_bps||0)+'/s';
-      // 各 IP 实时网速
       const spdBox=document.getElementById('rtIPSpeeds');
       if(spdBox){
         const speeds=d.ip_speeds||[];
@@ -6519,7 +7460,6 @@ function connectRealtime(){
       const evs=d.events||[];
       const tb=document.getElementById('rtTable');
       if(!evs.length) return;
-      // 增量：新事件插到顶部，保留最多 80 条
       const html=evs.map(e=>`<tr>
         <td data-label="时间"><span class="cell-v muted mono">${esc(e.time)}</span></td>
         <td data-label="IP"><span class="cell-v mono ip-link" data-ip="${esc(e.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600">${esc(e.ip)}</span></td>
@@ -6540,9 +7480,7 @@ function connectRealtime(){
     }catch(e){}
   };
 }
-// 移动端展开侧边栏
 function openSidebar(){document.getElementById('sb').classList.add('open');document.getElementById('sbMask').classList.add('on')}
-// 移动端收起侧边栏
 function closeSidebar(){document.getElementById('sb').classList.remove('open');document.getElementById('sbMask').classList.remove('on')}
 document.getElementById('mmb').addEventListener('click',(e)=>{e.stopPropagation();openSidebar()});
 document.getElementById('sbMask').addEventListener('click',closeSidebar);
@@ -6550,10 +7488,8 @@ document.getElementById('sbMask').addEventListener('click',closeSidebar);
 document.querySelectorAll('.nav-i').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.t)));
 document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');if(btn){e.preventDefault();switchTab(btn.dataset.goto)}});
 
-// 把当前监听端口写回设置页输入框与顶部端口标签
-function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p;document.getElementById('portChip').textContent=':'+p}
+function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p}
 
-// 拉取后端配置并填充设置页表单（同时缓存到 state.cfgCache 供保存时对比）
 async function loadConfig(){
   try{
     const r=await fetch('/admin/api/config',{cache:'no-store'});
@@ -6566,13 +7502,14 @@ async function loadConfig(){
     const ru=document.getElementById('reportUrl');if(ru)ru.value=c.report_url||'';
     const rt=document.getElementById('reportToken');if(rt)rt.value=c.report_token||'';
     const rn=document.getElementById('reportNote');if(rn)rn.value=c.report_note||'';
+    const aa=document.getElementById('adminAllow');if(aa)aa.value=(c.admin_allow||[]).join('\n');
+
   }catch(e){console.error('loadConfig error:',e)}
 }
 
 let miniTrendChart=null,miniByteChart=null,reqChart=null,byteChart=null,hostChart=null;
 let trafficTrendData=[];
 
-/* 概览区间边界：与流量页同一套口径（北京时间，单日=分时，多日=按天） */
 function ovRangeBounds(){
   const tStr=nowBeijingDateStr();
   let from=null,to=tStr;
@@ -6588,7 +7525,6 @@ function ovRangeBounds(){
   }
   return {from,to,today:tStr};
 }
-/* 概览趋势数据按区间过滤 */
 function ovFilteredTrend(){
   const {from,to}=ovRangeBounds();
   return (ovTrendData||[]).filter(d=>{
@@ -6599,7 +7535,6 @@ function ovFilteredTrend(){
   }).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
 }
 
-// 按当前区间汇总趋势数据，刷新概览页的请求数/流量/拦截等指标卡片
 function updateOvStats() {
   if (!ovTrendData.length) return;
   const {from,to}=ovRangeBounds();
@@ -6608,7 +7543,6 @@ function updateOvStats() {
   filtered.forEach(d => {
     reqs += d.requests || 0;
     bytes += d.bytes || 0;
-    // 优先用后端汇总字段（五种拦截之和）；旧数据无 blocked 字段时回退老两字段
     bTotal += (d.blocked != null) ? d.blocked : ((d.blocked_cn||0)+(d.blocked_whitelist||0));
   });
 
@@ -6619,10 +7553,8 @@ function updateOvStats() {
   document.getElementById('ovAvgBytes').textContent = fmtBytes(Math.round(bytes/days));
   document.getElementById('ovBlocked').textContent = bTotal.toLocaleString();
 
-  // 标题/说明随区间变化（单日给分时提示，多日给天数）
   const single = !!from && from===to;
   const dayName = state.ovRange==='yesterday' ? '昨日' : '今日';
-  // 多日：跨度按区间自然日算（与图上 X 轴一致），无数据的天按 0 计
   let spanDays = filtered.length;
   if(!single && from && to && to>=from){
     const a=new Date(from+'T00:00:00'), b=new Date(to+'T00:00:00');
@@ -6633,7 +7565,6 @@ function updateOvStats() {
   document.getElementById('ovByteDesc').textContent = single ? (dayName + ' 00:00–23:00 各时段整机端口流量（含其他进程，仅供参考）') : ('区间内每日整机端口流量（含其他进程） · ' + spanHint);
 }
 
-/* 概览趋势：单日→0~23 点；多日→按天（过长则按周/月汇总） */
 function ovChartSeries(){
   const {from,to}=ovRangeBounds();
   const filtered=ovFilteredTrend();
@@ -6651,7 +7582,6 @@ function ovChartSeries(){
       }
       return {labels,reqs,ups,downs,gran:'hour'};
     }
-    // 兼容：拿不到分时明细时（老数据/极简响应），退化为单点当日汇总，避免全 0 空图
     labels.push((day.date||from||'').slice(5)||'当日');
     reqs.push(day.requests||0);
     ups.push(day.up_bytes||0); downs.push(day.down_bytes||0);
@@ -6659,11 +7589,9 @@ function ovChartSeries(){
   }
   const byDate={}; filtered.forEach(d=>{byDate[d.date]=d});
   let days=Object.keys(byDate).sort();
-  // 补全区间内每个自然日（无数据填 0），否则「近 7 天」只有 1 天有记录时
-  // 图上只剩一个孤立圆点，看不出趋势
   if(from&&to&&to>=from){
     const a=new Date(from+'T00:00:00'), bEnd=new Date(to+'T00:00:00');
-    const cap=400; // 防止自定义超大区间生成过多点
+    const cap=400;
     let n=0; const full=[];
     for(let t=new Date(a); t<=bEnd && n<cap; t.setDate(t.getDate()+1), n++) full.push(localDateStr(new Date(t)));
     if(full.length) days=full;
@@ -6694,10 +7622,8 @@ function ovChartSeries(){
   return {labels,reqs,ups,downs,gran};
 }
 
-// 加载概览页：趋势数据、系统信息、拦截摘要
 async function loadOverview(){
   try{
-    // slim=1：trend 只含每日汇总，避免 5 秒轮询拉全量明细（分时/主机/IP/国家）
     const r=await fetch('/admin/api/traffic?slim=1',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
@@ -6705,7 +7631,6 @@ async function loadOverview(){
     ovTrendData = t.trend || [];
     refreshOverview();
     
-    // 概览只需最新几条拦截，limit=5 大幅减少轮询传输
     const r2=await fetch('/admin/api/blocks?limit=5',{cache:'no-store'});
     if(r2.ok){const b=await r2.json();renderOvBlocks(b.items||[]);}
     
@@ -6720,7 +7645,6 @@ async function loadOverview(){
   }catch(e){console.error('loadOverview error:',e)}
 }
 
-/* 系统信息卡片：仅保留运维最关心的少量指标，单列紧凑排布 */
 function renderSysInfo(sys, uptime){
   const box=document.getElementById('sysInfo');
   if(!box) return;
@@ -6732,11 +7656,13 @@ function renderSysInfo(sys, uptime){
   const group=(title,rows)=>`<div class="svg-title">${title}</div><div class="sv-list">${rows.join('')}</div>`;
 
   const sw = sys || {};
+  const dropped = sw.stat_dropped||0;
   const run=[
     kv('运行时长', upStr),
     kv('监听端口', sw.port!=null ? (':'+sw.port) : '—'),
     kv('内存占用', fmtBytes(sw.mem_heap||0)),
     kv('在线会话', (sw.logins!=null? sw.logins : '—') + ' 个'),
+    kv('统计丢弃', dropped>0 ? (Number(dropped).toLocaleString()+' 条') : '0 条', dropped>0?'var(--w)':''),
   ];
   const diskPct = sw.disk_total ? Math.max(0, Math.round(sw.disk_free/sw.disk_total*100)) : 0;
   const env=[
@@ -6749,12 +7675,10 @@ function renderSysInfo(sys, uptime){
   box.innerHTML = group('运行状态', run) + group('环境', env);
 }
 
-/* 概览两张图共用：按当前区间渲染请求趋势 + 流量趋势（上下行） */
 function renderOvCharts(){
   if(typeof Chart==='undefined') return;
   const v=ovChartSeries();
 
-  // --- 请求趋势 ---
   const cvReq=document.getElementById('miniTrendChart');
   if(cvReq && v.labels.length){
     const cfg={type:'line',data:{labels:v.labels.map(l=>fmtAxisLabel(l,v.gran)),datasets:[
@@ -6763,7 +7687,6 @@ function renderOvCharts(){
     miniTrendChart=upsertChart(miniTrendChart,cvReq,cfg);
   }
 
-  // --- 流量趋势（上下行合计，单条平滑曲线）---
   const cvByte=document.getElementById('miniByteChart');
   if(cvByte && v.labels.length){
     const tot=v.ups.map((u,i)=>(u||0)+(v.downs[i]||0));
@@ -6774,16 +7697,13 @@ function renderOvCharts(){
   }
 }
 
-/* 概览区间切换后统一刷新（统计 + 两张图） */
 function refreshOverview(){
   updateOvStats();
   renderOvCharts();
 }
 
-// esc：HTML 转义，防 XSS
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-// 渲染概览页底部的拦截摘要列表
 function renderOvBlocks(items){
   const box=document.getElementById('ovBlocks');
   if(!items.length){box.innerHTML='<div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">近期没有拦截事件</span></div>';return}
@@ -6793,18 +7713,15 @@ function renderOvBlocks(items){
   </div>`).join('');
 }
 
-// Date 对象转本地时区的 YYYY-MM-DD
 function localDateStr(d){
   return fmtBeijing(d instanceof Date ? d : new Date(d), 'date');
 }
-/* 按北京时间取「今天往前 n 天」的日期字符串 */
 function beijingDateStrBefore(days){
   const now = new Date();
   const bj = new Date(now.getTime() + (now.getTimezoneOffset() + 480) * 60000);
   bj.setDate(bj.getDate() - days);
   return bj.getFullYear() + '-' + String(bj.getMonth()+1).padStart(2,'0') + '-' + String(bj.getDate()).padStart(2,'0');
 }
-// 计算流量页区间边界（北京时间；自定义区间时自动纠正首尾颠倒）
 function dateRangeBounds(){
   const tStr=nowBeijingDateStr();
   let from=null,to=tStr;
@@ -6820,7 +7737,6 @@ function dateRangeBounds(){
   }
   return {from,to,today:tStr};
 }
-// 按当前区间过滤趋势数组，并按日期升序返回
 function filterTrendByRange(trend){
   const {from,to}=dateRangeBounds();
   return (trend||[]).filter(d=>{
@@ -6830,28 +7746,24 @@ function filterTrendByRange(trend){
     return true;
   }).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
 }
-// 返回某天所在周的周一日期，用于按周聚合
 function weekStartKey(dateStr){
   const d=new Date(dateStr+'T00:00:00');
   const day=d.getDay()||7;
   d.setDate(d.getDate()-day+1);
   return localDateStr(d);
 }
-// 取 YYYY-MM，用于按月聚合
 function monthKey(dateStr){ return (dateStr||'').slice(0,7); }
-/** 按区间跨度选择图表粒度：日 → 周(>60) → 月(>180) */
 function pickGranularity(dayCount){
   if(dayCount>180) return 'month';
   if(dayCount>60) return 'week';
   return 'day';
 }
-// 把后端趋势整理成流量页所需结构：按粒度生成 labels 与请求/上下行序列
 function buildTrafficView(trend){
   const filtered=filterTrendByRange(trend);
   const {from,to}=dateRangeBounds();
   const isToday = !!from && from === to;
   const labels=[],reqs=[],bytes=[],ups=[],downs=[];
-  const ipMap={},ctryMap={},hostMap={};
+  const ipMap={},ctryMap={},hostMap={},uaMap={},uaRawMap={};
   let totalReq=0,totalBytes=0,totalUp=0,totalDown=0,blocked=0,rawDayCount=0,gran='hour';
   filtered.forEach(d=>{
     totalReq+=d.requests||0; totalBytes+=d.bytes||0;
@@ -6860,6 +7772,8 @@ function buildTrafficView(trend){
     Object.entries(d.ips||{}).forEach(([k,v])=>{ipMap[k]=(ipMap[k]||0)+v});
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
     Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
+    Object.entries(d.ua_class||{}).forEach(([k,v])=>{uaMap[k]=(uaMap[k]||0)+v});
+    Object.entries(d.ua_raw||{}).forEach(([k,v])=>{uaRawMap[k]=(uaRawMap[k]||0)+v});
   });
   if(isToday){
     gran='hour';
@@ -6871,7 +7785,6 @@ function buildTrafficView(trend){
       const key=String(h).padStart(2,'0');
       const up=hourUp[key]||0, down=hourDown[key]||0;
       labels.push(key+':00'); reqs.push(hours[key]||0);
-      // 真实分时：优先上下行明细，缺失时回落到合计
       ups.push(up); downs.push(down);
       bytes.push((up||down)?(up+down):(hourBytes[key]||0));
     }
@@ -6913,9 +7826,8 @@ function buildTrafficView(trend){
   const ipMapTrim={}, ctryMapTrim={};
   ipEntries.slice(0,ipTopN).forEach(([k,v])=>{ipMapTrim[k]=v});
   ctryEntries.slice(0,ctryTopN).forEach(([k,v])=>{ctryMapTrim[k]=v});
-  return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN};
+  return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN,uaMap,uaRawMap,days:filtered};
 }
-// 把整理好的序列渲染到流量页的图表与汇总指标
 function applyTrafficView(){
   const v=buildTrafficView(trafficTrendData);
   document.getElementById('tfReq').textContent=v.totalReq.toLocaleString();
@@ -6945,9 +7857,10 @@ function applyTrafficView(){
   if(state.ipDownBytes) for(const k in state.ipDownBytes) ipBytesMap[k]=(ipBytesMap[k]||0)+state.ipDownBytes[k];
   renderIP(v.ipMap,ipBytesMap,v.ipTotalUnique,v.ipTopN);
   renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN);
+  renderUADist(v.uaMap,v.uaRawMap);
+  renderHourHeat(v.days);
 }
 
-// 加载流量页数据（趋势 + 域名/IP/地区排行）
 async function loadTraffic(){
   try{
     const r=await fetch('/admin/api/traffic',{cache:'no-store'});
@@ -6958,14 +7871,11 @@ async function loadTraffic(){
     trafficTrendData = t.trend || [];
     state.ipUpBytes = t.ip_up_bytes || {};
     state.ipDownBytes = t.ip_down_bytes || {};
-    // 自定义日期输入默认最近 7 天
     applyTrafficView();
   }catch(e){console.error('loadTraffic error:',e)}
 }
 
-// 复用已有 Chart 实例：同类型只更新数据，类型或粒度变化时销毁重建
 function upsertChart(prev,cv,cfg){
-  // 分时(bar) 与按天(line) 切换时必须重建，否则会一直保留小时轴
   if(prev){
     const sameType = prev.config && prev.config.type === cfg.type;
     if(sameType){
@@ -6979,14 +7889,12 @@ function upsertChart(prev,cv,cfg){
   }
   return new Chart(cv, cfg);
 }
-// 按粒度缩短 X 轴标签（月只留「MM月」，日只留「MM-DD」）
 function fmtAxisLabel(lab,gran){
   if(gran==='hour') return lab;
   if(gran==='month' && /^\d{4}-\d{2}$/.test(lab)) return lab.slice(5)+'月';
   if(/^\d{4}-\d{2}-\d{2}$/.test(lab)) return lab.slice(5);
   return lab;
 }
-// 生成图表 tooltip 标题；按周聚合时补「起一周」，避免误读
 function tooltipTitle(labels,gran){
   return (items)=>{
     const raw=labels[items[0].dataIndex]||'';
@@ -6995,7 +7903,6 @@ function tooltipTitle(labels,gran){
     return raw;
   };
 }
-// 按粒度控制 X 轴最多显示多少个刻度，防止标签重叠
 function chartTickLimit(n,gran){
   if(gran==='hour') return 12;
   if(n<=14) return n;
@@ -7003,7 +7910,6 @@ function chartTickLimit(n,gran){
   if(gran==='week') return Math.min(16,n);
   return 14;
 }
-// 渲染请求数图表
 function renderReqChart(labels,data,gran){
   const cv=document.getElementById('reqChart');if(!cv||typeof Chart==='undefined')return;
   gran=gran||'day';
@@ -7012,31 +7918,26 @@ function renderReqChart(labels,data,gran){
   const cfg={type:'line',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'请求数：'+Number(c.parsed.y||0).toLocaleString()}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
-// 渲染流量图表（上行/下行双序列）
 function renderByteChart(labels,ups,downs,gran){
   const cv=document.getElementById('byteChart');if(!cv||typeof Chart==='undefined')return;
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  // 上下行合并展示：total = 上行 + 下行，一条平滑曲线
   const tot=(labels||[]).map((_,i)=>((ups&&ups[i])||0)+((downs&&downs[i])||0));
   const cfg={type:'line',data:{labels:labs,datasets:[
     {label:'流量',data:tot,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}
   ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'流量：'+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
-// 渲染上游域名 Top N 图表
 function renderHostChart(hostTop){
   const cv=document.getElementById('hostChart');if(!cv||typeof Chart==='undefined')return;
   const labels=hostTop.map(([h])=>h.length>22?h.slice(0,20)+'…':h);
   const data=hostTop.map(([,n])=>n);
   if(!labels.length){labels.push('暂无数据');data.push(0)}
   const dense=labels.length>24;
-  // 横向树状图：主机名较长，横条比折线更易读
   const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.75)',hoverBackgroundColor:'#8b5cf6',borderRadius:4,maxBarThickness:22}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:14,font:{size:11}}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
 }
-// 渲染请求 IP 排行：IP、占比条、次数、流量四列，点击行看详情
 function renderIP(map,bytesMap,totalUnique,topN){
   topN=topN||20;
   const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
@@ -7053,7 +7954,6 @@ function renderIP(map,bytesMap,totalUnique,topN){
   box.innerHTML=html;
   box.querySelectorAll('.ip-row').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
 }
-// 渲染地区分布排行
 function renderRegion(map,totalUnique,topN){
   topN=topN||20;
   const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
@@ -7069,7 +7969,86 @@ function renderRegion(map,totalUnique,topN){
   box.innerHTML=html;
 }
 
-// 弹出单个 IP 的详情（请求数、上下行、最近访问等）
+function renderUADist(map,rawMap){
+  const box=document.getElementById('uaDist');
+  if(!box)return;
+  const rows=Object.entries(map||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  if(!rows.length){
+    box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有客户端记录</span></div>';
+    return;
+  }
+  const total=Object.values(map).reduce((a,b)=>a+b,0)||1;
+  const max=rows[0][1]||1;
+  const raws=Object.entries(rawMap||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  const rawHtml=raws.length?`
+    <div class="ua-raw">
+      <div class="ua-raw-h">原始 UA 采样 · 当前范围 Top ${raws.length}<span style="color:var(--t3);font-weight:400">（点击行收起）</span></div>
+      ${raws.map(([u,n])=>`<div class="ua-raw-i"><span class="ua-raw-n">${n.toLocaleString()}</span><span class="ua-raw-u" title="${esc(u)}">${esc(u)}</span></div>`).join('')}
+    </div>`:'<div class="ua-raw"><div class="ua-raw-h">暂无原始 UA 采样（仅 v3.1.2 起的新数据）</div></div>';
+  box.innerHTML=rows.map(([name,n])=>
+    `<div class="dr ua-row" data-cls="${esc(name)}" style="cursor:pointer" title="点击查看原始 UA 采样"><span class="dn"><span class="tx">${esc(name)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`
+  ).join('')+'<div class="ua-raw-box" style="display:none">'+rawHtml+'</div>';
+  const rawBox=box.querySelector('.ua-raw-box');
+  box.querySelectorAll('.ua-row').forEach(el=>el.addEventListener('click',()=>{
+    if(!rawBox)return;
+    const open=rawBox.style.display!=='none';
+    rawBox.style.display=open?'none':'block';
+  }));
+}
+
+function hmCell(v,max,title){
+  const a=v?0.10+0.85*Math.pow(v/max,0.65):0;
+  const bg=v?`background:rgba(59,130,246,${a.toFixed(3)})`:'';
+  return `<div class="hm-cell" style="${bg}" title="${esc(title)}"></div>`;
+}
+function renderHourHeat(days){
+  const box=document.getElementById('hourHeat');
+  if(!box)return;
+  const sub=document.getElementById('hourHeatSub');
+  const list=(days||[]).filter(d=>d&&d.date).sort((a,b)=>a.date<b.date?-1:1);
+  if(!list.length){
+    if(sub)sub.textContent='当前筛选条件下没有数据';
+    box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有请求记录</span></div>';
+    return;
+  }
+  const {from,to}=dateRangeBounds();
+  const single=!!(from&&to&&from===to);
+  let span=list.length||1;
+  if(from&&to){span=Math.round((new Date(to)-new Date(from))/86400000)+1}
+
+  let headCells=[],rowLabel='',unit='',max=1,cells='',title='';
+  if(single){
+    const d=list.find(x=>x.date===from)||list[list.length-1];
+    const hours=d.hours||{};
+    for(let h=0;h<24;h++){const v=hours[String(h).padStart(2,'0')]||0;if(v>max)max=v}
+    headCells=[];for(let h=0;h<24;h++)headCells.push(`<div class="hm-h">${String(h).padStart(2,'0')}</div>`);
+    for(let h=0;h<24;h++){const k=String(h).padStart(2,'0');const v=hours[k]||0;cells+=hmCell(v,max,`${d.date} ${k}:00 · ${v.toLocaleString()} 次`)}
+    rowLabel=String(d.date).slice(5);unit='次/时';
+    title=`${d.date} 24 小时请求分布（北京时间）`;
+  }else if(span<=31){
+    list.forEach(d=>{if((d.requests||0)>max)max=d.requests||0});
+    headCells=list.map(d=>`<div class="hm-h" title="${esc(d.date)}">${String(d.date).endsWith('-01')?String(d.date).slice(5):String(d.date).slice(8)}</div>`);
+    list.forEach(d=>{const v=d.requests||0;cells+=hmCell(v,max,`${d.date} · ${v.toLocaleString()} 次`)});
+    rowLabel='按天';unit='次/天';
+    title=`${list[0].date} ~ ${list[list.length-1].date} 按天请求分布`;
+  }else{
+    const months={};
+    list.forEach(d=>{const m=String(d.date).slice(0,7);months[m]=(months[m]||0)+(d.requests||0)});
+    const keys=Object.keys(months).sort();
+    keys.forEach(m=>{if(months[m]>max)max=months[m]});
+    headCells=keys.map(m=>`<div class="hm-h" title="${esc(m)}">${m}</div>`);
+    keys.forEach(m=>{const v=months[m];cells+=hmCell(v,max,`${m} · ${v.toLocaleString()} 次`)});
+    rowLabel='按月';unit='次/月';
+    title=`${keys[0]} ~ ${keys[keys.length-1]} 按月请求分布`;
+  }
+  if(sub)sub.textContent=title;
+  const n=headCells.length;
+  box.innerHTML=`<div class="hm" style="grid-template-columns:56px repeat(${n},1fr)">${headCells.join('')}<div class="hm-d">${esc(rowLabel)}</div>${cells}</div>
+    <div class="hm-legend"><span>少</span>
+      <i style="background:rgba(59,130,246,.12)"></i><i style="background:rgba(59,130,246,.35)"></i><i style="background:rgba(59,130,246,.6)"></i><i style="background:rgba(59,130,246,.9)"></i>
+      <span>多（峰值 ${max.toLocaleString()} ${unit}）</span></div>`;
+}
+
 async function showIPDetail(ip){
   if(!ip)return;
   document.getElementById('modalTitle').textContent='IP 详情';
@@ -7097,22 +8076,35 @@ async function showIPDetail(ip){
   }
 }
 
-// 加载拦截记录列表，并按当前筛选条件渲染
+const blkState={page:1,size:50,total:0};
+function blkParams(extra){
+  const q=document.getElementById('blkQ')?.value?.trim()||'';
+  const reason=document.getElementById('blkReason')?.value||'';
+  const ip=document.getElementById('blkIP')?.value?.trim()||'';
+  const p=new URLSearchParams();
+  if(q)p.set('q',q);
+  if(reason)p.set('reason',reason);
+  if(ip)p.set('ip',ip);
+  if(extra)Object.entries(extra).forEach(([k,v])=>p.set(k,v));
+  return p;
+}
 async function loadBlocks(){
   try{
-    const q=document.getElementById('blkQ')?.value?.trim()||'';
-    const reason=document.getElementById('blkReason')?.value||'';
-    const ip=document.getElementById('blkIP')?.value?.trim()||'';
-    const params=new URLSearchParams({limit:'500'});
-    if(q) params.set('q',q);
-    if(reason) params.set('reason',reason);
-    if(ip) params.set('ip',ip);
-    const r=await fetch('/admin/api/blocks?'+params.toString(),{cache:'no-store'});
+    const p=blkParams({limit:String(blkState.size),offset:String((blkState.page-1)*blkState.size)});
+    const r=await fetch('/admin/api/blocks?'+p.toString(),{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
     const tb=document.getElementById('blockTable');
     const cnt=document.getElementById('blkCount');
-    if(cnt) cnt.textContent='共 '+(t.total||0)+' 条'+(t.returned<t.total?' · 显示最新 '+t.returned:'');
+    blkState.total=t.total||0;
+    const pages=Math.max(1,Math.ceil(blkState.total/blkState.size));
+    if(blkState.page>pages)blkState.page=pages;
+    if(cnt) cnt.textContent='共 '+blkState.total+' 条';
+    const info=document.getElementById('blkPageInfo');
+    if(info) info.textContent=blkState.total?('第 '+blkState.page+' / '+pages+' 页'):'';
+    const prev=document.getElementById('blkPrev'), next=document.getElementById('blkNext');
+    if(prev) prev.disabled=blkState.page<=1;
+    if(next) next.disabled=blkState.page>=pages;
     if(!t.items||!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="7"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">没有匹配的拦截事件</span></div></td></tr>';return}
     tb.innerHTML=t.items.map(b=>{
       const ua=String(b.ua||'').trim();
@@ -7136,23 +8128,66 @@ async function loadBlocks(){
         const d=await r.json().catch(()=>({}));
         if(!r.ok){alert(d.error||'拉黑失败');return;}
         alert(d.existed?'该 IP 已在黑名单中':'已加入黑名单');
-        loadConfig();
+        loadConfig(); loadBlocks();
       }catch(e){alert('网络异常');}
     }));
   }catch(e){console.error('loadBlocks error:',e)}
 }
 
+const audState={page:1,size:50,total:0};
+const ACT_LABEL={login:'登录',change_password:'修改密码',save_config:'保存配置',ban_ip:'拉黑 IP',clear_stats:'清空统计',speed_create:'生成测速链接',speed_delete:'删除测速链接',report_test:'手动上报',report_retry:'补传上报',report_clear:'清空上报快照',report_clear_records:'清空上报记录',backup_db:'下载数据库',config_export:'导出配置',config_import:'导入配置',blocks_export:'导出拦截记录'};
+function actLabel(a){return ACT_LABEL[a]||a||'其他'}
+async function loadAudit(){
+  const tb=document.getElementById('auditBody');
+  if(!tb)return;
+  try{
+    const action=document.getElementById('auditAction')?.value||'';
+    const p=new URLSearchParams({limit:String(audState.size),offset:String((audState.page-1)*audState.size)});
+    if(action)p.set('action',action);
+    const r=await fetch('/admin/api/audit?'+p.toString(),{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    const items=d.items||[];
+    const total=d.total||0;
+    const pages=Math.max(1,Math.ceil(total/audState.size));
+    if(audState.page>pages)audState.page=pages;
+    const cnt=document.getElementById('auditCount');
+    if(cnt)cnt.textContent='共 '+total+' 条';
+    const info=document.getElementById('auditPageInfo');
+    if(info)info.textContent=total?('第 '+audState.page+' / '+pages+' 页'):'';
+    const prev=document.getElementById('auditPrev'),next=document.getElementById('auditNext');
+    if(prev)prev.disabled=audState.page<=1;
+    if(next)next.disabled=audState.page>=pages;
+    if(!items.length){
+      tb.innerHTML='<tr class="emp-row"><td colspan="4"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">暂无匹配的后台操作</span></div></td></tr>';
+      return;
+    }
+    const danger={clear_stats:1,ban_ip:1,change_password:1,config_import:1,report_clear:1,report_clear_records:1};
+    tb.innerHTML=items.map(a=>`<tr>
+      <td data-label="时间"><span class="cell-v muted mono">${fmtBeijing(a.time,'full')}</span></td>
+      <td data-label="动作"><span class="cell-v"><span class="act-tag${danger[a.action]?' warn':''}">${esc(actLabel(a.action))}</span></span></td>
+      <td data-label="详情"><span class="cell-v" style="word-break:break-all">${esc(a.detail||'—')}</span></td>
+      <td data-label="来源 IP"><span class="cell-v mono">${a.ip?`<span class="ip-link" data-ip="${esc(a.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600" title="点击查看该 IP 详情">${esc(a.ip)}</span>`:'—'}</span></td>
+    </tr>`).join('');
+    tb.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
+  }catch(e){console.error('loadAudit error:',e)}
+}
 
-// 从设置页表单收集配置项，返回待保存的配置对象
 function collect(){
   const raw=parseInt(document.getElementById('portInput').value,10);
-  return{port:isNaN(raw)?0:raw,china_only:document.getElementById('chinaOnly').checked,whitelist:document.getElementById('whitelist').value.split('\n').map(x=>x.trim()).filter(Boolean),geo_api:true,ban_list:document.getElementById('banList').value.split('\n').map(x=>x.trim()).filter(Boolean),allowed_uas:document.getElementById('allowedUAs').value.split('\n').map(x=>x.trim()).filter(Boolean),
+  const lines=id=>((document.getElementById(id)?.value||'').split('\n')).map(x=>x.trim()).filter(Boolean);
+  return{port:isNaN(raw)?0:raw,
+    china_only:!!document.getElementById('chinaOnly')?.checked,
+    whitelist:lines('whitelist'),
+    ban_list:lines('banList'),
+    allowed_uas:lines('allowedUAs'),
+    admin_allow:lines('adminAllow'),
     report_on:!!document.getElementById('reportOn')?.checked,
     report_url:(document.getElementById('reportUrl')?.value||'').trim(),
     report_token:(document.getElementById('reportToken')?.value||'').trim(),
-    report_note:(document.getElementById('reportNote')?.value||'').trim()}
+    report_note:(document.getElementById('reportNote')?.value||'').trim(),
+    }
 }
-// 保存设置：提交后按需热切换端口，并刷新页面状态
 async function save(){
   try{
     const r=await fetch('/admin/api/save',{method:'POST',body:JSON.stringify(collect())});
@@ -7163,19 +8198,13 @@ async function save(){
 }
 document.getElementById('savePort').addEventListener('click',()=>save());document.getElementById('saveAll').addEventListener('click',()=>save());
 
-/* ===== 数据上报 ===== */
 const RP_PAGE_SIZE=20;
 const rpState={items:[],page:1,loaded:false};
-// 在数据上报页显示一条操作提示
 function reportMsg(t,color){const el=document.getElementById('reportMsg');if(el){el.textContent=t;el.style.color=color||'var(--t3)'}}
-// 上报触发方式转中文标签（整点自动/手动/补传）
 function rpTriggerLabel(t){return {auto:'整点自动',manual:'手动',retry:'补传'}[t]||t||'—'}
-// 请求耗时格式化（毫秒/秒）
 function fmtDur(ms){if(!ms)return '—';if(ms<1000)return ms+' ms';return (ms/1000).toFixed(1)+' s'}
-// 时间字段格式化，空值显示为「—」
 function fmtTimeSec(v){return v?fmtBeijing(v):'—'}
 
-// 加载数据上报页：记录列表 + 待补传条数，并开启 15 秒自动刷新
 async function loadReportPage(){
   const st=document.getElementById('rpState');
   if(st){st.className='rp-g wt';st.textContent='读取中'}
@@ -7183,7 +8212,6 @@ async function loadReportPage(){
   if(!reportTimer){reportTimer=setInterval(()=>{if(!document.hidden && document.getElementById('report')?.classList.contains('on')){loadReportRecords();loadReportQueueStat()}},15000)}
 }
 
-// 按关键字与结果筛选上报记录
 function rpFiltered(){
   const q=(document.getElementById('rpQ')?.value||'').trim().toLowerCase();
   const res=document.getElementById('rpResult')?.value||'';
@@ -7200,7 +8228,6 @@ function rpFiltered(){
   });
 }
 
-// 渲染上报记录表格
 function rpRenderTable(){
   const tb=document.getElementById('rpBody');
   if(!tb)return;
@@ -7235,7 +8262,6 @@ function rpRenderTable(){
   tb.querySelectorAll('.rp-row').forEach(tr=>tr.addEventListener('click',()=>showReportRecord(tr.dataset.rid)));
 }
 
-// 打开某条上报记录的详情弹窗，并异步加载其原始报文
 function showReportRecord(id){
   const it=rpState.items.find(x=>x.id===id);
   if(!it)return;
@@ -7257,7 +8283,6 @@ function showReportRecord(id){
   let html='<table style="min-width:0;width:100%;table-layout:fixed"><tbody>'
     + rows.map(([k,v])=>`<tr><td style="width:88px;color:var(--t3);font-size:12.5px;padding:6px 0;vertical-align:top">${esc(k)}</td><td style="font-size:12.5px;padding:6px 0;word-break:break-all">${esc(String(v))}</td></tr>`).join('')
     + '</tbody></table>';
-  // 原始上报数据：整段报文原样保留，这里直接原文展示，不做解析重组
   if(it.payload_saved){
     html+='<div style="font-size:12px;font-weight:600;color:var(--t2);margin-top:14px">原始上报数据 <span id="rpRawMeta" style="font-weight:normal;color:var(--t3)">· 加载中…</span></div>'
       +'<div class="rp-pre" id="rpRaw">加载中…</div>';
@@ -7275,8 +8300,6 @@ function showReportRecord(id){
   if(it.payload_saved)loadRawPayload(it.id);
 }
 
-// 按记录 ID 取原始报文。后端返回的就是投递时的原字符串，直接放进 <pre>，
-// 不 JSON.parse 再 stringify——那会改变键顺序并丢掉格式，就不再是「原文」了。
 async function loadRawPayload(id){
   const box=document.getElementById('rpRaw'), meta=document.getElementById('rpRawMeta');
   if(!box)return;
@@ -7292,7 +8315,6 @@ async function loadRawPayload(id){
   }
 }
 
-// 拉取上报记录列表
 async function loadReportRecords(){
   try{
     const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'records'})});
@@ -7314,7 +8336,6 @@ async function loadReportRecords(){
   }
 }
 
-// 渲染上报页顶部的统计指标
 function rpRenderStats(){
   const items=rpState.items||[];
   const since=Date.now()-24*3600*1000;
@@ -7327,7 +8348,6 @@ function rpRenderStats(){
   document.getElementById('rpLast').textContent=last?fmtTimeSec(last.time):'—';
 }
 
-// 拉取待补传队列条数，用于提示是否有积压
 async function loadReportQueueStat(){
   try{
     const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'status'})});
@@ -7354,7 +8374,6 @@ document.getElementById('testReport')?.addEventListener('click',async()=>{
     const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'test'})});
     const d=await r.json().catch(()=>({}));
     if(d && d.payload!==undefined){
-      // 弹窗展示完整回显：发送数据 + 接收端返回
       const head=d.ok
         ?'<div style="color:var(--ok);font-weight:600;margin-bottom:10px">✓ 上报成功（HTTP '+d.resp_status+'）</div>'
         :'<div style="color:var(--d);font-weight:600;margin-bottom:10px">✗ 上报失败：'+esc(d.error||'')+'<br><span style="font-weight:400;color:var(--t3)">数据已存入队列，稍后自动重试；接收端返回如下</span></div>';
@@ -7418,14 +8437,95 @@ document.getElementById('changePassBtn').addEventListener('click',async()=>{
   const r=await fetch('/admin/api/change-password',{method:'POST',body:JSON.stringify({OldPass:o,NewPass:n})});
   if(r.ok){alert('密码修改成功，即将跳转到登录页，请用新密码重新登录');location.reload()}else{alert('密码修改失败：'+(await r.text()||'未知错误'))}
 });
-document.getElementById('blkFilterBtn')?.addEventListener('click',()=>loadBlocks());
+document.getElementById('blkFilterBtn')?.addEventListener('click',()=>{blkState.page=1;loadBlocks()});
 document.getElementById('blkResetBtn')?.addEventListener('click',()=>{
   const q=document.getElementById('blkQ'); if(q)q.value='';
   const r=document.getElementById('blkReason'); if(r)r.value='';
   const i=document.getElementById('blkIP'); if(i)i.value='';
-  loadBlocks();
+  blkState.page=1; loadBlocks();
 });
-document.getElementById('blkQ')?.addEventListener('keydown',e=>{if(e.key==='Enter')loadBlocks()});
+document.getElementById('blkQ')?.addEventListener('keydown',e=>{if(e.key==='Enter'){blkState.page=1;loadBlocks()}});
+document.getElementById('blkIP')?.addEventListener('keydown',e=>{if(e.key==='Enter'){blkState.page=1;loadBlocks()}});
+document.getElementById('blkPrev')?.addEventListener('click',()=>{if(blkState.page>1){blkState.page--;loadBlocks()}});
+document.getElementById('blkNext')?.addEventListener('click',()=>{blkState.page++;loadBlocks()});
+document.getElementById('blkExport')?.addEventListener('click',()=>{
+  const p=blkParams(); window.location='/admin/api/blocks.csv?'+p.toString();
+});
+
+document.getElementById('auditRefresh')?.addEventListener('click',()=>loadAudit());
+document.getElementById('auditAction')?.addEventListener('change',()=>{audState.page=1;loadAudit()});
+document.getElementById('auditPrev')?.addEventListener('click',()=>{if(audState.page>1){audState.page--;loadAudit()}});
+document.getElementById('auditNext')?.addEventListener('click',()=>{audState.page++;loadAudit()});
+
+document.getElementById('themeBtn')?.addEventListener('click',()=>{
+  const next=currentTheme()==='dark'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',next);
+  try{localStorage.setItem('ep_theme',next)}catch(e){}
+  if(typeof Chart!=='undefined'){
+    try{
+      Object.values(Chart.instances||{}).forEach(c=>{ try{c.destroy()}catch(e){} });
+    }catch(e){}
+    miniTrendChart=miniByteChart=reqChart=byteChart=hostChart=null;
+    if(document.getElementById('overview')?.classList.contains('on'))loadOverview();
+    if(document.getElementById('traffic')?.classList.contains('on'))loadTraffic();
+  }
+});
+function switchSetTab(key){
+  document.querySelectorAll('.set-tab').forEach(b=>b.classList.toggle('on',b.dataset.st===key));
+  document.querySelectorAll('.set-pane').forEach(pn=>{ pn.style.display = (pn.id==='pane-'+key)?'':'none'; });
+  try{ localStorage.setItem('ep_set_tab',key) }catch(e){}
+}
+document.querySelectorAll('.set-tab').forEach(b=>b.addEventListener('click',()=>switchSetTab(b.dataset.st)));
+try{ const saved=localStorage.getItem('ep_set_tab'); if(saved&&document.getElementById('pane-'+saved))switchSetTab(saved); }catch(e){}
+
+document.getElementById('rtFillUA')?.addEventListener('click',()=>{
+  const el=document.getElementById('rtUA'); if(el) el.value=navigator.userAgent;
+});
+document.getElementById('rtRun')?.addEventListener('click',async()=>{
+  const box=document.getElementById('rtResult');
+  const body={
+    ip:(document.getElementById('rtIP')?.value||'').trim(),
+    host:(document.getElementById('rtHost')?.value||'').trim(),
+    ua:(document.getElementById('rtUA')?.value||'').trim()
+  };
+  box.innerHTML='<div style="color:var(--t3);font-size:13px;padding:10px 0">测试中…</div>';
+  try{
+    const r=await fetch('/admin/api/rules/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const txt=await r.text();
+    if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
+    const d=JSON.parse(txt);
+    const steps=(d.steps||[]).map(st=>`<div class="tl-i ${st.status}"><div class="tl-d"></div><div class="tl-n">${esc(st.name)}</div><div class="tl-v">${esc(st.detail)}</div></div>`).join('');
+    const pass=d.result==='pass';
+    box.innerHTML=`<div class="tl">${steps}</div>
+      <div class="tl-res ${pass?'pass':'block'}">${pass?'✓ 该请求会被放行并转发':'✕ 该请求会被拦截'}</div>
+      <div style="margin-top:10px;font-size:12px;color:var(--t3);word-break:break-all">
+        来源 ${esc(d.ip)} · 地区 ${esc(d.country_name||d.country||'—')} · 客户端归类 ${esc(d.ua_class||'—')}
+      </div>`;
+  }catch(e){
+    box.innerHTML='<div style="color:var(--d);font-size:13px;padding:10px 0">测试失败：'+esc(e.message||'')+'</div>';
+  }
+});
+
+document.getElementById('btnBackup')?.addEventListener('click',()=>{ window.location='/admin/api/backup' });
+document.getElementById('btnExportCfg')?.addEventListener('click',()=>{ window.location='/admin/api/config/export' });
+document.getElementById('importCfgFile')?.addEventListener('change',async(e)=>{
+  const f=e.target.files&&e.target.files[0];
+  const msg=document.getElementById('backupMsg');
+  if(!f)return;
+  if(!confirm('导入配置会覆盖当前网关设置（端口保持不变），确定继续？')){e.target.value='';return}
+  msg.style.color='var(--t3)'; msg.textContent='导入中…';
+  try{
+    const text=await f.text();
+    const r=await fetch('/admin/api/config/import',{method:'POST',body:text});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){msg.style.color='var(--d)';msg.textContent='导入失败：'+(d.error||('HTTP '+r.status));return}
+    msg.style.color='var(--ok)'; msg.textContent='导入成功，端口保持 :'+d.port_kept+'，正在刷新页面…';
+    setTimeout(()=>location.reload(),900);
+  }catch(err){
+    msg.style.color='var(--d)'; msg.textContent='导入失败：'+(err.message||'未知错误');
+  }finally{ e.target.value=''; }
+});
+
 document.getElementById('clearStatsBtn').addEventListener('click',async()=>{
   if(!confirm('确定清空全部统计数据？此操作不可恢复。'))return;
   await fetch('/admin/api/clear-stats',{method:'POST'});alert('统计数据已清空');loadOverview();
@@ -7439,7 +8539,6 @@ document.getElementById('ovRangeBar').addEventListener('click', e => {
   const box=document.getElementById('ovCustomBox');
   if(box) box.style.display = state.ovRange==='custom' ? 'flex' : 'none';
   if(state.ovRange==='custom'){
-    // 首次切到自定义：预填最近 7 天，避免空输入框
     const fEl=document.getElementById('ovFrom'), tEl=document.getElementById('ovTo');
     if(fEl && !fEl.value) fEl.value=beijingDateStrBefore(6);
     if(tEl && !tEl.value) tEl.value=nowBeijingDateStr();
@@ -7463,7 +8562,6 @@ document.getElementById('tfRangeBar').addEventListener('click', e => {
   const box=document.getElementById('tfCustomBox');
   if(box) box.style.display = state.tfRange==='custom' ? 'flex' : 'none';
   if(state.tfRange==='custom'){
-    // 首次切到自定义：预填最近 7 天，避免空输入框
     const fEl=document.getElementById('tfFrom'), tEl=document.getElementById('tfTo');
     if(fEl && !fEl.value) fEl.value=beijingDateStrBefore(6);
     if(tEl && !tEl.value) tEl.value=nowBeijingDateStr();
@@ -7504,37 +8602,9 @@ document.getElementById('logoutBtn')?.addEventListener('click', async () => {
   location.href = '/admin/login';
 });
 
-/* ----- PWA 安装提示 -----
- * PWA 恒为开启（内置 manifest + Service Worker）：浏览器满足安装条件时触发
- * beforeinstallprompt，设置页的“安装应用”按钮即可随时安装；
- * 已作为独立应用运行时按钮自动隐藏。 */
-let pwaInstallPrompt=null;
-async function pwaInstall(){
-  if(!pwaInstallPrompt){
-    alert('当前浏览器暂未就绪或已安装。\n提示：可使用浏览器的“添加到主屏幕/安装应用”菜单功能手动安装。');
-    return;
-  }
-  pwaInstallPrompt.prompt();
-  try{
-    const choice=await pwaInstallPrompt.userChoice;
-    if(choice&&choice.outcome==='accepted'){
-      alert('安装成功！\n桌面/主屏幕已出现 Emby Proxy 图标，点击即可从快速启动页进入后台。');
-    }
-  }catch(e){}
-  pwaInstallPrompt=null;
-}
-window.addEventListener('beforeinstallprompt',e=>{
-  e.preventDefault();
-  pwaInstallPrompt=e;
-});
-window.addEventListener('appinstalled',()=>{
-  pwaInstallPrompt=null;
-});
-document.getElementById('pwaInstallBtn')?.addEventListener('click',pwaInstall);
+window.addEventListener('beforeinstallprompt',e=>{ e.preventDefault(); });
 
-/* ---------- 测速链接 ---------- */
 let spdPage=1;const SPD_PAGE_SIZE=5;
-// 加载测速链接列表（分页）
 async function loadSpeedTokens(){
   const box=document.getElementById('spdList');
   if(!box)return;
@@ -7577,9 +8647,7 @@ async function loadSpeedTokens(){
     box.innerHTML=html;
   }catch(e){box.innerHTML='<div style="color:var(--d);font-size:12.5px">加载失败：'+esc(e.message)+'</div>'}
 }
-// 切换测速链接列表的分页
 function spdGo(p){spdPage=p;loadSpeedTokens();}
-// 创建一条限次测速链接
 async function createSpeedToken(){
   const uses=parseInt(document.getElementById('spdUses').value,10)||5;
   try{
@@ -7589,12 +8657,10 @@ async function createSpeedToken(){
     spdPage=1;loadSpeedTokens();
   }catch(e){alert('生成失败：'+e.message)}
 }
-// 删除指定测速链接
 async function delSpeedToken(tok){
   await fetch('/admin/api/speed-tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',token:tok})});
   loadSpeedTokens();
 }
-// 复制测速链接到剪贴板
 function copySpeedUrl(tok){
   const url=location.origin+'/speed/'+tok;
   (navigator.clipboard?navigator.clipboard.writeText(url):Promise.reject()).then(()=>{}).catch(()=>{
@@ -7603,7 +8669,6 @@ function copySpeedUrl(tok){
 }
 document.getElementById('spdCreate')?.addEventListener('click',createSpeedToken);
 
-// 加载历史测速结果列表
 async function loadSpeedResults(){
   const tb=document.getElementById('spdResBody');
   if(!tb)return;
@@ -7628,8 +8693,6 @@ async function loadSpeedResults(){
 }
 
 loadConfig();
-// Chart.js 使用 defer 异步加载：先并行下载，等就绪后再拉概览（趋势图依赖）；
-// 首屏 HTML 解析不再被外部脚本阻塞，最快 10 秒后无论如何继续（图表等切页时再渲染）
 (function waitForChart(){
   if(typeof Chart!=='undefined'){ loadOverview(); return; }
   var n=0;
@@ -7642,8 +8705,8 @@ let ovTimer=setInterval(()=>{if(!document.hidden)loadOverview()},5000);
 document.addEventListener('visibilitychange',()=>{
   if(!document.hidden){
     loadOverview();
-    // 拦截记录页处于激活状态时，回到页面立即刷新一次
     if(document.getElementById('blocks')?.classList.contains('on'))loadBlocks();
+    if(document.getElementById('audit')?.classList.contains('on'))loadAudit();
   }
 });
 </script>
@@ -7651,12 +8714,7 @@ document.addEventListener('visibilitychange',()=>{
 </html>
 ADMIN_HTML
 
-  # heredoc 用的是 <<'GO_SOURCE'（引号形式），变量在里面不会展开，
-  # 所以 Go 源码里的版本号在这里统一注入，保证与顶部 APP_VERSION 一致。
-  # 三处：源码注释头 / PWA manifest 描述 / appVersionStr 常量。
-  # 正则写成 [0-9][0-9.]* 而不是固定的 2.2.0，改版本号后依然幂等。
   sed -i \
-    -e "s/路径反代 v[0-9][0-9.]*服务（单文件）/路径反代 v${APP_VERSION}服务（单文件）/" \
     -e "s/路径反代 v[0-9][0-9.]*管理控制台/路径反代 v${APP_VERSION}管理控制台/" \
     -e "s/^const appVersionStr = \".*\"\$/const appVersionStr = \"${APP_VERSION}\"/" \
     "$dir/main.go"
@@ -7667,7 +8725,7 @@ compute_source_hash() {
   local d h
   d="$(mktemp -d)"
   write_go_source "$d"
-  h="$(cd "$d" && sha256sum main.go admin.html | sha256sum | awk '{print $1}')"
+  h="$(cd "$d" && sha256sum main.go features.go admin.html chart.umd.min.js | sha256sum | awk '{print $1}')"
   rm -rf "$d"
   printf '%s' "$h"
 }
@@ -7700,7 +8758,6 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 UNIT
 }
-# 编译二进制：可选用 --prebuilt；否则写源码、go mod、CGO_ENABLED=0 静态链接
 build_binary() {
   local out="$1"
   if [[ -n "$PREBUILT" ]]; then [[ -f "$PREBUILT" ]] || die "预构建二进制不存在: $PREBUILT"; cp -f "$PREBUILT" "$out"; chmod 0755 "$out"; return; fi
@@ -7740,8 +8797,6 @@ print_access_info() {
   local ip ep; ip="$(local_ip)"; ep="$(effective_port)"
   printf '\n   管理页:  http://%s:%s/admin/\n' "$ip" "$ep"
   printf '   用户名:  %s\n' "$ADMIN_USER"
-  # 密码以数据库为准（后台「修改密码」只更新 DB 哈希，不会改 unit 里的启动参数）
-  # 因此：仅在本次新生成/用户显式指定密码时打印；更新/已有安装不打印 unit 中的旧明文，避免误导
   if [[ ${GENERATED_PASS:-0} -eq 1 ]] || [[ ${PASS_GIVEN:-0} -eq 1 ]]; then
     if [[ -n "$ADMIN_PASS" ]]; then
       printf '   密  码:  %s\n' "$ADMIN_PASS"
@@ -7755,7 +8810,6 @@ print_access_info() {
   printf '   查看日志: journalctl -u %s -f\n\n' "$SERVICE_NAME"
 }
 
-# 限制系统 journal 日志大小，防止磁盘撑爆
 setup_journal_limit() {
   local conf_dir="/etc/systemd/journald.conf.d"
   local conf_file="${conf_dir}/size.conf"
@@ -7770,8 +8824,6 @@ EOF
   fi
 }
 
-# 安装/重装：编译（若源码或 unit 有变）→ 写 systemd unit → enable --now
-# 支持：--port --admin-pass --bin --prebuilt --force --code-only
 cmd_install() {
   parse_install_args "$@"
   require_root install
@@ -7821,7 +8873,6 @@ cmd_install() {
     if [[ -z "$PREBUILT" ]]; then [[ -n "$new_hash" ]] || new_hash="$(compute_source_hash)"; printf '%s' "$new_hash" > "$BUILD_HASH_FILE"; else rm -f "$BUILD_HASH_FILE"; fi
   fi
   if [[ $need_reload -eq 1 ]]; then
-    # 首次安装（尚无 DB 哈希）时临时写入密码引导；启动成功后立即剥离
     local unit_content="$expected_unit"
     local first_boot=0
     if [[ ! -f "$DB_FILE" ]] || ! grep -q "admin_pass_hash" "$DB_FILE" 2>/dev/null; then
@@ -7835,7 +8886,6 @@ cmd_install() {
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE_NAME"
   sleep 2
-  # 首次启动成功后，剥离 unit 中的明文密码并重载
   if [[ ${first_boot:-0} -eq 1 ]] && systemctl is-active --quiet "$SERVICE_NAME"; then
     printf '%s\n' "$expected_unit" > "$UNIT_FILE"
     chmod 0600 "$UNIT_FILE"
@@ -7843,9 +8893,6 @@ cmd_install() {
     info "首次引导完成，已从 unit 中移除明文密码（后续以数据库哈希为准）"
   fi
   sleep 1
-  # Type=simple + Restart=on-failure 时，进程刚崩会进入 5s 重启等待期，
-  # 此时 is-active 返回 activating（非 0）。直接判定会把「还在重启」误报成失败，
-  # 也会让真正的错误信息被吞掉——所以这里最多等 20 秒，并优先看端口是否已监听。
   local waited=0 ep
   ep="$(effective_port)"
   while [[ $waited -lt 20 ]]; do
@@ -7895,7 +8942,6 @@ cmd_uninstall() {
   rm -f "${DEFAULT_BIN}.tmp."* 2>/dev/null || true
   info "卸载完成"
 }
-# 更新：强制重编译并只替换程序（保留配置与 unit 中的端口/密码）
 cmd_update() {
   require_root update
   require_systemd
@@ -8020,7 +9066,6 @@ cmd_menu() {
     esac
   done
 }
-# 入口：无参数默认进入交互菜单
 main() {
   local sub="${1:-menu}"
   if [[ $# -gt 0 ]]; then shift; fi
