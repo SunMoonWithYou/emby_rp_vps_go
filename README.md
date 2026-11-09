@@ -1,286 +1,219 @@
-# Emby 路径反代
+<p align="center">
+  <img src="banner.png" width="100%" alt="Emby 路径反向代理">
+</p>
 
-按路径将请求转发到指定上游的轻量反向代理，面向 Emby / Jellyfin 等媒体服务场景，自带管理后台、访问控制、流量统计与实时连接监控。
+# Emby 路径反向代理
 
-```text
-客户端  →  http://你的服务器:8520/https://emby.example.com:8096/web/index.html
-              │
-              ▼
-         Emby Proxy（本服务）
-              │  白名单 / 地区 / 限流 / UA
-              ▼
-         上游 Emby / 任意 HTTP(S) 服务
-```
+一个基于 Go 开发的 Emby 路径反向代理服务，集成 Web 管理后台、访问统计、流量监控、IP 地区识别、访问规则控制和数据上报等功能。
 
----
+无需单独部署 Nginx，即可通过 URL 路径指定目标地址，实现灵活的反向代理。
 
-## 功能特性
+## ✨ 主要功能
 
-| 类别           | 说明                                                     |
-| -------------- | -------------------------------------------------------- |
-| **路径反代**   | 访问格式 `/https://域名:端口/路径`，自动推断 http/https  |
-| **域名白名单** | 支持根域名匹配；空列表表示不限制                         |
-| **地区限制**   | 可选「仅中国大陆 IP」（本地 IP 库，不依赖外网）          |
-| **黑名单**     | IP / CIDR；可选在地区拦截时自动封禁                      |
-| **限流**       | 按 IP 每分钟请求上限                                     |
-| **UA 白名单**  | 按关键字过滤客户端                                       |
-| **图片缓存**   | 可选缓存上游 `/Images/` 小图（LRU，有容量上限）          |
-| **CORS**       | 可选宽松跨域头，方便部分播放器                           |
-| **管理后台**   | 概览、流量趋势、实时监控、拦截记录、网关设置             |
-| **实时监控**   | WebSocket 推送活跃连接；单连接速率、相对时间、可主动断开 |
-| **统计**       | 按日/时聚合请求与流量，IP / 地区 / 上游排行              |
-| **安全**       | 管理端验证码登录、会话 Cookie；systemd 限制内存          |
+### 1. 路径反向代理
+- 通过 URL 路径指定代理目标，无需提前配置固定的上游地址。
+- 支持 HTTP / HTTPS 自动识别。
+- 根据目标端口自动判断连接协议。
+- 支持自定义目标路径及请求参数。
+- 支持 WebSocket 代理。
+- 支持 Emby 等服务的访问转发。
 
-时间相关展示与统计分桶统一为 **北京时间（Asia/Shanghai）**。
+### 2. Web 管理后台
+- 独立的 Web 管理界面。
+- 用户名、密码登录验证。
+- 验证码登录保护。
+- 支持修改管理配置。
+- 支持限制管理后台访问 IP。
+- 支持操作记录审计。
 
----
+### 3. 访问统计
+- 今日请求数量。
+- 累计请求数量。
+- 上传和下载流量统计。
+- IP 访问次数统计。
+- 国家及地区访问统计。
+- 访问域名统计。
+- 客户端类型及 User-Agent 统计。
+- 每日、每小时数据统计。
+- 实时访问记录及并发连接监控。
 
-## 环境要求
+### 4. 网络流量监控
+- 实时上传速度。
+- 实时下载速度。
+- 实时并发连接数。
+- 实时请求速率。
+- IP 上传和下载流量统计。
 
-- Linux（systemd）
-- root 权限（安装服务）
-- 出网（首次编译拉 Go 模块；可选）
-- Go 1.20+（脚本可自动安装）
+### 5. 访问安全控制
+- 中国大陆 IP 访问限制。
+- IP 黑名单，支持单个 IP 和 CIDR 网段。
+- User-Agent 白名单。
+- 目标域名白名单。
+- 管理后台独立 IP 白名单。
+- 访问拦截记录。
+- 访问规则在线测试，可提前判断请求是否会被放行。
 
-架构支持：`amd64` / `arm64` 等（与官方 Go 发行版一致）。
+### 6. 数据上报与通知
+- 支持定时统计数据上报。
+- 支持自定义上报地址。
+- 支持 Bearer Token。
+- 支持节点名称及备注。
+- 支持昨日访问日报。
+- 支持自定义日报模板。
+- 支持独立设置日报推送地址和 Token。
 
----
-## 一键脚本安装
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/install.sh)
-```
+### 7. 其他功能
+- 独立测速链接生成。
+- 测速链接有效期及使用次数限制。
+- 数据库备份与恢复。
+- 配置导入与导出。
+- 历史统计数据管理。
+- systemd 服务管理。
+- 自动清理临时构建文件。
 
-## 快速安装
+## 🖥️ 环境要求
 
-```bash
-# 下载安装脚本后
-chmod +x install.sh
-sudo bash install.sh
-```
+- Linux 系统
+- systemd
+- root 权限
+- Go 1.20 或更高版本（安装脚本可自动安装）
+- 网络连接，用于下载 Go 及编译依赖
 
-进入交互菜单，选择 **安装 / 重新安装**，按提示设置端口与管理密码。
+## 🚀 安装方法
 
-非交互示例：
-
-```bash
-sudo bash install.sh install \
-  --port 8520 \
-  --admin-pass '你的强密码'
-```
-
-安装完成后访问：
-
-```text
-http://<服务器IP>:<端口>/admin/
-```
-
-默认用户名：`admin`（密码为安装时设置或自动生成的值）。
-
----
-
-## 命令说明
-
-| 命令                              | 说明                               |
-| --------------------------------- | ---------------------------------- |
-| `sudo bash install.sh` | 交互菜单（默认）                   |
-| `… install`                       | 安装 / 重装                        |
-| `… update`                        | 重新编译并替换程序（保留配置）     |
-| `… uninstall`                     | 卸载（可加 `-y`、`--keep-config`） |
-| `… status`                        | 查看 systemd 状态                  |
-| `… start` / `stop` / `restart`    | 控制服务                           |
-
-### install 常用参数
-
-| 参数                  | 说明                                     |
-| --------------------- | ---------------------------------------- |
-| `--port <端口>`       | 监听端口（默认 `8520`）                  |
-| `--admin-pass <密码>` | 管理密码                                 |
-| `--admin-user <用户>` | 管理用户名（默认 `admin`）               |
-| `--bin <路径>`        | 二进制安装路径                           |
-| `--prebuilt <文件>`   | 使用已有二进制，跳过编译                 |
-| `--force`             | 强制重新编译                             |
-| `--code-only`         | 只更新程序，不重写 unit（`update` 使用） |
-
-查看日志：
+使用项目提供的一键安装脚本。
 
 ```bash
-journalctl -u emby-proxy -f
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/install.sh)
 ```
 
----
+首次运行会进入安装菜单，可以选择：
 
-## 使用方式
+1. 设置服务端口。
+2. 设置管理员密码。
+3. 确认安装。
 
-### 代理访问
+默认配置：
 
-在浏览器或播放器中把原来的上游地址改成「代理前缀 + 原 URL」：
+| 项目 | 默认值 |
+|---|---|
+| 服务名称 | emby-proxy |
+| 服务端口 | 8520 |
+| 管理员用户名 | admin |
+| 管理后台 | http://服务器IP:8520/admin/ |
+| 配置目录 | /etc/emby-proxy |
+| 数据库 | /etc/emby-proxy/emby.db |
 
-```text
-# 原地址
-https://emby.example.com:8096/web/index.html
+注意：`install.sh` 请替换为仓库中实际的安装脚本文件名。
 
-# 经本代理
-http://<代理主机>:8520/https://emby.example.com:8096/web/index.html
-```
-
-也支持 `http://` 前缀；若省略协议，会按端口常见习惯推断（如 `8096` → http，`443` → https）。
+## 📖 使用说明
 
 ### 管理后台
 
-登录后包含：
-
-1. **概览** — 请求量、流量、拦截、趋势与系统信息  
-2. **流量与请求** — 分时/按日/按周/按月趋势，IP 与地区排行  
-3. **实时监控** — 当前连接、上下行速率、累计流量；可断开进行中连接  
-4. **拦截记录** — 地区 / 白名单拒绝明细  
-5. **网关设置** — 端口、CORS、缓存、中国大陆限制、限流、UA/域名/IP 名单、改密、清空统计  
-
-实时监控优先使用 **WebSocket**（`/admin/api/live/ws`），不可用时自动回退 HTTP 轮询。离开监控页会清空本页累计记录。
-
----
-
-## 配置项说明
-
-在后台「网关设置」保存，持久化到本地数据库。
-
-| 配置              | 说明                      |
-| ----------------- | ------------------------- |
-| 监听端口          | 保存后尝试热切换监听      |
-| CORS              | 缓解部分播放器跨域问题    |
-| 缓存海报图片      | 缓存上游图片资源          |
-| 仅允许中国大陆 IP | 非 CN（及本机/内网）拒绝  |
-| 自动封禁异常 IP   | 地区拦截时写入黑名单      |
-| 限流              | 次/分钟，`0` 关闭         |
-| UA 白名单         | 每行一个关键字，空=不限制 |
-| 域名白名单        | 每行一个域名，支持根域    |
-| IP 黑名单         | 每行 IP 或 CIDR           |
-
----
-
-## 目录与文件
-
-| 路径                                     | 说明                                 |
-| ---------------------------------------- | ------------------------------------ |
-| `/usr/local/bin/emby-proxy`              | 服务二进制                           |
-| `/etc/emby-proxy/emby.db`                | BoltDB（配置、统计、密码、geo 缓存） |
-| `/etc/emby-proxy/build.sha256`           | 源码哈希，用于判断是否需重编译       |
-| `/etc/systemd/system/emby-proxy.service` | systemd 单元                         |
-
-服务环境变量（unit 内）：
-
-- `GOGC=100`
-- `GOMEMLIMIT=256MiB`（软内存上限，利于小内存 VPS）
-
----
-
-## 反向代理（可选）
-
-若前面还有 Nginx，且要使用管理端 WebSocket，需开启 Upgrade，例如：
-
-```nginx
-    location / {
-        proxy_pass http://127.0.0.1:8520;
-        proxy_http_version 1.1;
-
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-
-        # 媒体流：关掉缓冲，避免二次攒包
-        proxy_buffering         off;
-        proxy_request_buffering off;
-
-        proxy_read_timeout  86400;
-        proxy_send_timeout  86400;
-
-        client_max_body_size 0;
-    }
-```
-
-本服务仅在直连方为回环/私网时信任 `X-Forwarded-For` / `X-Real-IP`。
-
----
-
-## 架构简述
+安装完成后，在浏览器打开：
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│  emby-proxy-install.sh                                  │
-│    写出 main.go + admin.html → go build → systemd       │
-└─────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  emby-proxy                                             │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ 路径解析    │→ │ 访问控制 ACL │→ │ ReverseProxy   │  │
-│  └─────────────┘  └──────────────┘  └────────────────┘  │
-│         │                  │                  │         │
-│         ▼                  ▼                  ▼         │
-│   统计 channel      实时 liveConn        图片 LRU       │
-│   按日落盘          WS 推送活跃连接                      │
-│                                                         │
-│  /admin/*  会话认证 + 嵌入式管理页 + REST/WS API        │
-└─────────────────────────────────────────────────────────┘
+http://服务器IP:8520/admin/
 ```
 
-- **ACL**：配置保存时预编译黑名单 CIDR 与 UA 关键字，降低请求热路径开销。  
-- **统计**：异步写入，定期裁剪 Top-N，避免内存膨胀。  
-- **监控**：WS 只推活跃连接；已结束记录由浏览器本页会话累计。
+使用安装时设置的管理员账号和密码登录。
 
----
+### 反向代理使用
 
-## 更新与卸载
+代理请求采用路径指定目标地址的方式。
+
+基本格式：
+
+```text
+https://你的代理域名/https://目标服务器域名/路径
+```
+
+例如：
+
+```text
+https://proxy.example.com/https://emby.example.com:8920/
+```
+
+访问该地址即可将请求转发到指定的目标服务器。
+
+目标端口协议识别规则：
+
+- 443、8443、8920、9443：默认 HTTPS。
+- 80、8080、8000、8081、8090 等常见 HTTP 端口：默认 HTTP。
+- 其他端口：默认 HTTPS。
+- 也可以在路径中明确指定 HTTP 或 HTTPS。
+
+## ⚙️ 命令行管理
+
+安装脚本支持以下命令：
+
+| 命令 | 功能 |
+|---|---|
+| `menu` | 打开管理菜单 |
+| `install` | 安装或重新安装 |
+| `update` | 更新程序 |
+| `uninstall` | 卸载程序 |
+| `status` | 查看运行状态 |
+| `start` | 启动服务 |
+| `stop` | 停止服务 |
+| `restart` | 重启服务 |
+| `help` | 查看帮助 |
+
+例如：
 
 ```bash
-# 更新到脚本内嵌的最新源码并重编译
-sudo bash emby-proxy-install.sh update
-
-# 卸载（删除服务、程序、配置与统计）
-sudo bash emby-proxy-install.sh uninstall -y
-
-# 卸载但保留配置目录
-sudo bash emby-proxy-install.sh uninstall -y --keep-config
+sudo bash install.sh menu
 ```
 
----
+查看运行状态：
 
-## 安全建议
+```bash
+sudo bash install.sh status
+```
 
-1. 使用强管理密码，并仅在可信网络或经 HTTPS 反代后暴露管理端。  
-2. 生产环境建议配置 **域名白名单**，避免开放任意上游代理。  
-3. 按需开启 **中国大陆限制**、**限流** 与 **UA 白名单**。  
-4. 不要把 systemd unit 中的明文密码提交到公开仓库；unit 权限为 `0600`。  
-5. 若公网暴露，请配合防火墙或反代鉴权。
+更新程序：
 
----
+```bash
+sudo bash install.sh update
+```
 
-## 故障排查
+重启服务：
 
-| 现象               | 建议                                                         |
-| ------------------ | ------------------------------------------------------------ |
-| 服务起不来         | `journalctl -u emby-proxy -n 80 --no-pager`                  |
-| 编译失败           | 设置 `GOPROXY=https://goproxy.cn,direct` 后重试 `update`     |
-| 管理页打不开       | 检查端口监听、`systemctl status emby-proxy`                  |
-| WebSocket 一直轮询 | 检查反代是否支持 `Upgrade`；看后台提示是否为「WebSocket · 实时」 |
-| 地区判断不准       | 本机/内网显示为特殊码；公网依赖本地 IP 库                    |
+```bash
+sudo bash install.sh restart
+```
 
----
+## 🔧 配置与数据
 
-## 许可证
+程序默认使用以下目录：
 
-请根据你的发布意向自行补充（例如 MIT / Apache-2.0 / 仅个人使用等）。
+```text
+/etc/emby-proxy/
+├── emby.db
+└── build.sha256
+```
 
----
+其中：
 
-## 致谢
+- `emby.db`：保存管理配置、统计数据及相关记录。
+- `build.sha256`：保存程序构建校验信息。
 
-- [Go](https://go.dev/)
-- [bbolt](https://github.com/etcd-io/bbolt)
-- [iploc](https://github.com/phuslu/iploc)
-- [gorilla/websocket](https://github.com/gorilla/websocket)
-- [Chart.js](https://www.chartjs.org/)（管理页趋势图）
+建议定期通过管理后台备份数据库，避免意外操作造成数据丢失。
+
+## ⚠️ 注意事项
+
+1. 请确保服务器防火墙及云服务器安全组已放行对应服务端口。
+2. 建议通过 HTTPS 访问管理后台，不要直接将管理后台暴露在不可信网络中。
+3. 请妥善保管管理员账号和密码。
+4. 配置 IP 白名单时，请确认自己的管理 IP 已被允许，避免无法访问后台。
+5. 卸载操作会删除程序、配置、管理员密码和统计数据，请提前备份。
+6. 代理目标地址应当是自己拥有或获得授权访问的服务。
+
+## 📌 项目版本
+
+当前版本：**3.3.0**
+
+## 🙏 致谢
+
+感谢 Go 语言及相关开源项目提供的技术支持。
+
