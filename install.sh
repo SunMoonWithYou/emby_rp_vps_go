@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="3.2.1"
+APP_VERSION="3.3.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -367,6 +367,12 @@ type Config struct {
 	ReportOn    bool     `json:"report_on"`
 	ReportNote  string   `json:"report_note"`
 	AdminAllow  []string `json:"admin_allow"`
+	// 昨日日报自定义格式
+	DailyTmplOn    bool   `json:"daily_tmpl_on"`    // 开启后日报以渲染文本发送，关闭则发送标准 JSON
+	DailyTmpl      string `json:"daily_tmpl"`       // 模板内容，支持 {{date}} {{requests}} 等占位符
+	DailyTmplURL   string `json:"daily_tmpl_url"`   // 日报发送地址，留空使用 report_url
+	DailyTmplToken string `json:"daily_tmpl_token"` // 日报 Bearer Token，留空使用 report_token
+	DailyTmplType  string `json:"daily_tmpl_type"`  // Content-Type，默认 text/plain
 }
 
 var startedAt = time.Now()
@@ -1466,6 +1472,493 @@ func lastFullHourReport() (reportPayload, bool) {
 	return payloadFromDelta(snaps[len(snaps)-2], snaps[len(snaps)-1]), true
 }
 
+// ---------- 昨日统计日报 ----------
+
+// buildDailyReportPayload 汇总某一天（通常为昨天）的完整统计数据，作为日报 payload
+func buildDailyReportPayload(date string) (reportPayload, bool) {
+	statsMu.Lock()
+	d := stats.Daily[date]
+	if d == nil || (d.Requests == 0 && d.Bytes == 0 && d.BlockedCN == 0 && d.BlockedWL == 0 && d.BlockedBan == 0 && d.BlockedUA == 0) {
+		statsMu.Unlock()
+		return reportPayload{}, false
+	}
+	ensureDayMaps(d)
+	p := reportPayload{
+		NodeKey:     getNodeKey(),
+		Node:        detectNodeName(),
+		Note:        cfgPtr.Load().ReportNote,
+		Version:     appVersionStr,
+		ReportedAt:  beijingRFC3339(nowBeijing()),
+		QueueDepth:  len(loadReportQueue()),
+		PeriodDate:  date,
+		PeriodHour:  "daily",
+		Requests:    d.Requests,
+		UpBytes:     d.UpBytes,
+		DownBytes:   d.DownBytes,
+		BlockedCN:   d.BlockedCN,
+		BlockedWL:   d.BlockedWL,
+		BlockedBan:  d.BlockedBan,
+		BlockedUA:   d.BlockedUA,
+		Hosts:       copyInt64Map(d.Hosts),
+		IPs:         copyInt64Map(d.IPs),
+		IPBytes:     copyInt64Map(d.IPBytes),
+		IPUpBytes:   copyInt64Map(d.IPUpBytes),
+		IPDownBytes: copyInt64Map(d.IPDownBytes),
+		Countries:   copyInt64Map(d.Countries),
+		StatDropped: statDropped.Load(),
+	}
+	statsMu.Unlock()
+
+	if t, err := time.ParseInLocation("2006-01-02", date, beijingLoc); err == nil {
+		p.PeriodStart = beijingRFC3339(t)
+		p.PeriodEnd = beijingRFC3339(t.AddDate(0, 0, 1))
+	} else {
+		p.PeriodStart = date + "T00:00:00+08:00"
+		p.PeriodEnd = date + "T23:59:59+08:00"
+	}
+	p.Blocked = p.BlockedCN + p.BlockedWL + p.BlockedBan + p.BlockedUA
+	p.IPRequests = p.IPs
+	pruneTopN(p.Hosts, 100)
+	pruneTopN(p.IPs, 100)
+	if p.Countries != nil {
+		named := make(map[string]int64, len(p.Countries))
+		for code, v := range p.Countries {
+			named[countryName(code)] += v
+		}
+		p.Countries = named
+	}
+	keepIPs := topIPsByTotal(p.IPBytes, p.IPUpBytes, p.IPDownBytes, 100)
+	p.IPBytes = alignIPStats(p.IPBytes, keepIPs)
+	p.IPUpBytes = alignIPStats(p.IPUpBytes, keepIPs)
+	p.IPDownBytes = alignIPStats(p.IPDownBytes, keepIPs)
+	p.IPStatsOK = len(p.IPBytes) > 0
+	p.BatchID = p.NodeKey + "-" + date + "-daily"
+	return p, true
+}
+
+// lastDailyReportSent 读取已发送日报的最后日期（防重），空串表示从未发送
+func lastDailyReportSent() string {
+	var m struct {
+		Date string `json:"date"`
+	}
+	_ = db.View(func(tx *bolt.Tx) error {
+		if b := tx.Bucket([]byte("report_queue")); b != nil {
+			if raw := b.Get([]byte("daily_sent")); raw != nil {
+				_ = json.Unmarshal(raw, &m)
+			}
+		}
+		return nil
+	})
+	return m.Date
+}
+
+func markDailyReportSent(date string) {
+	raw, _ := json.Marshal(map[string]string{"date": date, "time": beijingRFC3339(nowBeijing())})
+	_ = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("report_queue"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("daily_sent"), raw)
+	})
+}
+
+// ---------- 昨日日报自定义发送格式 ----------
+
+const defaultDailyTmpl = `【昨日统计】{{date}}
+节点：{{node}}
+请求：{{requests}} 次
+流量：↓ {{down}} / ↑ {{up}}（共 {{total}}）
+拦截：{{blocked}} 次（CN {{blocked_cn}} / BAN {{blocked_ban}} / UA {{blocked_ua}} / 白名单 {{blocked_wl}}）
+Top IP：{{ips_top}}
+Top 流量 IP：{{ip_bytes_top}}
+Top 域名：{{hosts_top}}
+国家/地区：{{countries_top}}`
+
+func humanBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	div, exp := int64(1024), 0
+	for m := n / 1024; m >= 1024 && exp < len(units)-1; m /= 1024 {
+		div *= 1024
+		exp++
+	}
+	s := fmt.Sprintf("%.2f", float64(n)/float64(div))
+	s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	return s + " " + units[exp]
+}
+
+// topListText 取计数前 N 项，渲染为 "键×次数" 列表；asBytes 为 true 时次数显示为可读流量
+func topListText(m map[string]int64, n int, asBytes bool) string {
+	type kv struct {
+		k string
+		v int64
+	}
+	arr := make([]kv, 0, len(m))
+	for k, v := range m {
+		arr = append(arr, kv{k, v})
+	}
+	if len(arr) == 0 {
+		return "无"
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].v != arr[j].v {
+			return arr[i].v > arr[j].v
+		}
+		return arr[i].k < arr[j].k
+	})
+	if n <= 0 || n > len(arr) {
+		n = len(arr)
+	}
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		if asBytes {
+			parts = append(parts, arr[i].k+"×"+humanBytes(arr[i].v))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s×%d", arr[i].k, arr[i].v))
+		}
+	}
+	s := strings.Join(parts, "、")
+	if len(arr) > n {
+		s += fmt.Sprintf(" 等 %d 项", len(arr))
+	}
+	return s
+}
+
+// renderDailyTemplate 把 payload 渲染进模板占位符
+// renderDailyTemplate 渲染日报模板；jsonSafe 为 true 时（模板是 JSON，如 Telegram sendMessage）
+// 会对替换值做 JSON 转义，保证多行排行占位符不会破坏 JSON 结构
+func renderDailyTemplate(tmpl string, p reportPayload, date string, jsonSafe bool) string {
+	total := p.UpBytes + p.DownBytes
+	repl := map[string]string{
+		"{{date}}":         date,
+		"{{period_start}}": p.PeriodStart,
+		"{{period_end}}":   p.PeriodEnd,
+		"{{node}}":         p.Node,
+		"{{note}}":         p.Note,
+		"{{version}}":      p.Version,
+		"{{requests}}":     fmt.Sprintf("%d", p.Requests),
+		"{{requests_raw}}": strconv.FormatInt(p.Requests, 10),
+		"{{up}}":           humanBytes(p.UpBytes),
+		"{{down}}":         humanBytes(p.DownBytes),
+		"{{total}}":        humanBytes(total),
+		"{{up_raw}}":       strconv.FormatInt(p.UpBytes, 10),
+		"{{down_raw}}":     strconv.FormatInt(p.DownBytes, 10),
+		"{{blocked}}":      fmt.Sprintf("%d", p.Blocked),
+		"{{blocked_cn}}":   fmt.Sprintf("%d", p.BlockedCN),
+		"{{blocked_wl}}":   fmt.Sprintf("%d", p.BlockedWL),
+		"{{blocked_ban}}":  fmt.Sprintf("%d", p.BlockedBan),
+		"{{blocked_ua}}":   fmt.Sprintf("%d", p.BlockedUA),
+		"{{ips_top}}":      topListText(p.IPs, 5, false),
+		"{{ip_bytes_top}}": topListText(p.IPBytes, 5, true),
+		"{{hosts_top}}":    topListText(p.Hosts, 5, false),
+		"{{countries_top}}": topListText(p.Countries, 8, false),
+		"{{ips_top_lines}}":       topListLines(p.IPs, 5, false),
+		"{{ip_bytes_top_lines}}":  topListLines(p.IPBytes, 5, true),
+		"{{hosts_top_lines}}":     topListLines(p.Hosts, 5, false),
+		"{{countries_top_lines}}": topListLines(p.Countries, 8, false),
+	}
+	if jsonSafe {
+		for k, v := range repl {
+			repl[k] = jsonSafeValue(v)
+		}
+	}
+	out := tmpl
+	for k, v := range repl {
+		out = strings.ReplaceAll(out, k, v)
+	}
+	return out
+}
+
+// looksLikeJSONTmpl 判断模板是否为 JSON 请求体（如 Telegram sendMessage 的 {"chat_id":...,"text":"..."}）
+func looksLikeJSONTmpl(tmpl string) bool {
+	return strings.HasPrefix(strings.TrimSpace(tmpl), "{")
+}
+
+// topListLines 取计数前 N 项，每项独占一行，格式 "键 · 值"，适合 Telegram/IM 多行展示
+func topListLines(m map[string]int64, n int, asBytes bool) string {
+	type kv struct {
+		k string
+		v int64
+	}
+	arr := make([]kv, 0, len(m))
+	for k, v := range m {
+		arr = append(arr, kv{k, v})
+	}
+	if len(arr) == 0 {
+		return "（无）"
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].v != arr[j].v {
+			return arr[i].v > arr[j].v
+		}
+		return arr[i].k < arr[j].k
+	})
+	if n <= 0 || n > len(arr) {
+		n = len(arr)
+	}
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		if asBytes {
+			parts = append(parts, arr[i].k+" · "+humanBytes(arr[i].v))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s · %d 次", arr[i].k, arr[i].v))
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// jsonSafeValue 把值转义为可安全嵌入 JSON 字符串的形式（反斜杠/引号/换行）
+func jsonSafeValue(v string) string {
+	v = strings.ReplaceAll(v, "\\", "\\\\")
+	v = strings.ReplaceAll(v, "\"", "\\\"")
+	v = strings.ReplaceAll(v, "\n", "\\n")
+	v = strings.ReplaceAll(v, "\r", "")
+	return v
+}
+
+func mustJSON(v any) []byte {
+	raw, _ := json.Marshal(v)
+	return raw
+}
+
+// dailySendSpec 返回要发送的日报内容与触发标记：模板开启返回渲染文本，否则返回标准 JSON
+func dailySendSpec(c *Config, p reportPayload, date string) (body []byte, trigger, id string) {
+	raw, _ := json.Marshal(p)
+	if !c.DailyTmplOn {
+		return raw, "daily", p.BatchID
+	}
+	tmpl := c.DailyTmpl
+	if strings.TrimSpace(tmpl) == "" {
+		tmpl = defaultDailyTmpl
+	}
+	jsonMode := dailyContentType(c) == "application/json" && looksLikeJSONTmpl(tmpl)
+	return []byte(renderDailyTemplate(tmpl, p, date, jsonMode)), "daily-text", p.BatchID
+}
+
+// dailyTarget 返回日报的发送地址与 Token（模板模式下可用独立地址）
+func dailyTarget(c *Config) (string, string) {
+	if c.DailyTmplOn && strings.TrimSpace(c.DailyTmplURL) != "" {
+		return strings.TrimSpace(c.DailyTmplURL), strings.TrimSpace(c.DailyTmplToken)
+	}
+	return c.ReportURL, c.ReportToken
+}
+
+func dailyContentType(c *Config) string {
+	if c.DailyTmplOn {
+		if t := strings.TrimSpace(c.DailyTmplType); t != "" {
+			return t
+		}
+		return "text/plain"
+	}
+	return "application/json"
+}
+
+// isGetUpdatesURL 判断是否误用了 Telegram 的 getUpdates 接口（只能拉取消息，发不出通知）
+func isGetUpdatesURL(u string) bool {
+	s := strings.ToLower(strings.TrimRight(strings.TrimSpace(u), "/"))
+	return strings.HasSuffix(s, "/getupdates")
+}
+
+// notifyRejected 判断接收端是否「HTTP 200 但实际没送达」：
+//   - HTTP 状态码 >= 400
+//   - 响应体为 JSON 且 ok=false（取 description 作为原因）
+//   - 响应体为 JSON 且 result 为空数组（如 Telegram /getUpdates 只拉取消息，POST 后返回 result:[]，消息并未发出）
+func notifyRejected(status int, respBody string) (bool, string) {
+	body := strings.TrimSpace(respBody)
+	var m map[string]any
+	parsed := json.Unmarshal([]byte(body), &m) == nil
+	if parsed {
+		if okv, has := m["ok"].(bool); has && !okv {
+			desc, _ := m["description"].(string)
+			if strings.TrimSpace(desc) == "" {
+				desc = fmt.Sprintf("接收端返回 ok=false（HTTP %d）", status)
+			}
+			return true, desc
+		}
+		if arr, has := m["result"].([]any); has && len(arr) == 0 && status < 400 {
+			return true, "接收端返回 result 为空数组：HTTP 200 但未执行发送动作（Telegram /getUpdates 只能拉取消息，发通知需用 /sendMessage）"
+		}
+	}
+	if status >= 400 {
+		return true, ""
+	}
+	return false, ""
+}
+
+// checkNotifyResult 把「假成功」转成 error；正常送达返回 nil
+func checkNotifyResult(status int, respBody string) error {
+	bad, why := notifyRejected(status, respBody)
+	if !bad {
+		return nil
+	}
+	if strings.TrimSpace(why) == "" {
+		why = fmt.Sprintf("接收端返回 HTTP %d，请求被拒绝", status)
+	}
+	return fmt.Errorf("%s", why)
+}
+
+// reportChannelPlan 描述一条上报通道当前是否会执行、下一次执行时间与原因
+type reportChannelPlan struct {
+	Ready  bool   `json:"ready"`
+	Reason string `json:"reason"`
+	Next   string `json:"next"`
+	Mode   string `json:"mode,omitempty"` // 通知通道：template / json / off
+}
+
+type reportPlan struct {
+	API   reportChannelPlan `json:"api"`
+	Daily reportChannelPlan `json:"daily"`
+}
+
+// buildReportPlan 计算两条通道的执行计划：
+//   - 接口上报：需「自动上报开启」且「接收地址非空」，否则不执行
+//   - 通知推送：需「按模板发送开启」且「发送地址非空」且「模板内容非空」，否则不执行
+//
+// 两条通道互不影响，任意一条未配置完整都只是它自己不执行。
+func buildReportPlan(c *Config) reportPlan {
+	if c == nil {
+		c = &Config{}
+	}
+	now := nowBeijing()
+	var pl reportPlan
+
+	nextHour := now.Truncate(time.Hour).Add(5 * time.Second)
+	if !nextHour.After(now) {
+		nextHour = nextHour.Add(time.Hour)
+	}
+	pl.API.Next = beijingRFC3339(nextHour)
+	switch {
+	case strings.TrimSpace(c.ReportURL) == "":
+		pl.API.Reason = "未填写接收地址，不会执行"
+	case !c.ReportOn:
+		pl.API.Reason = "每小时上报开关已关闭，不会执行"
+	default:
+		pl.API.Ready = true
+		pl.API.Reason = "运行中：每小时整点发送上一小时增量"
+	}
+
+	nextDaily := time.Date(now.Year(), now.Month(), now.Day(), 0, 10, 0, 0, beijingLoc)
+	if !nextDaily.After(now) {
+		nextDaily = nextDaily.AddDate(0, 0, 1)
+	}
+	pl.Daily.Next = beijingRFC3339(nextDaily)
+	tURL, _ := dailyTarget(c)
+	if c.DailyTmplOn {
+		pl.Daily.Mode = "template"
+		switch {
+		case strings.TrimSpace(tURL) == "":
+			pl.Daily.Reason = "已开启模板推送但未填写发送地址，不会执行"
+		case isGetUpdatesURL(tURL):
+			pl.Daily.Reason = "发送地址以 /getUpdates 结尾，发不出通知，请改为 /sendMessage"
+		case strings.TrimSpace(c.DailyTmpl) == "":
+			pl.Daily.Reason = "已开启模板推送但模板内容为空，不会执行（填写模板后自动生效）"
+		default:
+			pl.Daily.Ready = true
+			pl.Daily.Reason = "运行中：每天 00:10 推送模板消息"
+		}
+		return pl
+	}
+	// 未开启模板推送：日报作为接口上报通道的附带内容（JSON 日报）
+	if pl.API.Ready {
+		pl.Daily.Mode = "json"
+		pl.Daily.Ready = true
+		pl.Daily.Reason = "未开启模板推送，日报随接口上报通道发 JSON（依赖上方接收地址）"
+	} else {
+		pl.Daily.Mode = "off"
+		pl.Daily.Reason = "未开启模板推送，且接口上报未运行，不会发送日报"
+	}
+	return pl
+}
+
+// sendDailyReportIfDue 检查并补发缺失的昨日日报（含服务中断期间的日期，最多回溯 7 天）
+func sendDailyReportIfDue() int {
+	c := cfgPtr.Load()
+	if c == nil {
+		return 0
+	}
+	// 通知与接口上报相互独立：
+	//   - 自定义格式（通知通道）开启即可发日报，无需配置上报地址或开启自动上报
+	//   - 未开启自定义格式时，日报仍作为接口上报的一部分，需 ReportOn 开启
+	if !c.DailyTmplOn && !c.ReportOn {
+		return 0
+	}
+	// 已开启模板推送但未填写模板内容 → 视为未配置，定时任务不执行（手动发送仍可用默认模板）
+	if c.DailyTmplOn && strings.TrimSpace(c.DailyTmpl) == "" {
+		return 0
+	}
+	tURL, _ := dailyTarget(c)
+	if tURL == "" {
+		return 0
+	}
+	if isGetUpdatesURL(tURL) {
+		return 0 // 误用拉取接口，发送必然无效，跳过以免队列堆积
+	}
+	yd := nowBeijing().AddDate(0, 0, -1)
+	end := beijingDate(yd)
+	last := lastDailyReportSent()
+	if last != "" && last >= end {
+		return 0
+	}
+	var from time.Time
+	if last == "" {
+		from = yd.AddDate(0, 0, -6)
+	} else if t, err := time.ParseInLocation("2006-01-02", last, beijingLoc); err == nil {
+		from = t.AddDate(0, 0, 1)
+	} else {
+		from = yd
+	}
+	sent := 0
+	for d := from; !d.After(yd); d = d.AddDate(0, 0, 1) {
+		date := beijingDate(d)
+		p, ok := buildDailyReportPayload(date)
+		if !ok {
+			continue // 该日无统计数据（无流量或服务未运行），跳过且不标记
+		}
+		body, trigger, id := dailySendSpec(c, p, date)
+		q := queuedReport{ID: id, Payload: body, Created: p.ReportedAt, Trigger: trigger}
+		if c.DailyTmplOn {
+			q.URL, q.Token = dailyTarget(c)
+			q.ContentType = dailyContentType(c)
+		}
+		reportQueueMu.Lock()
+		list := loadReportQueue()
+		list = append(list, q)
+		if len(list) > maxReportQueue {
+			list = list[len(list)-maxReportQueue:]
+		}
+		saveReportQueue(list)
+		reportQueueMu.Unlock()
+		markDailyReportSent(date)
+		sent++
+	}
+	if sent > 0 {
+		flushReportQueue()
+	}
+	return sent
+}
+
+// startDailyReportWorker 每天 00:10（北京时间）发送昨日统计；启动时先补发一次
+func startDailyReportWorker() {
+	go func() {
+		sendDailyReportIfDue()
+		for {
+			now := nowBeijing()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 0, 10, 0, 0, beijingLoc)
+			if !next.After(now) {
+				next = next.AddDate(0, 0, 1)
+			}
+			time.Sleep(time.Until(next))
+			sendDailyReportIfDue()
+		}
+	}()
+}
+
 func parseRFC3339(s string) time.Time {
 	t, _ := time.Parse(time.RFC3339, s)
 	return t
@@ -1724,12 +2217,19 @@ func startReportRecordCleaner() {
 
 const maxReportQueue = 24
 
+// maxQueueAttempts 单条队列项最大重试次数，超过则放弃（防止坏地址无限堆积）
+const maxQueueAttempts = 50
+
 type queuedReport struct {
-	ID       string `json:"id"`
-	Payload  []byte `json:"payload"`
-	Created  string `json:"created"`
-	Attempts int    `json:"attempts"`
-	LastErr  string `json:"last_err,omitempty"`
+	ID          string `json:"id"`
+	Payload     []byte `json:"payload"`
+	Created     string `json:"created"`
+	Attempts    int    `json:"attempts"`
+	LastErr     string `json:"last_err,omitempty"`
+	Trigger     string `json:"trigger,omitempty"`
+	URL         string `json:"url,omitempty"`         // 留空使用全局 report_url
+	Token       string `json:"token,omitempty"`       // 留空使用全局 report_token
+	ContentType string `json:"content_type,omitempty"` // 留空为 application/json
 }
 
 func loadReportQueue() []queuedReport {
@@ -1759,13 +2259,20 @@ func saveReportQueue(list []queuedReport) {
 }
 
 func sendOnceResp(url, token string, body []byte) (int, string, error) {
+	return sendOnceRespCT(url, token, body, "application/json")
+}
+
+func sendOnceRespCT(url, token string, body []byte, contentType string) (int, string, error) {
+	if contentType == "" {
+		contentType = "application/json"
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "emby-proxy/"+appVersionStr)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -1793,7 +2300,7 @@ func errString(err error) string {
 
 func flushReportQueue() {
 	c := cfgPtr.Load()
-	if c == nil || c.ReportURL == "" {
+	if c == nil {
 		return
 	}
 	reportQueueMu.Lock()
@@ -1802,6 +2309,52 @@ func flushReportQueue() {
 	if len(list) == 0 {
 		return
 	}
+	if c.ReportURL == "" {
+		// 全局接收地址为空时，仅补传自带目标地址的队列项（如日报独立发送地址）；
+		// 依赖全局地址的旧队列项永远无法补传，直接清理掉（写入一条说明性记录，便于用户理解队列为何减少）
+		hasOwn := false
+		for _, it := range list {
+			if it.URL != "" {
+				hasOwn = true
+				break
+			}
+		}
+		if !hasOwn {
+			if len(list) > 0 {
+				rec := reportRecord{
+					Time:     beijingRFC3339(nowBeijing()),
+					BatchID:  "queue-cleanup",
+					Trigger:  "cleanup",
+					OK:       true,
+					RespBody: fmt.Sprintf("接口上报未配置接收地址，清理了 %d 条无法补传的历史队列项", len(list)),
+				}
+				appendReportRecord(rec, nil)
+			}
+			saveReportQueue(nil)
+			return
+		}
+		// 混合情况：丢弃无地址项，保留自带地址项继续补传
+		kept := make([]queuedReport, 0, len(list))
+		for _, it := range list {
+			if it.URL == "" {
+				rec := reportRecord{
+					Time:     beijingRFC3339(nowBeijing()),
+					BatchID:  it.ID,
+					Trigger:  "cleanup",
+					OK:       true,
+					RespBody: "接口上报未配置接收地址，该队列项已清理",
+				}
+				appendReportRecord(rec, it.Payload)
+				continue
+			}
+			kept = append(kept, it)
+		}
+		list = kept
+		if len(list) == 0 {
+			saveReportQueue(list)
+			return
+		}
+	}
 	keep := list[:0]
 	stopped := false
 	for _, it := range list {
@@ -1809,9 +2362,39 @@ func flushReportQueue() {
 			keep = append(keep, it)
 			continue
 		}
+		if it.Attempts >= maxQueueAttempts {
+			rec := reportRecord{
+				Time:     beijingRFC3339(nowBeijing()),
+				BatchID:  it.ID,
+				Trigger:  "cleanup",
+				OK:       false,
+				Error:    fmt.Sprintf("重试 %d 次仍失败，已放弃：%s", it.Attempts, it.LastErr),
+				Attempts: it.Attempts,
+			}
+			appendReportRecord(rec, it.Payload)
+			continue
+		}
 		start := time.Now()
-		status, respBody, err := sendOnceResp(c.ReportURL, c.ReportToken, it.Payload)
-		rec := recordFromPayload(it.Payload, it.ID, "retry", status, respBody, err, it.Attempts+1, start, "", c.ReportURL)
+		trigger := it.Trigger
+		if trigger == "" {
+			trigger = "retry"
+		}
+		targetURL := c.ReportURL
+		targetToken := c.ReportToken
+		if it.URL != "" {
+			targetURL = it.URL
+			targetToken = it.Token
+		}
+		sendCT := it.ContentType
+		if sendCT == "" {
+			sendCT = "application/json"
+		}
+		status, respBody, err := sendOnceRespCT(targetURL, targetToken, it.Payload, sendCT)
+		// 通知类队列项（自带地址或模板触发）同样识别「假成功」
+		if err == nil && (it.URL != "" || strings.Contains(trigger, "text")) {
+			err = checkNotifyResult(status, respBody)
+		}
+		rec := recordFromPayload(it.Payload, it.ID, trigger, status, respBody, err, it.Attempts+1, start, "", targetURL)
 		rec.Note = c.ReportNote
 		appendReportRecord(rec, it.Payload)
 		if err != nil {
@@ -1868,7 +2451,7 @@ func enqueueAndSend() {
 
 	reportQueueMu.Lock()
 	list := loadReportQueue()
-	list = append(list, queuedReport{ID: p.BatchID, Payload: raw, Created: p.ReportedAt})
+	list = append(list, queuedReport{ID: p.BatchID, Payload: raw, Created: p.ReportedAt, Trigger: "auto"})
 	if len(list) > maxReportQueue {
 		list = list[len(list)-maxReportQueue:]
 	}
@@ -4827,6 +5410,9 @@ func adminHandler() http.HandlerFunc {
 				"keep_days": reportRecordKeepDays,
 				"url":       cfg.ReportURL,
 				"on":        cfg.ReportOn,
+				"tmpl_on":   cfg.DailyTmplOn,
+				"tmpl_url":  cfg.DailyTmplURL,
+				"plan":      buildReportPlan(cfg),
 			})
 			return
 		}
@@ -4870,12 +5456,34 @@ func adminHandler() http.HandlerFunc {
 		}
 
 		c := cfgPtr.Load()
-		if c == nil || c.ReportURL == "" {
-			http.Error(w, `{"error":"尚未配置上报地址"}`, http.StatusBadRequest)
+		if c == nil {
+			http.Error(w, `{"error":"配置尚未加载，请稍后再试"}`, http.StatusBadRequest)
 			return
 		}
 		if req.Action == "flush" {
 			flushReportQueue()
+		}
+		if req.Action == "clear_queue" {
+			n := len(loadReportQueue())
+			_ = db.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("report_queue"))
+				if b == nil {
+					return nil
+				}
+				c2 := b.Cursor()
+				for k, _ := c2.First(); k != nil; k, _ = c2.Next() {
+					if string(k) == "daily_sent" {
+						continue // 保留日报防重标记
+					}
+					if err := b.Delete(k); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			recordAudit(getClientIP(r), "report_clear_queue", "清空待补传队列")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "cleared": n})
+			return
 		}
 		if req.Action == "clear" {
 			_ = db.Update(func(tx *bolt.Tx) error {
@@ -4894,7 +5502,72 @@ func adminHandler() http.HandlerFunc {
 			for _, it := range q {
 				out = append(out, map[string]any{"id": it.ID, "created": it.Created, "attempts": it.Attempts, "last_err": it.LastErr})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"queue": out, "depth": len(q), "url": c.ReportURL, "on": c.ReportOn})
+			_ = json.NewEncoder(w).Encode(map[string]any{"queue": out, "depth": len(q), "url": c.ReportURL, "on": c.ReportOn, "tmpl_on": c.DailyTmplOn, "tmpl_url": c.DailyTmplURL})
+			return
+		}
+		if req.Action == "daily" {
+			// 通知通道与接口上报相互独立：自定义格式已配置独立地址即可发送，无需配置上报地址
+			tURL, tToken := dailyTarget(c)
+			if tURL == "" {
+				http.Error(w, `{"error":"尚未配置日报发送地址或上报地址，无法发送昨日统计"}`, http.StatusBadRequest)
+				return
+			}
+			if isGetUpdatesURL(tURL) {
+				http.Error(w, `{"error":"日报发送地址以 /getUpdates 结尾：该接口只能拉取消息，发不出通知。请改为 .../sendMessage，Content-Type 选 application/json"}`, http.StatusBadRequest)
+				return
+			}
+			yd := beijingDate(nowBeijing().AddDate(0, 0, -1))
+			p, ok := buildDailyReportPayload(yd)
+			if !ok {
+				http.Error(w, `{"error":"暂无昨天的统计数据（昨天无流量或服务未运行）"}`, http.StatusBadRequest)
+				return
+			}
+			body, trigger, id := dailySendSpec(c, p, yd)
+			ct := dailyContentType(c)
+			start := time.Now()
+			status, respBody, err := sendOnceRespCT(tURL, tToken, body, ct)
+			// 通知通道：识别「HTTP 200 但实际没送达」的假成功（Telegram ok:false、result 为空数组等）
+			if err == nil && c.DailyTmplOn {
+				err = checkNotifyResult(status, respBody)
+			}
+			clientIP := getClientIP(r)
+			rec := recordFromPayload(body, id, trigger, status, respBody, err, 1, start, clientIP, tURL)
+			appendReportRecord(rec, body)
+			recordAudit(clientIP, "report_daily", tURL)
+			if err != nil {
+				reportQueueMu.Lock()
+				list := loadReportQueue()
+				list = append(list, queuedReport{ID: id, Payload: body, Created: p.ReportedAt, Attempts: 1, LastErr: err.Error(), Trigger: trigger, URL: tURL, Token: tToken, ContentType: ct})
+				if len(list) > maxReportQueue {
+					list = list[len(list)-maxReportQueue:]
+				}
+				saveReportQueue(list)
+				reportQueueMu.Unlock()
+			} else {
+				markDailyReportSent(yd)
+			}
+			var payloadObj any
+			_ = json.Unmarshal(mustJSON(p), &payloadObj)
+			w.WriteHeader(http.StatusOK)
+			resp := map[string]any{
+				"ok":          err == nil,
+				"payload":     payloadObj,
+				"resp_status": status,
+				"resp_body":   respBody,
+				"error":       errString(err),
+				"queued":      err != nil,
+				"record_id":   rec.ID,
+				"content_type": ct,
+				"target":      tURL,
+			}
+			if c.DailyTmplOn {
+				resp["text"] = string(body)
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if c.ReportURL == "" {
+			http.Error(w, `{"error":"尚未配置上报地址（接收地址）；如需推送 Telegram 等通知，请使用「发送昨日统计」"}`, http.StatusBadRequest)
 			return
 		}
 		p, ok := lastFullHourReport()
@@ -5126,6 +5799,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	startNetSpeedSampler()
 	startHourlySnapshotWorker()
 	startReportWorker()
+	startDailyReportWorker()
 	detectSelfPublicIP()
 	publishStatsView()
 	initSessionsCleanup()
@@ -6829,13 +7503,31 @@ td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overf
 .stat-b .v{font-size:19px;font-weight:700;letter-spacing:-.4px;color:var(--t)}
 .stat-b .v small{font-size:11px;font-weight:500;color:var(--t3);margin-left:2px}
 .rp-g{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;white-space:nowrap}
+.rp-chs{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.rp-chs{grid-template-columns:1fr}}
+.rp-ch{border:1px solid var(--bd);border-radius:14px;padding:16px;background:rgba(148,163,184,.06);display:flex;flex-direction:column;gap:12px}
+.rp-ch.off{background:rgba(148,163,184,.03)}
+.rp-ch-hd{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.rp-ch-t{font-weight:700;font-size:14px;color:var(--t)}
+.rp-ch-hd .sw{margin-left:auto}
+.rp-ch-kv{display:flex;flex-direction:column;gap:6px;font-size:12.5px}
+.rp-ch-kv>div{display:flex;gap:10px;align-items:baseline;min-width:0}
+.rp-ch-kv span{color:var(--t3);flex:0 0 62px}
+.rp-ch-kv b{font-weight:600;color:var(--t2);font-size:12px;word-break:break-all;font-family:var(--mono,monospace);min-width:0}
+.rp-ch-hint{font-size:12px;line-height:1.6;padding:8px 10px;border-radius:8px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);color:#b45309}
+.rp-ch-hint.ok{background:rgba(16,185,129,.09);border-color:rgba(16,185,129,.25);color:#047857}
+.rp-ch-hint.bad{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.25);color:#b91c1c}
 .rp-g.ok{background:rgba(16,185,129,.12);color:#047857}
 .rp-g.bad{background:rgba(239,68,68,.12);color:#b91c1c}
 .rp-g.wt{background:rgba(245,158,11,.14);color:#b45309}
 .rp-tg{display:inline-block;font-size:11.5px;padding:2px 7px;border-radius:5px;background:#f1f5f9;color:var(--t2);white-space:nowrap}
 .rp-tg.auto{background:var(--ps);color:var(--pd)}
+.rp-tg.daily{background:rgba(37,99,235,.12);color:#1d4ed8}
 .rp-tg.manual{background:rgba(245,158,11,.14);color:#b45309}
+.rp-tg.manual-daily{background:rgba(37,99,235,.12);color:#1d4ed8}
+.rp-tg.daily-text,.rp-tg.manual-daily-text{background:rgba(124,58,237,.12);color:#6d28d9}
 .rp-tg.retry{background:rgba(239,68,68,.1);color:#b91c1c}
+.rp-tg.cleanup{background:rgba(148,163,184,.16);color:#64748b}
 .rp-row{cursor:pointer}
 .rp-row:hover td{background:#f8fafc}
 .rp-pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px;font:12px/1.6 var(--mono);overflow:auto;max-height:300px;white-space:pre-wrap;word-break:break-all;margin-top:6px}
@@ -7160,13 +7852,39 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </section>
 <section id="report" class="pg">
 <div class="card">
-  <div class="ch">
-    <div><h2 class="ct">上报状态</h2><div class="cd">每小时整点将「上一个自然小时」的增量 POST 到接收地址（JSON + Bearer Token），失败自动排队重试，重启不丢</div></div>
-    <div style="display:flex;align-items:center;gap:10px">
-      <span id="rpState" class="rp-g wt">读取中</span>
-      <label class="sw" title="开启/关闭每小时自动上报"><input type="checkbox" id="reportOn"><span class="tr2"></span></label>
+  <div class="ch"><div><h2 class="ct">定时任务总览</h2><div class="cd">两条通道各自独立、互不影响：任意一条未配置完整（地址 / 模板）都不会执行，也不会影响另一条</div></div></div>
+  <div class="rp-chs">
+    <div class="rp-ch" id="chApiCard">
+      <div class="rp-ch-hd">
+        <span class="rp-ch-t">📤 接口上报</span>
+        <span id="chApiState" class="rp-g wt">读取中</span>
+        <label class="sw" title="开启 / 关闭每小时接口上报"><input type="checkbox" id="reportOn"><span class="tr2"></span></label>
+      </div>
+      <div class="rp-ch-kv">
+        <div><span>频率</span><b>每小时整点（:00:05）</b></div>
+        <div><span>接收地址</span><b id="chApiUrl">—</b></div>
+        <div><span>下次执行</span><b id="chApiNext">—</b></div>
+      </div>
+      <div class="rp-ch-hint" id="chApiHint">—</div>
+    </div>
+    <div class="rp-ch" id="chDailyCard">
+      <div class="rp-ch-hd">
+        <span class="rp-ch-t">🔔 通知推送</span>
+        <span id="chDailyState" class="rp-g wt">读取中</span>
+        <label class="sw" title="开启 / 关闭每日日报推送"><input type="checkbox" id="dailyTmplOn"><span class="tr2"></span></label>
+      </div>
+      <div class="rp-ch-kv">
+        <div><span>频率</span><b>每天 00:10</b></div>
+        <div><span>发送地址</span><b id="chDailyUrl">—</b></div>
+        <div><span>下次执行</span><b id="chDailyNext">—</b></div>
+      </div>
+      <div class="rp-ch-hint" id="chDailyHint">—</div>
     </div>
   </div>
+</div>
+
+<div class="card">
+  <div class="ch"><div><h2 class="ct">投递统计</h2><div class="cd">最近 24 小时的发送结果与待补传队列</div></div></div>
   <div class="stat-grid" id="rpStats">
     <div class="stat-b"><div class="k">近 24 小时成功</div><div class="v" id="rpOk">—</div></div>
     <div class="stat-b"><div class="k">近 24 小时失败</div><div class="v" id="rpFail">—</div></div>
@@ -7178,8 +7896,8 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </div>
 
 <div class="card">
-  <div class="ch"><div><h2 class="ct">上报配置</h2><div class="cd">接收地址、鉴权与备注；服务器备注会随每批数据一起发出，便于接收端区分多台机器</div></div></div>
-  <div class="fi"><label class="fl">接收地址</label><div class="hint" style="margin-bottom:8px">留空则不上报，例如 https://api.example.com/collect</div><input id="reportUrl" class="inp m" type="url" placeholder="https://api.example.com/collect"></div>
+  <div class="ch"><div><h2 class="ct">接口上报</h2><div class="cd">每小时整点把 JSON 数据发送到接收地址；服务器备注会随每批数据一起发出，便于接收端区分多台机器 · 与「通知推送」相互独立</div></div></div>
+  <div class="fi"><label class="fl">接收地址</label><div class="hint" style="margin-bottom:8px">接口上报通道的接收端地址，留空则不上报，例如 https://api.example.com/collect</div><input id="reportUrl" class="inp m" type="url" placeholder="https://api.example.com/collect"></div>
   <div class="fi"><label class="fl">Bearer Token</label><div class="hint" style="margin-bottom:8px">留空则不带 Authorization 头</div><input id="reportToken" class="inp m" type="text" placeholder="可选"></div>
   <div class="fi"><label class="fl">服务器备注</label><div class="hint" style="margin-bottom:8px">如「香港节点」「家里宽带」</div><input id="reportNote" class="inp m" type="text" maxlength="60" placeholder="可选，如：香港节点"></div>
   <div class="acts" style="display:flex;gap:10px;flex-wrap:wrap">
@@ -7187,8 +7905,24 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <button class="btn g" id="testReport">立即上报一次</button>
     <button class="btn g" id="reportRetry">补传队列</button>
     <button class="btn g" id="reportClear">清空快照</button>
+    <button class="btn d" id="reportClearQueue">清空队列</button>
   </div>
   <div id="reportMsg" style="margin-top:12px;font-size:12.5px;color:var(--t3);word-break:break-all"></div>
+</div>
+
+<div class="card">
+  <div class="ch"><div><h2 class="ct">通知推送（昨日日报）</h2><div class="cd">每日 00:10 把昨日统计推送到 Telegram / 微信 / 钉钉 / Bark 等 Webhook · 开关在页面顶部「定时任务总览」中控制，与接口上报互不影响</div></div></div>
+  <div class="fi"><label class="fl">日报发送地址</label><div class="hint" style="margin-bottom:8px">通知 Webhook 地址，如 Telegram Bot：https://api.telegram.org/bot&lt;Token&gt;/sendMessage</div><input id="dailyTmplUrl" class="inp m" type="url" placeholder="https://api.telegram.org/bot123:ABC/sendMessage"></div>
+  <div class="fi"><label class="fl">日报 Token</label><div class="hint" style="margin-bottom:8px">以 Bearer Authorization 头随请求发送；Telegram 不需要，留空即可</div><input id="dailyTmplToken" class="inp m" type="text" placeholder="可选"></div>
+  <div class="fi"><label class="fl">日报 Content-Type</label><div class="hint" style="margin-bottom:8px">请求体类型：Telegram 用 application/json；Bark 用 text/plain；钉钉/企微机器人用 application/json</div><select id="dailyTmplType" class="inp m" style="width:auto"><option value="text/plain">text/plain</option><option value="text/markdown">text/markdown</option><option value="application/json">application/json</option><option value="application/x-www-form-urlencoded">application/x-www-form-urlencoded</option></select></div>
+  <div class="fi"><label class="fl">消息模板（自定义格式）</label><div class="hint" style="margin-bottom:8px">占位符：{{date}}、{{node}}、{{note}}、{{requests}}、{{up}}、{{down}}、{{total}}、{{blocked}}、{{blocked_cn}}、{{blocked_wl}}、{{blocked_ban}}、{{blocked_ua}}、{{ips_top}}、{{ip_bytes_top}}、{{hosts_top}}、{{countries_top}}（*_top 挤在一行）；{{ips_top_lines}}、{{ip_bytes_top_lines}}、{{hosts_top_lines}}、{{countries_top_lines}}（每项一行，更适合 IM 展示）。模板为 JSON 时（如 Telegram）值会自动转义，可放心使用多行占位符；配合 "parse_mode":"HTML" 可用 &lt;b&gt;、&lt;code&gt; 标签美化</div>
+    <div class="hint" style="margin-bottom:8px">模板留空时定时任务<span style="color:#b45309;font-weight:600">不会自动执行</span>（手动点「发送昨日统计」仍可用内置默认模板）</div>
+    <textarea id="dailyTmpl" class="inp m" rows="8" style="width:100%;font-family:var(--mono,monospace);font-size:12.5px" placeholder="粘贴自定义模板，留空则定时任务不执行"></textarea></div>
+  <div class="acts" style="display:flex;gap:10px;flex-wrap:wrap">
+    <button class="btn b" id="saveTmpl">保存配置</button>
+    <button class="btn g" id="dailyReport">发送昨日统计</button>
+  </div>
+  <div id="tmplMsg" style="margin-top:12px;font-size:12.5px;color:var(--t3);word-break:break-all"></div>
 </div>
 
 <div class="card">
@@ -7206,8 +7940,13 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <select id="rpTrigger" class="inp m" style="width:auto;max-width:150px">
       <option value="">全部触发方式</option>
       <option value="auto">整点自动</option>
+      <option value="daily">昨日日报</option>
+      <option value="daily-text">昨日日报(自定义)</option>
       <option value="manual">手动</option>
+      <option value="manual-daily">手动日报</option>
+      <option value="manual-daily-text">手动日报(自定义)</option>
       <option value="retry">补传</option>
+      <option value="cleanup">队列清理</option>
     </select>
     <span id="rpCount" style="font-size:12.5px;color:var(--t3)"></span>
     <span style="flex:1"></span>
@@ -7503,6 +8242,11 @@ async function loadConfig(){
     const ru=document.getElementById('reportUrl');if(ru)ru.value=c.report_url||'';
     const rt=document.getElementById('reportToken');if(rt)rt.value=c.report_token||'';
     const rn=document.getElementById('reportNote');if(rn)rn.value=c.report_note||'';
+    const dtOn=document.getElementById('dailyTmplOn');if(dtOn)dtOn.checked=!!c.daily_tmpl_on;
+    const dt=document.getElementById('dailyTmpl');if(dt)dt.value=c.daily_tmpl||'';
+    const dtUrl=document.getElementById('dailyTmplUrl');if(dtUrl)dtUrl.value=c.daily_tmpl_url||'';
+    const dtTok=document.getElementById('dailyTmplToken');if(dtTok)dtTok.value=c.daily_tmpl_token||'';
+    const dtType=document.getElementById('dailyTmplType');if(dtType)dtType.value=c.daily_tmpl_type||'text/plain';
     const aa=document.getElementById('adminAllow');if(aa)aa.value=(c.admin_allow||[]).join('\n');
 
   }catch(e){console.error('loadConfig error:',e)}
@@ -8152,7 +8896,7 @@ async function loadBlocks(){
 }
 
 const audState={page:1,size:50,total:0};
-const ACT_LABEL={login:'登录',change_password:'修改密码',save_config:'保存配置',ban_ip:'拉黑 IP',clear_stats:'清空统计',speed_create:'生成测速链接',speed_delete:'删除测速链接',report_test:'手动上报',report_retry:'补传上报',report_clear:'清空上报快照',report_clear_records:'清空上报记录',backup_db:'下载数据库',config_export:'导出配置',config_import:'导入配置',blocks_export:'导出拦截记录'};
+const ACT_LABEL={login:'登录',change_password:'修改密码',save_config:'保存配置',ban_ip:'拉黑 IP',clear_stats:'清空统计',speed_create:'生成测速链接',speed_delete:'删除测速链接',report_test:'手动上报',report_daily:'发送昨日统计',report_retry:'补传上报',report_clear:'清空上报快照',report_clear_records:'清空上报记录',backup_db:'下载数据库',config_export:'导出配置',config_import:'导入配置',blocks_export:'导出拦截记录'};
 function actLabel(a){return ACT_LABEL[a]||a||'其他'}
 async function loadAudit(){
   const tb=document.getElementById('auditBody');
@@ -8203,6 +8947,11 @@ function collect(){
     report_url:(document.getElementById('reportUrl')?.value||'').trim(),
     report_token:(document.getElementById('reportToken')?.value||'').trim(),
     report_note:(document.getElementById('reportNote')?.value||'').trim(),
+    daily_tmpl_on:!!document.getElementById('dailyTmplOn')?.checked,
+    daily_tmpl:(document.getElementById('dailyTmpl')?.value||''),
+    daily_tmpl_url:(document.getElementById('dailyTmplUrl')?.value||'').trim(),
+    daily_tmpl_token:(document.getElementById('dailyTmplToken')?.value||'').trim(),
+    daily_tmpl_type:(document.getElementById('dailyTmplType')?.value||'text/plain'),
     }
 }
 async function save(){
@@ -8213,12 +8962,22 @@ async function save(){
     alert('配置已保存并即时生效');
   }catch(e){alert('保存失败：'+(e.message||'未知错误'))}
 }
+// saveSilent 静默保存当前页面配置：不弹窗、返回结果，供「立即发送/上报」类按钮先落库再执行
+async function saveSilent(){
+  try{
+    const r=await fetch('/admin/api/save',{method:'POST',body:JSON.stringify(collect())});
+    if(!r.ok)throw new Error((await r.text())||('HTTP '+r.status));
+    const c=await r.json();applyPort(c.effective_port);
+    return {ok:true};
+  }catch(e){return {ok:false,err:e.message||'未知错误'}}
+}
 document.getElementById('savePort').addEventListener('click',()=>save());document.getElementById('saveAll').addEventListener('click',()=>save());
 
 const RP_PAGE_SIZE=20;
 const rpState={items:[],page:1,loaded:false};
-function reportMsg(t,color){const el=document.getElementById('reportMsg');if(el){el.textContent=t;el.style.color=color||'var(--t3)'}}
-function rpTriggerLabel(t){return {auto:'整点自动',manual:'手动',retry:'补传'}[t]||t||'—'}
+function reportMsg(t,color,target){const el=document.getElementById(target||'reportMsg');if(el){el.textContent=t;el.style.color=color||'var(--t3)'}}
+function tmplMsg(t,color){reportMsg(t,color,'tmplMsg')}
+function rpTriggerLabel(t){return {auto:'整点自动',daily:'昨日日报','daily-text':'昨日日报(自定义)',manual:'手动','manual-daily':'手动日报','manual-daily-text':'手动日报(自定义)',retry:'补传',cleanup:'队列清理'}[t]||t||'—'}
 function fmtDur(ms){if(!ms)return '—';if(ms<1000)return ms+' ms';return (ms/1000).toFixed(1)+' s'}
 function fmtTimeSec(v){return v?fmtBeijing(v):'—'}
 
@@ -8339,18 +9098,47 @@ async function loadReportRecords(){
     if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
     rpState.items=d.items||[];
     rpState.loaded=true;
-    const st=document.getElementById('rpState');
-    if(st){
-      if(!d.url){st.className='rp-g wt';st.textContent='未配置地址'}
-      else if(d.on){st.className='rp-g ok';st.textContent='自动上报已开启'}
-      else{st.className='rp-g wt';st.textContent='自动上报已关闭'}
-    }
+    rpRenderPlan(d.plan||{}, d);
     rpRenderTable();
     rpRenderStats();
   }catch(e){
     const tb=document.getElementById('rpBody');
     if(tb)tb.innerHTML='<tr><td colspan="9" style="color:var(--d);text-align:center;padding:18px 0">加载失败：'+esc(e.message||'')+'</td></tr>';
   }
+}
+
+// rpBeijing 把 RFC3339 时间显示为「MM-DD HH:mm」
+function rpBeijing(v){
+  if(!v)return '—';
+  const t=new Date(v);
+  if(isNaN(t.getTime()))return v;
+  const p=n=>String(n).padStart(2,'0');
+  return p(t.getMonth()+1)+'-'+p(t.getDate())+' '+p(t.getHours())+':'+p(t.getMinutes());
+}
+
+// rpRenderPlan 渲染两条通道的状态、地址、下次执行时间与未执行原因
+function rpRenderPlan(plan,d){
+  const api=plan.api||{}, daily=plan.daily||{};
+  const apply=(cardId,stateId,hintId,ready,reason,url,next,off)=>{
+    const card=document.getElementById(cardId);
+    const st=document.getElementById(stateId);
+    const hint=document.getElementById(hintId);
+    if(st){
+      st.className='rp-g '+(ready?'ok':(reason&&reason.indexOf('不会执行')<0&&reason?'bad':'wt'));
+      st.textContent=ready?'执行中':(off?'已关闭':'未执行');
+    }
+    if(card)card.classList.toggle('off',!ready);
+    const uEl=document.getElementById(cardId==='chApiCard'?'chApiUrl':'chDailyUrl');
+    if(uEl)uEl.textContent=url||'未填写';
+    const nEl=document.getElementById(cardId==='chApiCard'?'chApiNext':'chDailyNext');
+    if(nEl)nEl.textContent=ready?rpBeijing(next):'—（不会执行）';
+    if(hint){hint.textContent=reason||'';hint.className='rp-ch-hint'+(ready?' ok':'');}
+  };
+  apply('chApiCard','chApiState','chApiHint',!!api.ready,api.reason||'',d.url||'',api.next,!!(d.url&&!d.on));
+  const mode=daily.mode||'off';
+  let dReason=daily.reason||'';
+  if(mode==='json')dReason='未开启模板推送：日报随「接口上报」通道发 JSON，'+ (api.ready?'会执行':'但接口上报未运行，因此不会发送');
+  apply('chDailyCard','chDailyState','chDailyHint',!!daily.ready,dReason,d.tmpl_url||d.url||'',daily.next,mode==='off');
 }
 
 function rpRenderStats(){
@@ -8379,34 +9167,132 @@ async function loadReportQueueStat(){
 
 document.getElementById('saveReport')?.addEventListener('click',async()=>{
   const url=(document.getElementById('reportUrl')?.value||'').trim();
-  if(url && !/^https?:\/\//i.test(url)){reportMsg('地址需以 http:// 或 https:// 开头','var(--d)');return}
+  if(url && !/^https?:\/\//i.test(url)){reportMsg('接收地址需以 http:// 或 https:// 开头','var(--d)');return}
   await save();
-  reportMsg('上报配置已保存'+(document.getElementById('reportOn')?.checked?'，将每小时上报':'（当前未开启自动上报）'),'var(--ok)');
+  const on=!!document.getElementById('reportOn')?.checked;
+  reportMsg(url?(on?'已保存：接口上报已开启，将每小时上报':'已保存：接口上报地址已配置，自动上报未开启'):'已保存：接口上报未配置地址（不影响下方通知推送）',url&&on?'var(--ok)':'var(--t3)');
   loadReportPage();
   setTimeout(()=>reportMsg(''),4000);
 });
+
+// 定时任务开关：切换即保存，立即反映「是否会执行」
+document.getElementById('reportOn')?.addEventListener('change',async()=>{
+  const on=!!document.getElementById('reportOn')?.checked;
+  const sv=await saveSilent();
+  if(!sv.ok){reportMsg('保存失败：'+sv.err,'var(--d)');return}
+  reportMsg(on?'每小时接口上报已开启':'每小时接口上报已关闭','var(--t3)');
+  loadReportPage();
+});
+document.getElementById('dailyTmplOn')?.addEventListener('change',async()=>{
+  const on=!!document.getElementById('dailyTmplOn')?.checked;
+  const sv=await saveSilent();
+  if(!sv.ok){tmplMsg('保存失败：'+sv.err,'var(--d)');return}
+  tmplMsg(on?'每日通知已开启':'每日通知已关闭','var(--t3)');
+  loadReportPage();
+});
+
+document.getElementById('saveTmpl')?.addEventListener('click',async()=>{
+  const dUrl=(document.getElementById('dailyTmplUrl')?.value||'').trim();
+  if(dUrl && !/^https?:\/\//i.test(dUrl)){tmplMsg('日报发送地址需以 http:// 或 https:// 开头','var(--d)');return}
+  await save();
+  const tmpl=!!document.getElementById('dailyTmplOn')?.checked;
+  tmplMsg(dUrl?(tmpl?'已保存：通知推送已启用，每日 00:10 发送':'已保存：发送地址已配置，但「按模板发送」未勾选'):'已保存：通知推送未配置发送地址（不影响上方接口上报）',dUrl&&tmpl?'var(--ok)':'var(--t3)');
+  loadReportPage();
+  setTimeout(()=>tmplMsg(''),4000);
+});
+// 上报回显弹窗：发送内容与接收端返回分标签页展示，避免一起滚动过高
+function rpModalTab(t){
+  const s=document.getElementById('rpTabSent'),rr=document.getElementById('rpTabResp');
+  const bs=document.getElementById('rpTabBS'),br=document.getElementById('rpTabBR');
+  if(!s||!rr)return;
+  s.style.display=t==='sent'?'block':'none';
+  rr.style.display=t==='resp'?'block':'none';
+  if(bs){bs.style.background=t==='sent'?'var(--pd,#2563eb)':'transparent';bs.style.color=t==='sent'?'#fff':'var(--t2,#666)'}
+  if(br){br.style.background=t==='resp'?'var(--pd,#2563eb)':'transparent';br.style.color=t==='resp'?'#fff':'var(--t2,#666)'}
+}
+function showReportModal(title,headHTML,sentHTML,respHTML){
+  let tgWarn='';
+  try{
+    const m=(sentHTML.match(/https?:\/\/[^<\s"']*api\.telegram\.org[^<\s"']*/)||[''])[0];
+    if(/getUpdates|getMe|setWebhook|deleteWebhook/.test(m)){
+      tgWarn='<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.35);color:#b91c1c;font-size:12.5px;padding:8px 10px;border-radius:8px;margin:0 0 10px">⚠️ Telegram 地址以 /getUpdates 结尾只能「收取消息」，发不出通知。请把结尾改为 <b>/sendMessage</b>，Content-Type 选 <b>application/json</b>，模板保持 JSON 格式（含 chat_id 和 text 字段）</div>';
+    }else if(/api\.telegram\.org/.test(m)&&/x-www-form-urlencoded/.test(sentHTML)&&/^\s*\{/.test(sentHTML)){
+      tgWarn='<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.4);color:#b45309;font-size:12.5px;padding:8px 10px;border-radius:8px;margin:0 0 10px">提示：模板是 JSON 格式，Content-Type 建议选 <b>application/json</b>，否则 Telegram 可能解析不到 chat_id/text 参数</div>';
+    }
+  }catch(e){}
+  document.getElementById('modalTitle').textContent=title;
+  document.getElementById('modalBody').innerHTML=headHTML+tgWarn
+    +'<div style="display:flex;gap:8px;margin:2px 0 10px">'
+    +'<button type="button" id="rpTabBS" onclick="rpModalTab(\'sent\')" style="padding:5px 14px;border-radius:8px;border:1px solid rgba(128,128,128,.3);background:var(--pd,#2563eb);color:#fff;cursor:pointer;font-size:12.5px;font-weight:600">发送内容</button>'
+    +'<button type="button" id="rpTabBR" onclick="rpModalTab(\'resp\')" style="padding:5px 14px;border-radius:8px;border:1px solid rgba(128,128,128,.3);background:transparent;color:var(--t2,#666);cursor:pointer;font-size:12.5px;font-weight:600">接收端返回</button>'
+    +'</div>'
+    +'<div id="rpTabSent">'+sentHTML+'</div>'
+    +'<div id="rpTabResp" style="display:none">'+respHTML+'</div>';
+  document.getElementById('modal').classList.add('on');
+}
+
 document.getElementById('testReport')?.addEventListener('click',async()=>{
-  reportMsg('正在上报…');
+  reportMsg('正在保存配置并上报…');
+  const sv=await saveSilent();
+  if(!sv.ok){reportMsg('配置保存失败，已中止上报：'+sv.err,'var(--d)');return}
   try{
     const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'test'})});
     const d=await r.json().catch(()=>({}));
     if(d && d.payload!==undefined){
       const head=d.ok
         ?'<div style="color:var(--ok);font-weight:600;margin-bottom:10px">✓ 上报成功（HTTP '+d.resp_status+'）</div>'
-        :'<div style="color:var(--d);font-weight:600;margin-bottom:10px">✗ 上报失败：'+esc(d.error||'')+'<br><span style="font-weight:400;color:var(--t3)">数据已存入队列，稍后自动重试；接收端返回如下</span></div>';
-      document.getElementById('modalTitle').textContent='上报回显';
-      document.getElementById('modalBody').innerHTML=head
-        +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">发送的数据</div>'
-        +'<pre class="rp-pre" style="max-height:300px">'+esc(JSON.stringify(d.payload,null,2))+'</pre>'
-        +'<div style="font-size:12px;font-weight:600;color:var(--t2);margin:10px 0 0">接收端返回（HTTP '+d.resp_status+'）</div>'
-        +'<pre class="rp-pre" style="max-height:160px">'+esc(d.resp_body||'（空）')+'</pre>';
-      document.getElementById('modal').classList.add('on');
+        :'<div style="color:var(--d);font-weight:600;margin-bottom:10px">✗ 上报失败：'+esc(d.error||'')+'<br><span style="font-weight:400;color:var(--t3)">数据已存入队列，稍后自动重试</span></div>';
+      showReportModal('上报回显',head,
+        '<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">发送的数据</div>'
+        +'<pre class="rp-pre" style="max-height:420px">'+esc(JSON.stringify(d.payload,null,2))+'</pre>',
+        '<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">接收端返回（HTTP '+d.resp_status+'）</div>'
+        +'<pre class="rp-pre" style="max-height:420px">'+esc(d.resp_body||'（空）')+'</pre>');
       reportMsg(d.ok?'上报成功，详见弹窗':'上报失败，详见弹窗',d.ok?'var(--ok)':'var(--d)');
     }else{
       reportMsg(d.error||('HTTP '+r.status),'var(--d)');
     }
     loadReportRecords(); loadReportQueueStat();
   }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
+});
+
+document.getElementById('dailyReport')?.addEventListener('click',async()=>{
+  const dUrl=(document.getElementById('dailyTmplUrl')?.value||'').trim();
+  if(!dUrl){tmplMsg('请先填写「日报发送地址」','var(--d)');return}
+  if(/\/getUpdates\b/i.test(dUrl)){
+    showReportModal('地址填写有误',
+      '<div style="color:var(--d);font-weight:600;margin-bottom:10px">✗ 未发送：日报发送地址结尾是 /getUpdates</div>',
+      '<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.35);color:#b91c1c;font-size:13px;padding:10px 12px;border-radius:8px;line-height:1.7">'
+      +'<b>/getUpdates</b> 是「拉取 bot 收到的消息」的接口，POST 任何内容都只会返回 <code>{"ok":true,"result":[]}</code>，<b>消息不会发出</b>。<br><br>'
+      +'请把地址结尾改为 <b>/sendMessage</b>：<br><code style="word-break:break-all">https://api.telegram.org/bot&lt;Token&gt;/sendMessage</code><br><br>'
+      +'同时把 Content-Type 选为 <b>application/json</b>，模板保持 JSON 格式（含 chat_id 与 text）。改完点「保存配置」再发送。</div>',
+      '<div style="font-size:12.5px;color:var(--t2)">修正地址后再试。</div>');
+    tmplMsg('地址结尾是 /getUpdates，发不出消息，请改为 /sendMessage','var(--d)');
+    return;
+  }
+  tmplMsg('正在保存配置并发送昨日统计…');
+  const sv=await saveSilent();
+  if(!sv.ok){tmplMsg('配置保存失败，已中止发送：'+sv.err,'var(--d)');return}
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'daily'})});
+    const d=await r.json().catch(()=>({}));
+    if(d && d.payload!==undefined){
+      const head=d.ok
+        ?'<div style="color:var(--ok);font-weight:600;margin-bottom:10px">✓ 昨日统计发送成功（HTTP '+d.resp_status+'）</div>'
+        :'<div style="color:var(--d);font-weight:600;margin-bottom:10px">✗ 发送失败：'+esc(d.error||'')+'<br><span style="font-weight:400;color:var(--t3)">数据已存入队列，稍后自动重试</span></div>';
+      const sentHTML=d.text!==undefined
+        ?'<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">发送的内容（'+esc(d.content_type||'text/plain')+' → '+esc(d.target||'')+'）</div>'
+          +'<pre class="rp-pre" style="max-height:420px">'+esc(d.text)+'</pre>'
+        :'<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">发送的数据</div>'
+          +'<pre class="rp-pre" style="max-height:420px">'+esc(JSON.stringify(d.payload,null,2))+'</pre>';
+      showReportModal('昨日统计上报回显',head,sentHTML,
+        '<div style="font-size:12px;font-weight:600;color:var(--t2);margin-bottom:4px">接收端返回（HTTP '+d.resp_status+'）</div>'
+        +'<pre class="rp-pre" style="max-height:420px">'+esc(d.resp_body||'（空）')+'</pre>');
+      tmplMsg(d.ok?'昨日统计发送成功，详见弹窗':'发送失败，详见弹窗',d.ok?'var(--ok)':'var(--d)');
+    }else{
+      tmplMsg(d.error||('HTTP '+r.status),'var(--d)');
+    }
+    loadReportRecords(); loadReportQueueStat();
+  }catch(e){tmplMsg('网络异常：'+e.message,'var(--d)')}
 });
 
 document.getElementById('reportRetry')?.addEventListener('click',async()=>{
@@ -8429,6 +9315,18 @@ document.getElementById('reportClear')?.addEventListener('click',async()=>{
     const d=await r.json().catch(()=>({}));
     if(!r.ok){reportMsg(d.error||'清空失败','var(--d)');return}
     reportMsg('快照已清空，到整点后会重新开始记录','var(--ok)');
+  }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
+});
+
+document.getElementById('reportClearQueue')?.addEventListener('click',async()=>{
+  if(!confirm('确定清空全部待补传队列？被清空的数据不再重试发送（上传记录与日报防重标记不受影响）。通常在确认这些数据不需要了、或想清掉历史失败项时使用。'))return;
+  reportMsg('清空队列中…');
+  try{
+    const r=await fetch('/admin/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear_queue'})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){reportMsg(d.error||'清空失败','var(--d)');return}
+    reportMsg('已清空 '+(d.cleared||0)+' 条待补传队列项','var(--ok)');
+    loadReportQueueStat(); loadReportRecords();
   }catch(e){reportMsg('网络异常：'+e.message,'var(--d)')}
 });
 
