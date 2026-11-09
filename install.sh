@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="3.3.0"
+APP_VERSION="3.4.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -157,6 +157,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -245,69 +246,358 @@ func isBuiltinAssetPath(p string) bool {
 
 const pageCSS = `
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#f8fafc;--card:#fff;--bd:#e2e8f0;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--d:#ef4444;--w:#f59e0b;--ok:#10b981;--r:16px}
-body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:40px 36px;max-width:520px;width:100%;box-shadow:0 4px 24px -4px rgba(15,23,42,.06);text-align:center}
-.brand{text-align:center;margin-bottom:22px}
-.brand-logo{width:56px;height:56px;border-radius:14px;display:block;margin:0 auto 14px}
-.brand h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
-.brand p{font-size:13px;color:var(--t3);margin-top:4px}
-.icon{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px}
-.icon.blue{background:var(--ps);color:var(--p)}
-.icon.red{background:#fef2f2;color:var(--d)}
-.icon.amber{background:#fffbeb;color:var(--w)}
-h2{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:10px;color:var(--t)}
-.desc{color:var(--t2);font-size:14.5px;line-height:1.7;margin-bottom:28px}
-.ex{background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:16px 18px;text-align:left;margin-bottom:24px;font-size:13.5px}
-.ex-t{font-size:12px;color:var(--t3);margin-bottom:8px;font-weight:600}
-.ex code{display:block;word-break:break-all;line-height:1.7;font-family:Consolas,monospace;color:var(--pd)}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 22px;border-radius:10px;font-size:14px;font-weight:500;cursor:pointer;border:0;font-family:inherit;text-decoration:none;transition:.2s}
-.btn.b{background:var(--p);color:#fff;box-shadow:0 2px 6px rgba(59,130,246,.25)}
-.btn.b:hover{background:var(--pd)}
-.btn.g{background:#fff;border:1px solid var(--bd);color:var(--t2)}
-.btn.g:hover{background:#f8fafc;color:var(--t)}
-.acts{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-.foot{margin-top:28px;font-size:12.5px;color:var(--t3)}
-@media(max-width:480px){.card{padding:28px 20px}h2{font-size:20px}}
+:root{--bg:#f4f7fb;--card:#fff;--bd:#e6ebf2;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--pb:#bfdbfe;--d:#ef4444;--ds:#fef2f2;--db:#fecaca;--w:#f59e0b;--ws:#fffbeb;--wb:#fde68a;--ok:#10b981;--oks:#ecfdf5;--ob:#a7f3d0;--panel:#f8fafc;--r:18px;--mono:Consolas,"SFMono-Regular",Menlo,monospace}
+html[data-theme="dark"]{--bg:#0b1220;--card:#111a2b;--bd:#1f2b3d;--t:#e6edf7;--t2:#a8b6c9;--t3:#71809a;--p:#3b82f6;--pd:#7db2ff;--ps:#152742;--pb:#264a7d;--d:#f87171;--ds:#2a1418;--db:#4c2027;--w:#fbbf24;--ws:#2a2113;--wb:#4a3a18;--ok:#34d399;--oks:#0d2b22;--ob:#1b5340;--panel:#0e1726}
+body{min-height:100dvh;background:var(--bg);background-image:radial-gradient(900px 420px at 50% -12%,rgba(59,130,246,.10),transparent 72%);color:var(--t);font:15px/1.65 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;padding:28px 18px}
+.wrap{width:100%;max-width:560px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:26px 32px 20px;box-shadow:0 14px 44px -14px rgba(15,23,42,.16)}
+html[data-theme="dark"] .card{box-shadow:0 14px 44px -14px rgba(0,0,0,.5)}
+.brand{display:flex;align-items:center;gap:11px;padding-bottom:16px;border-bottom:1px solid var(--bd);margin-bottom:24px}
+.brand-logo{width:34px;height:34px;border-radius:9px;flex-shrink:0}
+.brand-n{font-size:14px;font-weight:650;line-height:1.25}
+.brand-s{font-size:11.5px;color:var(--t3);margin-top:2px}
+.brand-r{margin-left:auto;font-size:11.5px;color:var(--t3);font-family:var(--mono);white-space:nowrap}
+.hero{text-align:center}
+.ico{width:62px;height:62px;border-radius:19px;display:inline-flex;align-items:center;justify-content:center;margin-bottom:15px}
+.ico svg{width:30px;height:30px}
+.ico.red{background:var(--ds);color:var(--d)}
+.ico.amber{background:var(--ws);color:var(--w)}
+.ico.green{background:var(--oks);color:var(--ok)}
+.ico.blue{background:var(--ps);color:var(--p)}
+.badge{display:inline-block;font:600 11.5px/1.2 var(--mono);letter-spacing:.2px;padding:5px 11px;border-radius:999px;border:1px solid var(--bd);color:var(--t2);background:var(--panel);margin-bottom:11px}
+.badge.red{color:var(--d);background:var(--ds);border-color:var(--db)}
+.badge.amber{color:var(--w);background:var(--ws);border-color:var(--wb)}
+.badge.green{color:var(--ok);background:var(--oks);border-color:var(--ob)}
+.badge.blue{color:var(--p);background:var(--ps);border-color:var(--pb)}
+h1{font-size:22px;font-weight:700;letter-spacing:-.4px;margin-bottom:8px;color:var(--t)}
+.sum{font-size:13.5px;font-weight:650;color:var(--pd);margin-bottom:8px}
+.desc{font-size:14px;color:var(--t2);line-height:1.78;max-width:450px;margin:0 auto}
+.sec{margin-top:22px;text-align:left}
+.sec-t{font-size:11px;font-weight:700;letter-spacing:.8px;color:var(--t3);margin-bottom:9px;display:flex;align-items:center;gap:9px}
+.sec-t:after{content:"";flex:1;height:1px;background:var(--bd)}
+.kv{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:5px 14px}
+.kv-r{display:flex;gap:12px;padding:7px 0;border-bottom:1px dashed var(--bd);font-size:13px}
+.kv-r:last-child{border-bottom:0}
+.kv-k{color:var(--t3);width:76px;flex-shrink:0}
+.kv-v{color:var(--t);word-break:break-all;font-family:var(--mono);font-size:12.5px;flex:1;line-height:1.55}
+.tips{background:var(--ps);border:1px solid var(--pb);border-radius:12px;padding:12px 16px 12px 30px;margin:0;font-size:12.8px;color:var(--t2);line-height:1.8}
+.tips li{margin:2px 0;padding-left:2px}
+.tips li::marker{color:var(--p)}
+html[data-theme="dark"] .tips{color:var(--t2)}
+.tech{margin-top:9px;background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:9px 12px;font:12px/1.65 var(--mono);color:var(--t2);word-break:break-all}
+.usage{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:13px 15px;font-size:13px;color:var(--t2);line-height:1.8}
+.usage code{display:block;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:8px 11px;margin:7px 0;font:12.3px/1.6 var(--mono);color:var(--pd);word-break:break-all}
+.hint{font-size:12.3px;color:var(--t3);line-height:1.7}
+.acts{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:22px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 20px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;border:1px solid transparent;font-family:inherit;text-decoration:none;transition:.18s}
+.btn.b{background:var(--p);color:#fff}
+.btn.b:hover{background:var(--pd);transform:translateY(-1px)}
+.btn.g{background:var(--card);border-color:var(--bd);color:var(--t2)}
+.btn.g:hover{background:var(--panel);color:var(--t)}
+.foot{margin-top:20px;padding-top:14px;border-top:1px solid var(--bd);display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:var(--t3);font-family:var(--mono)}
+@media(max-width:520px){body{padding:16px 12px}.card{padding:20px 18px 16px}h1{font-size:20px}.kv-k{width:68px}.foot{flex-direction:column;gap:3px}.brand-r{font-size:10.5px}}
 `
 
-func writePage(w http.ResponseWriter, status int, iconClass, icon, title, desc, extraHTML string) {
+// ---------------- 统一页面框架（首页 / 所有提示与错误页）----------------
+// 所有动态内容统一经 pageEsc 转义，避免 Host、路径、UA、上游错误等用户输入造成 XSS。
+
+type pageKV struct{ K, V string }
+type pageAction struct {
+	Label, Href, Kind, Copy string
+	Reload                  bool
+}
+type pageData struct {
+	Status    int
+	Kind      string // red / amber / blue / green
+	Title     string
+	Summary   string
+	Desc      string
+	Rows      []pageKV
+	Tips      []string
+	Tech      string
+	UsageHTML string
+	Actions   []pageAction
+	FootL     string
+	FootR     string
+}
+
+var statusZh = map[int]string{
+	400: "请求有误", 401: "未授权", 403: "禁止访问", 404: "页面不存在",
+	405: "方法不支持", 410: "资源已失效", 429: "请求过于频繁",
+	500: "服务内部错误", 502: "网关错误", 503: "服务不可用", 504: "网关超时",
+}
+
+var pageIconSVG = map[string]string{
+	"red":   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9.5 9.5 5 5M14.5 9.5l-5 5"/></svg>`,
+	"amber": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
+	"blue":  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="7"/><path d="m20 20-4.2-4.2"/><path d="M8.5 9a2.5 2.5 0 1 1 3.2 2.4c-.7.3-1.2.9-1.2 1.7v.4M10.5 16.5h.01"/></svg>`,
+	"green": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.8 2.8L16 9.6"/></svg>`,
+}
+
+func pageEsc(s string) string { return html.EscapeString(s) }
+
+func pageStatusLabel(status int) string {
+	zh := statusZh[status]
+	if zh == "" {
+		zh = http.StatusText(status)
+	}
+	return fmt.Sprintf("%d · %s", status, zh)
+}
+
+func pageIcon(kind string) string {
+	if s, ok := pageIconSVG[kind]; ok {
+		return s
+	}
+	return pageIconSVG["red"]
+}
+
+func pageDuration(d time.Duration) string {
+	sec := int64(d.Seconds())
+	if sec < 0 {
+		sec = 0
+	}
+	days, hh, mm, ss := sec/86400, (sec%86400)/3600, (sec%3600)/60, sec%60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%d 天 %d 小时 %d 分", days, hh, mm)
+	case hh > 0:
+		return fmt.Sprintf("%d 小时 %d 分", hh, mm)
+	case mm > 0:
+		return fmt.Sprintf("%d 分 %d 秒", mm, ss)
+	default:
+		return fmt.Sprintf("%d 秒", ss)
+	}
+}
+
+func renderPage(w http.ResponseWriter, p pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	statusHTML, titleHTML := "", ""
-	if icon != "" {
-		statusHTML = `<div class="icon ` + iconClass + `">` + icon + `</div>`
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(p.Status)
+	var b strings.Builder
+	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">`)
+	b.WriteString(`<link rel="icon" href="/favicon.ico` + iconVer + `"><title>` + pageEsc(p.Title) + ` · 服务</title>`)
+	b.WriteString(`<script>try{var t=localStorage.getItem('ep_theme');if(t!=='dark'&&t!=='light'){t=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}</script>`)
+	b.WriteString(`<style>` + pageCSS + `</style></head><body><div class="wrap"><div class="card">`)
+	b.WriteString(`<div class="brand"><img class="brand-logo" src="/logo.png" alt=""><div><div class="brand-n">服务</div><div class="brand-s">Emby Proxy · v` + appVersionStr + `</div></div><div class="brand-r">` + pageEsc(pageStatusLabel(p.Status)) + `</div></div>`)
+	b.WriteString(`<div class="hero"><div class="ico ` + p.Kind + `">` + pageIcon(p.Kind) + `</div>`)
+	b.WriteString(`<div class="badge ` + p.Kind + `">` + pageEsc(pageStatusLabel(p.Status)) + `</div>`)
+	b.WriteString(`<h1>` + pageEsc(p.Title) + `</h1>`)
+	if p.Summary != "" {
+		b.WriteString(`<div class="sum">` + pageEsc(p.Summary) + `</div>`)
 	}
-	if title != "" {
-		titleHTML = `<h2>` + title + `</h2>`
+	if p.Desc != "" {
+		b.WriteString(`<div class="desc">` + pageEsc(p.Desc) + `</div>`)
 	}
-	pageTitle := title
-	if pageTitle == "" {
-		pageTitle = "首页"
+	b.WriteString(`</div>`)
+	if len(p.Rows) > 0 {
+		b.WriteString(`<div class="sec"><div class="sec-t">请求详情</div><div class="kv">`)
+		for _, kv := range p.Rows {
+			b.WriteString(`<div class="kv-r"><div class="kv-k">` + pageEsc(kv.K) + `</div><div class="kv-v">` + pageEsc(kv.V) + `</div></div>`)
+		}
+		b.WriteString(`</div></div>`)
 	}
-	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><link rel="icon" href="/favicon.ico` + iconVer + `"><title>` + pageTitle + `</title><style>` + pageCSS + `</style></head><body><div class="card"><div class="brand"><img class="brand-logo" src="/admin/logo.png" alt=""><h1>服务</h1><p>运行中</p></div>` + statusHTML + titleHTML + `<div class="desc">` + desc + `</div>` + extraHTML + `<div class="foot">服务</div></div></body></html>`
-	_, _ = w.Write([]byte(html))
+	if p.UsageHTML != "" {
+		b.WriteString(`<div class="sec"><div class="sec-t">使用方式</div>` + p.UsageHTML + `</div>`)
+	}
+	if len(p.Tips) > 0 {
+		b.WriteString(`<div class="sec"><div class="sec-t">可以试试</div><ul class="tips">`)
+		for _, t := range p.Tips {
+			b.WriteString(`<li>` + pageEsc(t) + `</li>`)
+		}
+		b.WriteString(`</ul></div>`)
+	}
+	if p.Tech != "" {
+		b.WriteString(`<div class="sec"><div class="sec-t">技术详情</div><div class="tech">` + pageEsc(p.Tech) + `</div></div>`)
+	}
+	if len(p.Actions) > 0 {
+		b.WriteString(`<div class="acts">`)
+		for _, a := range p.Actions {
+			kind := a.Kind
+			if kind == "" {
+				kind = "g"
+			}
+			switch {
+			case a.Reload:
+				b.WriteString(`<button class="btn ` + kind + `" onclick="location.reload()">` + pageEsc(a.Label) + `</button>`)
+			case a.Copy != "":
+				b.WriteString(`<button class="btn ` + kind + `" data-copy="` + pageEsc(a.Copy) + `" onclick="pgCopy(this)">` + pageEsc(a.Label) + `</button>`)
+			default:
+				b.WriteString(`<a class="btn ` + kind + `" href="` + pageEsc(a.Href) + `">` + pageEsc(a.Label) + `</a>`)
+			}
+		}
+		b.WriteString(`</div>`)
+	}
+	b.WriteString(`<div class="foot"><span>` + pageEsc(p.FootL) + `</span><span>` + pageEsc(p.FootR) + `</span></div>`)
+	b.WriteString(`</div></div><script>function pgCopy(b){var t=b.getAttribute('data-copy');if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){b.textContent='已复制 \u2713'},function(){b.textContent='复制失败，请手动复制'})}else{b.textContent='请手动复制'}}</script></body></html>`)
+	_, _ = w.Write([]byte(b.String()))
+}
+
+// pageRequestRows 生成每个页面共有的上下文，方便管理员按请求编号在日志中定位。
+func pageRequestRows(r *http.Request, status int, reason, reqID string) []pageKV {
+	ip := getClientIP(r)
+	rows := []pageKV{{"状态码", fmt.Sprintf("%d %s", status, http.StatusText(status))}}
+	if reason != "" {
+		rows = append(rows, pageKV{"拦截原因", reason})
+	}
+	host := r.Host
+	if host == "" {
+		host = "—"
+	}
+	path := r.URL.RequestURI()
+	if len(path) > 160 {
+		path = path[:160] + "…"
+	}
+	rows = append(rows,
+		pageKV{"访问域名", host},
+		pageKV{"请求路径", path},
+		pageKV{"来源 IP", ip},
+		pageKV{"来源地区", countryName(countryOf(ip))},
+		pageKV{"发生时间", nowBeijing().Format("2006-01-02 15:04:05") + " UTC+8"},
+		pageKV{"请求编号", reqID},
+	)
+	return rows
+}
+
+// autoPageTips 按拦截原因码给出可操作的排查建议，不在页面里泄露白名单内容或内部配置。
+func autoPageTips(status int, code string) []string {
+	switch code {
+	case "host_ip":
+		return []string{
+			"请使用管理员配置的域名访问，不要直接输入服务器 IP、localhost 或单标签主机名。",
+			"若前面挂了 Nginx / CDN，确认回源保留原始 Host，或设置 proxy_set_header X-Forwarded-Host $host;",
+			"如您认为当前域名应当被允许，请联系服务提供者将其加入允许列表。",
+		}
+	case "host_deny":
+		return []string{
+			"核对浏览器地址栏的域名拼写，确认与「允许访问的域名」中的条目一致。",
+			"需要放行子域名时请显式填写 *.example.com；只填根域不会自动放宽到子域。",
+			"前面挂了反向代理时，确认回传的原始 Host / X-Forwarded-Host 没有被改写。",
+		}
+	case "ban":
+		return []string{
+			"您的来源 IP 被管理员加入了黑名单，本次请求未进入反代流程。",
+			"若经过代理或 VPN，出口 IP 变化后结果可能不同；如为误封请联系管理员移除。",
+		}
+	case "ua":
+		return []string{
+			"换用已授权的客户端（如 Infuse、Emby 官方 App）再试。",
+			"如需使用当前客户端，请联系服务提供者为其授权。",
+		}
+	case "cn":
+		return []string{
+			"当前出口 IP 的归属地不在放行范围内，切换网络后重试。",
+			"如需从当前地区访问，请联系服务提供者调整地区限制。",
+		}
+	case "whitelist":
+		return []string{
+			"检查 URL 路径里填写的上游域名是否正确，以及是否在「上游域名白名单」中。",
+			"注意这里校验的是被反代的目标，与「访问域名白名单」是两个不同的设置。",
+		}
+	}
+	switch {
+	case status == http.StatusNotFound:
+		return []string{"核对访问路径是否完整，注意不要遗漏开头的斜杠。", "反代请求的格式为 /https://上游域名/路径。"}
+	case status == http.StatusGone:
+		return []string{"测速链接有 7 天有效期与可用次数上限，请联系管理员重新生成。"}
+	case status == http.StatusTooManyRequests:
+		return []string{"请稍等片刻再试，避免短时间发起大量请求。"}
+	case status >= 500:
+		return []string{
+			"检查上游服务是否已启动、端口与协议（http / https）是否正确、防火墙是否放行。",
+			"稍后重试；若持续失败，请把下方技术详情与请求编号提供给管理员。",
+		}
+	}
+	return []string{"请核对访问地址与请求参数后重试。"}
+}
+
+type errPageCtx struct {
+	Code  string   // 原因码，用于匹配建议库；留空则按状态码给建议
+	Label string   // 原因中文说明
+	Tips  []string // 调用点额外补充的建议
+	Tech  string   // 技术详情（主要用于 5xx）
+}
+
+func serveError(w http.ResponseWriter, r *http.Request, status int, title, message string, ctx ...errPageCtx) {
+	var c errPageCtx
+	if len(ctx) > 0 {
+		c = ctx[0]
+	}
+	reqID := randToken(4)
+	reason := ""
+	if c.Code != "" {
+		reason = c.Code
+		if c.Label != "" {
+			reason = c.Label + "（" + c.Code + "）"
+		}
+	}
+	kind := "red"
+	switch status {
+	case http.StatusNotFound:
+		kind = "blue"
+	case http.StatusGone, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		kind = "amber"
+	}
+	tips := append([]string{}, c.Tips...)
+	tips = append(tips, autoPageTips(status, c.Code)...)
+	tips = append(tips, "若确认是误拦截，请把上面的「请求编号」与「发生时间」提供给服务提供者，以便按编号在服务端日志中定位本次请求。")
+	actions := []pageAction{{Label: "返回首页", Href: "/", Kind: "g"}}
+	if status >= 500 || status == http.StatusTooManyRequests {
+		actions = append([]pageAction{{Label: "重试", Kind: "b", Reload: true}}, actions...)
+	}
+	log.Printf("[%s] %d %s ip=%s host=%s path=%s", reqID, status, c.Code, getClientIP(r), r.Host, r.URL.RequestURI())
+	renderPage(w, pageData{
+		Status: status, Kind: kind, Title: title, Summary: reason,
+		Desc: message, Rows: pageRequestRows(r, status, reason, reqID),
+		Tips: tips, Tech: c.Tech, Actions: actions,
+		FootL: "Emby Proxy · 访问受控", FootR: "ID " + reqID,
+	})
 }
 
 func serveHome(w http.ResponseWriter, r *http.Request) {
-	extra := `<div class="acts" style="margin-top:8px"><a class="btn g" href="/admin/">管理</a></div>`
-	writePage(w, http.StatusOK, "", "", "",
-		"服务运行中。", extra)
-}
-
-func serveError(w http.ResponseWriter, status int, title, message string) {
-	iconClass, icon := "red", "✕"
-	switch status {
-	case http.StatusTooManyRequests:
-		iconClass, icon = "amber", "⏱"
-	case http.StatusBadGateway, http.StatusServiceUnavailable:
-		iconClass, icon = "amber", "⚠"
-	case http.StatusNotFound:
-		iconClass, icon = "blue", "?"
+	ip := getClientIP(r)
+	host := r.Host
+	if host == "" {
+		host = "localhost"
 	}
-	extra := `<div class="acts"><a class="btn g" href="/">返回</a></div>`
-	writePage(w, status, iconClass, icon, title, message, extra)
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		scheme = "https"
+	}
+	guard := "未启用"
+	if c := currentCfg(); c != nil && c.HostGuardOn {
+		guard = "已启用 · 仅允许授权域名访问"
+	}
+	rows := []pageKV{
+		{"运行状态", "运行中"},
+		{"运行时长", pageDuration(time.Since(startedAt))},
+		{"服务版本", "v" + appVersionStr},
+		{"当前域名", host},
+		{"来源 IP", ip},
+		{"来源地区", countryName(countryOf(ip))},
+		{"客户端", uaClassOfEx(r.UserAgent())},
+		{"域名守卫", guard},
+		{"当前时间", nowBeijing().Format("2006-01-02 15:04:05") + " UTC+8"},
+	}
+	ex1 := scheme + "://" + host + "/https://上游域名/路径"
+	ex2 := scheme + "://" + host + "/http://192.168.1.10:8096/emby/Items?api_key=xxx"
+	usage := `<div class="usage">在访问域名后直接拼上目标地址即可反代：<code>` + pageEsc(ex1) + `</code>示例：<code>` + pageEsc(ex2) + `</code><div class="hint">支持 http / https、查询参数与 WebSocket；目标域名需位于「上游域名白名单」中（若已启用）。</div></div>`
+	renderPage(w, pageData{
+		Status: http.StatusOK, Kind: "green", Title: "服务运行中",
+		Summary: "网关已就绪",
+		Desc:    "这是一个 Emby 路径反代网关。本页仅展示服务状态与用法，不会暴露任何媒体内容。",
+		Rows:    rows, UsageHTML: usage,
+		Tips: []string{
+			"若访问被拒绝，错误页会显示具体拦截原因、访问域名与请求编号，按提示排查即可。",
+			"反代地址格式为 /https://上游域名/路径，目标域名需在允许范围内。",
+			"如遇持续失败，请把错误页上的请求编号提供给服务提供者以便定位。",
+		},
+		Actions: []pageAction{
+			{Label: "复制示例链接", Kind: "b", Copy: ex2},
+		},
+		FootL: "Emby Proxy · v" + appVersionStr,
+		FootR: nowBeijing().Format("2006-01-02 15:04:05") + " UTC+8",
+	})
 }
 
 func parseTarget(r *http.Request) (*url.URL, error) {
@@ -362,6 +652,10 @@ type Config struct {
 	Whitelist   []string `json:"whitelist"`
 	BanList     []string `json:"ban_list"`
 	AllowedUAs  []string `json:"allowed_uas"`
+	// 访问域名守卫：校验浏览器地址栏里的 Host，禁止用服务器 IP 直连反代。
+	// 与上面的 Whitelist（路径里允许反代到的上游域名）是两个不同维度，互不影响。
+	HostGuardOn  bool     `json:"host_guard_on"`  // 总开关，默认 false 以兼容旧配置
+	AllowedHosts []string `json:"allowed_hosts"` // 允许访问的域名；留空则只禁 IP/localhost 直连
 	ReportURL   string   `json:"report_url"`
 	ReportToken string   `json:"report_token"`
 	ReportOn    bool     `json:"report_on"`
@@ -653,10 +947,144 @@ func whitelistMatch(list []string, targetHost string) bool {
 	return false
 }
 
+// ---------------- 访问域名守卫（Host 白名单）----------------
+// 与 whitelistMatch 不同：这里校验的是浏览器地址栏中的访问域名 r.Host，
+// 用来禁止通过服务器 IP 直接访问反代；Whitelist 管的是路径里的上游目标域名。
+
+// peerAddrIP 取 TCP 对端 IP（不经过 X-Forwarded-For，避免被伪造头欺骗）。
+func peerAddrIP(r *http.Request) net.IP {
+	h, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		h = r.RemoteAddr
+	}
+	return net.ParseIP(strings.Trim(h, "[]"))
+}
+
+// normalizeAccessHost 把 Host 规范化成"纯主机名"：小写、去端口、去尾点、去 IPv6 方括号。
+func normalizeAccessHost(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if i := strings.IndexByte(h, '#'); i >= 0 {
+		h = h[:i]
+	}
+	h = strings.TrimSpace(h)
+	if strings.HasPrefix(h, "[") {
+		if i := strings.IndexByte(h, ']'); i >= 0 {
+			return strings.TrimSuffix(h[1:i], ".")
+		}
+	}
+	if i := strings.LastIndexByte(h, ':'); i >= 0 && !strings.Contains(h[i+1:], ":") {
+		h = h[:i]
+	}
+	return strings.TrimSuffix(h, ".")
+}
+
+// requestAccessHost 返回用于准入判断的访问主机名。
+// 本机回环（Nginx/CDN 回源）且带 X-Forwarded-Host 时优先采信该头，
+// 因为反代常把 Host 改写成 127.0.0.1:端口；公网直连一律不采信，防止伪造绕过。
+func requestAccessHost(r *http.Request) string {
+	h := strings.TrimSpace(r.Host)
+	if peer := peerAddrIP(r); peer != nil && peer.IsLoopback() {
+		xfh := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+		if i := strings.IndexByte(xfh, ','); i >= 0 {
+			xfh = xfh[:i]
+		}
+		if v := strings.TrimSpace(xfh); v != "" {
+			h = v
+		}
+	}
+	return normalizeAccessHost(h)
+}
+
+// isBareHost 判断是否为"裸访问"：IP 地址、localhost 或不含点号的单标签主机名。
+func isBareHost(h string) bool {
+	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	return !strings.Contains(h, ".")
+}
+
+// normalizeWhitelistEntry 只用于"管理员填写的白名单项"，对请求 Host 不适用。
+// 容错常见写法：粘贴完整 URL（https://example.com/path）、带 userinfo、带端口等，
+// 一律归一成纯主机名；保留 *. 通配前缀。请求侧仍由 normalizeAccessHost 严格处理，
+// 不接受畸形 Host 头，避免被伪造绕过。
+func normalizeWhitelistEntry(w string) string {
+	w = strings.ToLower(strings.TrimSpace(w))
+	if i := strings.Index(w, "://"); i >= 0 {
+		w = w[i+3:]
+	}
+	if i := strings.IndexByte(w, '/'); i >= 0 {
+		w = w[:i]
+	}
+	if i := strings.IndexByte(w, '?'); i >= 0 {
+		w = w[:i]
+	}
+	if i := strings.LastIndexByte(w, '@'); i >= 0 {
+		w = w[i+1:]
+	}
+	return normalizeAccessHost(w)
+}
+
+// hostAllowed 精确匹配访问域名，支持 *.example.com 通配（同时匹配根域）。
+// 这里刻意不做 whitelistMatch 的"根域名自动放宽"，避免填了 example.com
+// 却把任意 xxx.example.com 也一并放行。
+func hostAllowed(list []string, host string) bool {
+	for _, w := range list {
+		w = strings.ToLower(strings.TrimSpace(w))
+		if i := strings.IndexAny(w, "#;"); i >= 0 {
+			w = strings.TrimSpace(w[:i])
+		}
+		w = normalizeWhitelistEntry(w)
+		if w == "" {
+			continue
+		}
+		if strings.HasPrefix(w, "*.") {
+			suf := strings.TrimPrefix(w, "*.")
+			if suf != "" && (host == suf || strings.HasSuffix(host, "."+suf)) {
+				return true
+			}
+			continue
+		}
+		if host == w {
+			return true
+		}
+	}
+	return false
+}
+
+// accessHostAllowed 是守卫总入口，返回是否放行，以及被拒时的细分原因编码：
+//   - host_ip：用 IP / localhost 等裸 Host 直连（拦截记录里标红）
+//   - host_deny：域名不在允许列表中（拦截记录里标橙）
+//   - 开关关闭：不限制（完全兼容旧配置）
+//   - 开关开启 + 白名单非空：只放行白名单域名
+//   - 开关开启 + 白名单为空：仅拒绝 IP/localhost 直连，任何域名都放行
+func accessHostAllowed(c *Config, r *http.Request) (bool, string) {
+	if c == nil || !c.HostGuardOn {
+		return true, ""
+	}
+	h := requestAccessHost(r)
+	if len(c.AllowedHosts) > 0 {
+		if hostAllowed(c.AllowedHosts, h) {
+			return true, ""
+		}
+		if isBareHost(h) {
+			return false, "host_ip"
+		}
+		return false, "host_deny"
+	}
+	if isBareHost(h) {
+		return false, "host_ip"
+	}
+	return true, ""
+}
+
 type BlockEvent struct {
 	Time       string `json:"time"`
 	IP         string `json:"ip"`
 	Country    string `json:"country"`
+	Host       string `json:"host"` // 触发拦截时浏览器使用的访问 Host（原始值，可带端口）
 	Path       string `json:"path"`
 	Reason     string `json:"reason"`
 	ReasonText string `json:"reason_text"`
@@ -2484,7 +2912,9 @@ func startReportWorker() {
 func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/speed/")
 	if rest == "" {
-		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已失效。")
+		serveError(w, r, http.StatusNotFound, "测速链接不存在",
+			"测速链接为空或格式不正确，无法找到对应的测速任务。",
+			errPageCtx{Tips: []string{"请联系服务提供者重新生成链接，并完整复制地址（不要漏掉末尾的令牌）。"}})
 		return
 	}
 	if strings.HasSuffix(rest, "/dl") {
@@ -2577,21 +3007,29 @@ func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 
 	tok := rest
 	if strings.Contains(tok, "/") {
-		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已失效。")
+		serveError(w, r, http.StatusNotFound, "测速链接不存在",
+			"测速链接为空或格式不正确，无法找到对应的测速任务。",
+			errPageCtx{Tips: []string{"请联系服务提供者重新生成链接，并完整复制地址（不要漏掉末尾的令牌）。"}})
 		return
 	}
 	v, ok := speedTokens.Load(tok)
 	if !ok {
-		serveError(w, http.StatusNotFound, "链接不存在", "测速链接无效或已被删除。")
+		serveError(w, r, http.StatusNotFound, "测速链接不存在",
+			"该链接对应的测速任务不存在或已被删除，服务中没有可匹配的令牌。",
+			errPageCtx{Tips: []string{"确认链接完整无误；如已删除，请联系管理员重新生成。"}})
 		return
 	}
 	st := v.(*speedToken)
 	if speedTokenExpired(st) {
-		serveError(w, http.StatusGone, "链接已过期", "该测速链接已超过 7 天有效期，请联系管理员重新生成。")
+		serveError(w, r, http.StatusGone, "测速链接已过期",
+			"该测速链接已超过 7 天有效期，出于安全考虑不再接受请求。",
+			errPageCtx{Tips: []string{"测速链接自生成起有效期为 7 天，请联系管理员重新生成后再测。"}})
 		return
 	}
 	if st.Uses.Load() >= int64(st.MaxUses) {
-		serveError(w, http.StatusGone, "链接已失效", "该测速链接的可用次数已用完，请联系管理员重新生成。")
+		serveError(w, r, http.StatusGone, "测速链接已用尽",
+			"该测速链接的可用次数已用完，无法继续发起测速。",
+			errPageCtx{Tips: []string{"每个测速链接有次数上限，请联系管理员重新生成。"}})
 		return
 	}
 	st.Uses.Add(1)
@@ -3654,7 +4092,7 @@ func isSelfOrLocalIP(ip, country string) bool {
 	return false
 }
 
-func recordBlocked(ip, country, path, reason, ua string) {
+func recordBlocked(ip, country, path, reason, ua, host string) {
 	if isSelfOrLocalIP(ip, country) {
 		return
 	}
@@ -3680,7 +4118,7 @@ func recordBlocked(ip, country, path, reason, ua string) {
 	if country == "" {
 		country = "??"
 	}
-	ev := BlockEvent{Time: beijingRFC3339(time.Now()), IP: ip, Country: country, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
+	ev := BlockEvent{Time: beijingRFC3339(time.Now()), IP: ip, Country: country, Host: host, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
 	stats.Blocks = append(stats.Blocks, ev)
 	if len(stats.Blocks) > maxBlockEvents {
 		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
@@ -3695,11 +4133,23 @@ func blockReasonText(reason string) string {
 		return "IP 在黑名单中"
 	case "ua":
 		return "User-Agent 不在允许列表"
+	case "host_ip":
+		return "IP / localhost 直连被拒绝（未使用授权域名）"
+	case "host_deny":
+		return "访问域名不在允许列表中"
+	case "host":
+		return "访问域名未授权（旧记录，禁止 IP 直接访问）"
 	case "login_fail":
 		return "管理后台登录失败（用户名/密码或验证码错误）"
 	default:
 		return "目标域名未在白名单中"
 	}
+}
+
+// reasonMatches 让下拉选总类 "host" 时能同时命中细分原因 host_ip / host_deny，
+// 并兼容旧数据里的 host；其它原因仍是精确匹配。
+func reasonMatches(evReason, want string) bool {
+	return evReason == want || strings.HasPrefix(evReason, want+"_")
 }
 
 const maxBlockEvents = 5000
@@ -4336,7 +4786,7 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 	}
 
 	ua := ""
-	recordBlocked(ip, countryOf(ip), "/admin/api/login", "login_fail", ua)
+	recordBlocked(ip, countryOf(ip), "/admin/api/login", "login_fail", ua, "")
 	recordAudit(ip, "login_fail", reason)
 
 	if fails >= loginFailLimit {
@@ -4489,18 +4939,28 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			msg := "无法连接到上游服务，可能是上游服务器暂时不可用或网络波动，请稍后重试。"
-			if err != nil {
-				msg += "<br><span style=\"font-size:12px;color:#94a3b8;font-family:Consolas,monospace\">技术详情：" + strings.ReplaceAll(strings.ReplaceAll(err.Error(), "<", "&lt;"), ">", "&gt;") + "</span>"
+			tech, target := "", ""
+			if t, ok := r.Context().Value(targetCtxKey{}).(*url.URL); ok && t != nil {
+				target = t.Scheme + "://" + t.Host
 			}
-			serveError(w, http.StatusBadGateway, "请求失败", "暂时无法完成请求，请稍后重试。")
+			if err != nil {
+				tech = err.Error()
+			}
+			tips := []string{}
+			if target != "" {
+				tips = append(tips, "本次请求的目标上游："+target+"（请确认该地址可从服务器访问）")
+			}
+			serveError(w, r, http.StatusBadGateway, "上游连接失败",
+				"网关已通过全部访问规则，但在连接目标上游时失败，未取得任何响应内容。这通常与上游服务状态、端口、协议或网络有关，与访问白名单无关。",
+				errPageCtx{Code: "upstream", Label: "上游服务连接失败", Tips: tips, Tech: tech})
 		},
 	}
 }
 
 type adminConfigResp struct {
 	Config
-	EffectivePort int `json:"effective_port"`
+	EffectivePort int    `json:"effective_port"`
+	CurrentHost   string `json:"current_host"` // 当前浏览器访问后台使用的 Host，便于管理员配全白名单
 }
 
 const iconVer = "?v=4"
@@ -4821,7 +5281,7 @@ func adminHandler() http.HandlerFunc {
 
 	mux.HandleFunc("/admin/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *currentCfg(), EffectivePort: currentPort()})
+		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *currentCfg(), EffectivePort: currentPort(), CurrentHost: r.Host})
 	})
 	mux.HandleFunc("/admin/api/save", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -4855,7 +5315,7 @@ func adminHandler() http.HandlerFunc {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort()})
+		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort(), CurrentHost: r.Host})
 	})
 	mux.HandleFunc("/admin/api/system", func(w http.ResponseWriter, r *http.Request) {
 		var ms runtime.MemStats
@@ -4925,6 +5385,8 @@ func adminHandler() http.HandlerFunc {
 			"total_bytes":    totalBytes,
 			"allow_rate":     allowRate,
 			"whitelist":      len(c.Whitelist),
+			"host_guard_on":  c.HostGuardOn,
+			"allowed_hosts":  len(c.AllowedHosts),
 			"ban_list":       len(c.BanList),
 			"china_only":     c.ChinaOnly,
 			"allowed_uas":    len(c.AllowedUAs),
@@ -5130,17 +5592,22 @@ func adminHandler() http.HandlerFunc {
 
 		v := currentStatsView()
 		all := v.blocks
+		// 全局原因分布：不受当前筛选影响，用于页面上按类型区分与计数
+		reasonCounts := make(map[string]int, 8)
+		for i := range all {
+			reasonCounts[all[i].Reason]++
+		}
 		matched := make([]BlockEvent, 0, len(all))
 		for i := len(all) - 1; i >= 0; i-- {
 			ev := all[i]
 			if qIP != "" && ev.IP != qIP {
 				continue
 			}
-			if qReason != "" && ev.Reason != qReason {
+			if qReason != "" && !reasonMatches(ev.Reason, qReason) {
 				continue
 			}
 			if qSearch != "" {
-				blob := strings.ToLower(ev.IP + " " + ev.Path + " " + ev.UA + " " + ev.ReasonText + " " + ev.Country)
+				blob := strings.ToLower(ev.IP + " " + ev.Host + " " + ev.Path + " " + ev.UA + " " + ev.ReasonText + " " + ev.Country)
 				if !strings.Contains(blob, qSearch) {
 					continue
 				}
@@ -5160,13 +5627,14 @@ func adminHandler() http.HandlerFunc {
 		items := make([]map[string]any, len(page))
 		for i, ev := range page {
 			items[i] = map[string]any{
-				"time": ev.Time, "ip": ev.IP, "country": ev.Country,
+				"time": ev.Time, "ip": ev.IP, "country": ev.Country, "host": ev.Host,
 				"country_name": countryName(ev.Country),
 				"path":         ev.Path, "reason": ev.Reason, "reason_text": ev.ReasonText, "ua": ev.UA,
 			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"total": total, "returned": len(items), "offset": start, "limit": limit, "items": items,
+			"total": total, "returned": len(items), "offset": start, "limit": limit,
+			"items": items, "reason_counts": reasonCounts,
 		})
 	})
 
@@ -5690,7 +6158,12 @@ func adminHandler() http.HandlerFunc {
 	})
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !adminIPAllowed(getClientIP(r)) {
-			http.Error(w, "当前来源 IP 不在后台允许访问范围内", http.StatusForbidden)
+			serveError(w, r, http.StatusForbidden, "访问受限",
+				"当前来源 IP 不在允许访问的范围内，无法打开该页面。此限制不影响代理转发。",
+				errPageCtx{Code: "admin_ip", Label: "来源 IP 不在允许范围", Tips: []string{
+					"如需从当前来源访问，请联系服务提供者调整允许范围。",
+					"若确认被误拦，请把上面的「请求编号」与「发生时间」提供给服务提供者。",
+				}})
 			return
 		}
 		path := r.URL.Path
@@ -5813,7 +6286,12 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 		if isBuiltinAssetPath(r.URL.Path) {
-			serveError(w, http.StatusNotFound, "页面不存在", "未找到请求的资源。")
+			serveError(w, r, http.StatusNotFound, "页面不存在",
+				"该路径属于浏览器自动请求的内置资源（如 favicon、robots.txt），本服务没有提供对应文件。",
+				errPageCtx{Tips: []string{
+					"普通访客可忽略此提示，它不影响媒体播放。",
+					"管理员可在前置 Nginx 上给这些路径配置静态文件，或直接返回 204。",
+				}})
 			return
 		}
 		if r.URL.Path == "/" || r.URL.Path == "" {
@@ -5822,34 +6300,46 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		ip := getClientIP(r)
 		c := currentCfg()
+		// IP 归属整条判定链只解析一次，下面各步共用
+		country := countryOf(ip)
 
+		// 判定链 ② IP 黑名单
 		clientIP := net.ParseIP(ip)
 		if isBannedIP(ip, clientIP) {
-			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), "ban", r.UserAgent())
-			serveError(w, http.StatusForbidden, "访问被拒绝", "当前请求无法继续。")
+			recordBlocked(ip, country, r.URL.RequestURI(), "ban", r.UserAgent(), r.Host)
+			serveError(w, r, http.StatusForbidden, "来源 IP 已被拉黑",
+				"您的来源 IP 命中了 IP 黑名单，请求在判定链第 ② 步被拒绝，未进入反代流程。",
+				errPageCtx{Code: "ban", Label: "IP 在黑名单中"})
 			return
 		}
+		// 判定链 ③ UA 白名单
 		if !uaAllowed(r.UserAgent()) {
-			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), "ua", r.UserAgent())
-			serveError(w, http.StatusForbidden, "访问被拒绝", "当前请求无法继续。")
+			recordBlocked(ip, country, r.URL.RequestURI(), "ua", r.UserAgent(), r.Host)
+			serveError(w, r, http.StatusForbidden, "客户端不被允许",
+				"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求在判定链第 ③ 步被拒绝。",
+				errPageCtx{Code: "ua", Label: "User-Agent 不在允许列表"})
 			return
 		}
-
-		country := countryOf(ip)
+		// 判定链 ④ 地区限制
 		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
-			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent())
-			serveError(w, http.StatusForbidden, "访问被拒绝", "当前请求无法继续。")
+			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent(), r.Host)
+			serveError(w, r, http.StatusForbidden, "地区限制",
+				"当前来源 IP 的归属地不在允许范围内，请求在判定链第 ④ 步被拒绝。",
+				errPageCtx{Code: "cn", Label: "仅允许中国大陆 IP 访问"})
 			return
 		}
 
+		// 判定链 ⑤ 上游域名白名单（需先解析出反代目标，故放在最后）
 		target, err := parseTarget(r)
 		if err != nil {
 			serveHome(w, r)
 			return
 		}
 		if !whitelistMatch(c.Whitelist, target.Host) {
-			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent())
-			serveError(w, http.StatusForbidden, "访问被拒绝", "当前请求无法继续。")
+			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent(), r.Host)
+			serveError(w, r, http.StatusForbidden, "目标域名未授权",
+				"请求路径中的上游域名不在「上游域名白名单」内，请求在判定链第 ⑤ 步被拒绝，未向上游转发任何数据。",
+				errPageCtx{Code: "whitelist", Label: "上游目标域名未授权"})
 			return
 		}
 
@@ -5875,6 +6365,12 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	adminSrv := adminHandler()
 	adminGz := gzipMiddleware(adminSrv)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 公开页面（首页 / 所有提示页）的图标走根路径，避免 HTML 里出现 /admin 前缀。
+		// 与 /admin/logo.png 指向同一资源，必须在访问域名守卫之前放行，保证 403 页也能显示。
+		if r.URL.Path == "/logo.png" {
+			redirectIcon(w, r, iconLogoURL)
+			return
+		}
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d}`, int64(time.Since(startedAt).Seconds()))))
@@ -5890,6 +6386,22 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		if strings.HasPrefix(r.URL.Path, "/speed/") {
 			serveSpeedTest(w, r)
+			return
+		}
+		// 判定链 ① 访问域名白名单：/health（监控）、/admin/（后台）、/speed/（测速链接）
+		// 已在上面放行，其余请求（首页、favicon、所有代理转发路径）都必须用允许的域名访问。
+		// 放在这里而不是 proxyHandler 内部，能保证通过 IP 打开时连首页都不暴露。
+		// 顺序与 ruleChainOrder 一致，后续 ②③④⑤ 在 proxyHandler 内依次执行。
+		if allowed, reason := accessHostAllowed(currentCfg(), r); !allowed {
+			ip := getClientIP(r)
+			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), reason, r.UserAgent(), r.Host)
+			title, label, msg := "禁止 IP 直连", "IP / localhost 直连被拒绝", "您正在使用服务器 IP、localhost 或单标签主机名访问，本服务已禁止这种访问方式。"
+			if reason == "host_deny" {
+				title, label, msg = "访问域名未授权", "访问域名不在允许列表中", "当前浏览器使用的域名不在「允许访问的域名」列表中。"
+			}
+			serveError(w, r, http.StatusForbidden, title,
+				msg+"该请求在判定链第 ① 步被拒绝，未进入后续规则与反代流程。",
+				errPageCtx{Code: reason, Label: label})
 			return
 		}
 		proxyHandler(w, r)
@@ -6198,7 +6710,44 @@ func adminAllowContains(c *Config, ipStr string) bool {
 	return false
 }
 
+// ruleChainOrder 是全站唯一的判定链顺序定义。
+// 真实请求（runServer 的 root 守卫 + proxyHandler）、规则测试 API、
+// 管理后台「判定链顺序」面板三处共用此顺序，避免各写一份后逐渐漂移。
+//
+// 排序原则：先准入后内容，先便宜后昂贵。
+//   ① 访问域名白名单：纯字符串解析，最外层准入，挡掉 IP 直连 / 盗链 / 扫描器
+//   ② IP 黑名单：内存查表，明确拉黑的来源直接丢弃
+//   ③ UA 白名单：内存字符串匹配
+//   ④ 地区限制：要查 IP 归属库，放到便宜规则之后，只对存活下来的请求执行
+//   ⑤ 上游域名白名单：需先 parseTarget 解析请求路径，只有真正反代才需要
+// 例外路径（/health、/admin/、/speed/、favicon、内置资源、首页）不参与此链，
+// 保持「后台与监控永远可用、首页不暴露内容」的既有行为。
+type ruleStepSpec struct {
+	Key    string `json:"key"`
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
+	Kind   string `json:"kind"` // block=拦截项, pass=终点
+}
+
+var ruleChainOrder = []ruleStepSpec{
+	{"access_host", "访问域名白名单", "请求 Host 必须在允许列表内；开启后禁止 IP / localhost 直连", "block"},
+	{"ban", "IP 黑名单", "来源 IP 精确匹配或命中 CIDR 段", "block"},
+	{"ua", "UA 白名单", "客户端 UA 需包含白名单关键字，空=不限制", "block"},
+	{"cn", "地区限制", "开启「仅允许中国大陆 IP」时，非大陆来源被拒", "block"},
+	{"whitelist", "上游域名白名单", "路径中的目标域名需匹配白名单（支持根域名），空=不限制", "block"},
+	{"forward", "放行转发", "全部通过后反代到上游，并计入流量统计", "pass"},
+}
+
 func registerExtraRoutes(mux *http.ServeMux) {
+	// 判定链顺序（后台面板渲染用），与 ruleChainOrder 同源
+	mux.HandleFunc("/admin/api/rules/chain", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"方法不支持"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "chain": ruleChainOrder})
+	})
 	mux.HandleFunc("/admin/api/rules/test", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost {
@@ -6206,9 +6755,10 @@ func registerExtraRoutes(mux *http.ServeMux) {
 			return
 		}
 		var req struct {
-			IP   string `json:"ip"`
-			UA   string `json:"ua"`
-			Host string `json:"host"`
+			IP         string `json:"ip"`
+			UA         string `json:"ua"`
+			Host       string `json:"host"`        // 目标上游：路径里要反代的域名
+			AccessHost string `json:"access_host"` // 请求 Host：浏览器地址栏用的域名
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
 			http.Error(w, `{"error":"请求格式有误"}`, http.StatusBadRequest)
@@ -6225,69 +6775,122 @@ func registerExtraRoutes(mux *http.ServeMux) {
 		c := currentCfg()
 		ua := req.UA
 		host := strings.TrimSpace(req.Host)
+		// 留空时用当前后台请求自身的访问域名（含回环代理 X-Forwarded-Host 兼容），
+		// 与真实守卫 requestAccessHost 取自同一份逻辑。
+		accessHost := strings.TrimSpace(req.AccessHost)
+		if accessHost == "" {
+			accessHost = requestAccessHost(r)
+		}
 
 		type step struct {
+			Key    string `json:"key"`
 			Name   string `json:"name"`
 			Status string `json:"status"`
 			Detail string `json:"detail"`
 		}
-		steps := make([]step, 0, 6)
+		steps := make([]step, 0, len(ruleChainOrder))
 		final := "pass"
-
-		if isBannedIP(ip, net.ParseIP(ip)) {
-			steps = append(steps, step{"IP 黑名单", "block", "命中黑名单规则（IP 或 CIDR）"})
-			final = "block"
-		} else {
-			steps = append(steps, step{"IP 黑名单", "pass", "未命中"})
+		blockedReason := ""
+		add := func(idx int, status, detail string) {
+			spec := ruleChainOrder[idx]
+			steps = append(steps, step{spec.Key, spec.Name, status, detail})
 		}
+
+		// ① 访问域名白名单 —— 直接复用真实请求的同一个守卫函数
+		fakeReq := &http.Request{Host: accessHost, RemoteAddr: ip + ":0", Header: http.Header{}}
+		allowed, reason := accessHostAllowed(c, fakeReq)
+		switch {
+		case !allowed && reason == "host_ip":
+			final, blockedReason = "block", reason
+			add(0, "block", accessHost+" 为 IP / localhost 直连，已被禁止")
+		case !allowed:
+			final, blockedReason = "block", reason
+			add(0, "block", accessHost+" 不在允许访问的域名列表中")
+		case !c.HostGuardOn:
+			add(0, "pass", "未启用（开关关闭，不限制访问域名）")
+		case len(c.AllowedHosts) == 0:
+			add(0, "pass", accessHost+" 是合法域名；白名单为空，仅禁止 IP 直连")
+		default:
+			add(0, "pass", accessHost+" 在允许访问的域名列表内")
+		}
+
+		// ② IP 黑名单
+		if final == "pass" {
+			if isBannedIP(ip, net.ParseIP(ip)) {
+				final, blockedReason = "block", "ban"
+				add(1, "block", ip+" 命中黑名单规则（IP 或 CIDR）")
+			} else {
+				add(1, "pass", "未命中")
+			}
+		}
+
+		// ③ UA 白名单
 		if final == "pass" {
 			switch {
 			case len(c.AllowedUAs) == 0:
-				steps = append(steps, step{"UA 白名单", "pass", "未启用（空=不限制）"})
+				add(2, "pass", "未启用（空=不限制）")
 			case uaAllowed(ua):
-				steps = append(steps, step{"UA 白名单", "pass", "命中白名单关键字"})
+				add(2, "pass", "命中白名单关键字")
 			default:
-				steps = append(steps, step{"UA 白名单", "block", "User-Agent 不包含任何白名单关键字"})
-				final = "block"
+				final, blockedReason = "block", "ua"
+				add(2, "block", "User-Agent 不包含任何白名单关键字")
 			}
 		}
+
+		// ④ 地区限制（IP 归属只解析一次，与真实请求一致）
 		country := countryOf(ip)
 		cname := countryName(country)
 		if final == "pass" {
 			if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
-				steps = append(steps, step{"地区限制", "block", "来源地区为 " + cname + "，不在中国大陆放行范围"})
-				final = "block"
+				final, blockedReason = "block", "cn"
+				add(3, "block", "来源地区为 "+cname+"，不在中国大陆放行范围")
 			} else if c.ChinaOnly {
-				steps = append(steps, step{"地区限制", "pass", "来源地区 " + cname + "，允许访问"})
+				add(3, "pass", "来源地区 "+cname+"，允许访问")
 			} else {
-				steps = append(steps, step{"地区限制", "pass", "未开启（仅记录来源：" + cname + "）"})
+				add(3, "pass", "未开启（仅记录来源："+cname+"）")
 			}
 		}
+
+		// ⑤ 上游域名白名单（真实请求里由 parseTarget 解析路径得到目标域名）
 		if final == "pass" {
 			if host == "" {
-				steps = append(steps, step{"域名白名单", "pass", "未填写目标域名，跳过校验"})
+				add(4, "pass", "未填写目标上游，跳过校验")
 			} else if len(c.Whitelist) == 0 {
-				steps = append(steps, step{"域名白名单", "pass", "未启用（空=不限制）"})
+				add(4, "pass", "未启用（空=不限制）")
 			} else if whitelistMatch(c.Whitelist, host) {
-				steps = append(steps, step{"域名白名单", "pass", host + " 在白名单内"})
+				add(4, "pass", host+" 在白名单内")
 			} else {
-				steps = append(steps, step{"域名白名单", "block", host + " 不在白名单内"})
-				final = "block"
+				final, blockedReason = "block", "whitelist"
+				add(4, "block", host+" 不在白名单内")
 			}
 		}
+
+		// 前序已拦截：后续规则不再执行，但仍完整列出，便于对照判定链
+		for len(steps) < len(ruleChainOrder)-1 {
+			spec := ruleChainOrder[len(steps)]
+			steps = append(steps, step{spec.Key, spec.Name, "skip", "前序规则已拦截，未执行"})
+		}
+		if final == "pass" {
+			add(len(ruleChainOrder)-1, "pass", "全部规则通过，将反代到上游并计入流量统计")
+		} else {
+			add(len(ruleChainOrder)-1, "skip", "已被拦截，不会转发到上游")
+		}
+
+		// 后台访问限制只影响 /admin，不属于反代判定链，单独返回避免误导
+		adminAccess := "unrestricted"
 		if len(adminAllowList(c)) > 0 {
 			if adminAllowContains(c, ip) {
-				steps = append(steps, step{"后台访问限制", "pass", "可访问 /admin"})
+				adminAccess = "allowed"
 			} else {
-				steps = append(steps, step{"后台访问限制", "block", "不可访问 /admin（仅影响后台，不影响代理）"})
+				adminAccess = "denied"
 			}
 		}
 
 		cls := uaClassOfEx(ua)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok": true, "ip": ip, "ua": ua, "host": host,
+			"ok": true, "ip": ip, "ua": ua, "host": host, "access_host": accessHost,
 			"country": country, "country_name": cname, "ua_class": cls,
-			"result": final, "steps": steps,
+			"result": final, "reason": blockedReason, "admin_access": adminAccess, "steps": steps,
 		})
 	})
 
@@ -6384,17 +6987,17 @@ func registerExtraRoutes(mux *http.ServeMux) {
 			if qIP != "" && ev.IP != qIP {
 				continue
 			}
-			if qReason != "" && ev.Reason != qReason {
+			if qReason != "" && !reasonMatches(ev.Reason, qReason) {
 				continue
 			}
 			if qSearch != "" {
-				blob := strings.ToLower(ev.IP + " " + ev.Path + " " + ev.UA + " " + ev.ReasonText + " " + ev.Country)
+				blob := strings.ToLower(ev.IP + " " + ev.Host + " " + ev.Path + " " + ev.UA + " " + ev.ReasonText + " " + ev.Country)
 				if !strings.Contains(blob, qSearch) {
 					continue
 				}
 			}
 			rows = append(rows, []string{ev.Time, ev.IP, ev.Country, countryName(ev.Country),
-				blockReasonText(ev.Reason), ev.Path, ev.UA})
+				blockReasonText(ev.Reason), ev.Host, ev.Path, ev.UA})
 		}
 		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 			rows[i], rows[j] = rows[j], rows[i]
@@ -6405,7 +7008,7 @@ func registerExtraRoutes(mux *http.ServeMux) {
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
 		_, _ = w.Write([]byte("\xEF\xBB\xBF"))
 		cw := csv.NewWriter(w)
-		_ = cw.Write([]string{"时间", "IP", "国家/地区码", "国家/地区", "拦截原因", "访问路径", "User-Agent"})
+		_ = cw.Write([]string{"时间", "IP", "国家/地区码", "国家/地区", "拦截原因", "访问域名(Host)", "访问路径", "User-Agent"})
 		for _, row := range rows {
 			_ = cw.Write(row)
 		}
@@ -7340,6 +7943,7 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .pill{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:1.4;white-space:nowrap}
 .pill.pc{background:#fff7ed;color:#c2410c;border:1px solid #fed7aa}
 .pill.pw{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.pill.po{background:#fffbeb;color:#b45309;border:1px solid #fde68a}
 .pill.pb{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
 .pill.pu{background:#ecfeff;color:#0e7490;border:1px solid #a5f3fc}
 .flg{width:22px;height:16px;object-fit:cover;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.08);background:#e2e8f0;margin-right:8px;vertical-align:middle}
@@ -7564,6 +8168,7 @@ html[data-theme="dark"] tr{border-color:var(--bd)}
 html[data-theme="dark"] .table-wrap{border-color:var(--bd)}
 html[data-theme="dark"] .pill.pc{background:#3a2415;color:#fdba74;border-color:#5a3a1d}
 html[data-theme="dark"] .pill.pw{background:#12274a;color:#93c5fd;border-color:#1e3f70}
+html[data-theme="dark"] .pill.po{background:#3a2a0d;color:#fcd34d;border-color:#5c4416}
 html[data-theme="dark"] .pill.pb{background:#331519;color:#fca5a5;border-color:#57242b}
 html[data-theme="dark"] .pill.pu{background:#0d2b33;color:#67e8f9;border-color:#164e5c}
 html[data-theme="dark"] .pill.pg{background:#0f2d22;color:#6ee7b7;border-color:#1b5340}
@@ -7583,6 +8188,8 @@ html[data-theme="dark"] .act-tag.warn{background:#3a2415;color:#fdba74}
 .tl-d{width:10px;height:10px;border-radius:50%;margin-top:6px;flex-shrink:0}
 .tl-i.pass .tl-d{background:var(--ok)}
 .tl-i.block .tl-d{background:var(--d)}
+.tl-i.skip .tl-d{background:var(--t3)}
+.tl-i.skip{opacity:.45}
 .tl-n{font-weight:600;color:var(--t);min-width:96px;flex-shrink:0}
 .tl-v{color:var(--t2);flex:1;word-break:break-word}
 .tl-res{margin-top:14px;padding:12px 14px;border-radius:10px;font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px}
@@ -7647,7 +8254,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 <li><button class="nav-i" data-t="realtime"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>实时监控</button></li>
 <li><button class="nav-i" data-t="speedm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>测速管理</button></li>
 <li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
-<li><button class="nav-i" data-t="audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/></svg>操作审计</button></li>
+<li><button class="nav-i" data-t="audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/></svg>操作记录</button></li>
 <li><button class="nav-i" data-t="report"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5-7 5 7"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>数据上报</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
@@ -7764,13 +8371,16 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </section>
 <section id="blocks" class="pg">
 <div class="card">
-<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区、白名单或 UA 策略被拒绝的请求 · 服务端分页 · 每 5 秒自动刷新</div></div></div>
+<div class="ch"><div><h2 class="ct">拦截记录</h2><div class="cd">因黑名单、地区、上游/访问域名白名单或 UA 策略被拒绝的请求 · 服务端分页 · 每 5 秒自动刷新</div></div></div>
 <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;align-items:center">
-  <input id="blkQ" class="inp m" type="search" placeholder="搜索 IP / 路径 / UA" style="max-width:220px">
-  <select id="blkReason" class="inp m" style="width:auto;max-width:160px">
+  <input id="blkQ" class="inp m" type="search" placeholder="搜索 IP / 域名 / 路径 / UA" style="max-width:220px">
+  <select id="blkReason" class="inp m" style="width:auto;max-width:190px">
     <option value="">全部原因</option>
     <option value="cn">地区限制</option>
-    <option value="whitelist">域名未授权</option>
+    <option value="whitelist">上游域名未授权</option>
+    <option value="host">访问域名未授权（全部）</option>
+    <option value="host_ip">└ IP / localhost 直连</option>
+    <option value="host_deny">└ 非白名单域名</option>
     <option value="ban">IP 黑名单</option>
     <option value="ua">UA 不允许</option>
     <option value="login_fail">登录失败</option>
@@ -7782,7 +8392,8 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <span style="flex:1"></span>
   <button type="button" class="btn g s" id="blkExport">导出 CSV</button>
 </div>
-<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
+<div id="blkReasonStats" style="display:flex;flex-wrap:wrap;gap:8px;margin:-4px 0 14px"></div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>访问域名</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
   <div class="pgbar">
     <span id="blkPageInfo"></span>
     <div style="display:flex;gap:8px">
@@ -7975,7 +8586,9 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <div class="ch"><div><h2 class="ct">安全与访问控制</h2><div class="cd">代理转发的准入规则；保存后立即生效并预编译匹配</div></div></div>
     <div class="row"><div><div class="rl">仅允许中国大陆 IP</div><div class="rd">非大陆来源将被拒绝</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
     <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
-    <div class="fi"><label class="fl">域名白名单</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
+    <div class="row"><div><div class="rl">禁止 IP 直连 / 访问域名白名单</div><div class="rd">开启后，只有通过下方允许的域名访问代理才被放行；用服务器 IP、localhost 或其它域名访问一律返回 403。管理后台 /admin/、健康检查 /health 与测速链接不受限制，不会被锁在门外</div></div><label class="sw"><input type="checkbox" id="hostGuardOn"><span class="tr2"></span></label></div>
+    <div class="fi"><label class="fl">允许访问的域名</label><div class="hint" style="margin-bottom:8px">每行一个，支持 *.example.com 通配；也可直接粘贴完整网址（会自动忽略 https:// 与路径）。留空表示只禁止 IP / localhost 直连，任意域名均可访问。前面挂了 Nginx / CDN 时，请回传 X-Forwarded-Host 或保留原始 Host，否则后端看到的会是回环 IP。注意：只填根域不会放行子域，用到的子域请逐个添加或改用通配</div><textarea id="allowedHosts" class="tarea" placeholder="emby.example.com&#10;*.example.com"></textarea><div class="hint" id="curHostHint" style="margin-top:8px;color:var(--pd)">当前访问域名：加载中…</div></div>
+    <div class="fi"><label class="fl">上游域名白名单（可反代到的目标）</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配；限制路径里能反代到哪些上游主机，与上面的访问域名无关</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
     <div class="fi"><label class="fl">后台访问来源</label><div class="hint" style="margin-bottom:8px">留空表示不限制；填写后只有这些 IP/CIDR 能打开管理后台（不影响代理转发）。保存时会校验本机 IP 是否在列表内，避免把自己锁在门外。</div><textarea id="adminAllow" class="tarea" style="min-height:70px" placeholder="192.168.1.0/24&#10;203.0.113.8"></textarea></div>
     <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
@@ -8007,23 +8620,25 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <div class="g2">
     <div class="card" style="margin-bottom:0">
       <div class="ch"><div><h2 class="ct">规则命中测试</h2><div class="cd">按当前配置跑一遍判定链，调白名单/UA 时不用拿播放器反复试</div></div></div>
+      <div class="fi"><label class="fl">访问域名 / Host</label><div class="hint" style="margin-bottom:8px">浏览器地址栏里的域名，对应「访问域名白名单」；留空则用当前后台访问域名</div><input id="rtAccessHost" class="inp m" placeholder="例如 emby.example.com:8520"></div>
       <div class="fi"><label class="fl">来源 IP</label><input id="rtIP" class="inp m" placeholder="留空则用当前浏览器出口 IP"></div>
       <div class="fi"><label class="fl">目标上游</label><input id="rtHost" class="inp m" placeholder="例如 emby.example.com:8096"></div>
       <div class="fi"><label class="fl">User-Agent</label><textarea id="rtUA" class="tarea" style="min-height:70px" placeholder="粘贴客户端的 UA，例如 Infuse/7.8 (iPhone; iOS 17.0)"></textarea></div>
-      <div class="acts"><button class="btn b" id="rtRun">开始测试</button><button class="btn g" id="rtFillUA">填入本浏览器 UA</button></div>
+      <div class="acts"><button class="btn b" id="rtRun">开始测试</button><button class="btn g" id="rtFillHost">填入当前域名</button><button class="btn g" id="rtFillUA">填入本浏览器 UA</button></div>
       <div id="rtResult" style="margin-top:6px"></div>
     </div>
 
     <div class="card" style="margin-bottom:0;align-self:start">
       <div class="ch"><div><h2 class="ct">判定链顺序</h2><div class="cd">请求按以下顺序依次校验，命中即拦截</div></div></div>
-      <div class="tl">
+      <div class="tl" id="rtChain">
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">访问域名白名单</div><div class="tl-v">请求 Host 必须在允许列表内；开启后禁止 IP / localhost 直连</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">IP 黑名单</div><div class="tl-v">来源 IP 精确匹配或命中 CIDR 段</div></div>
-        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">地区限制</div><div class="tl-v">开启「仅允许中国大陆 IP」时，非大陆来源被拒</div></div>
-        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">域名白名单</div><div class="tl-v">目标域名需匹配白名单（支持根域名），空=不限制</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">UA 白名单</div><div class="tl-v">客户端 UA 需包含白名单关键字，空=不限制</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">地区限制</div><div class="tl-v">开启「仅允许中国大陆 IP」时，非大陆来源被拒</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">上游域名白名单</div><div class="tl-v">路径中的目标域名需匹配白名单（支持根域名），空=不限制</div></div>
         <div class="tl-i pass"><div class="tl-d"></div><div class="tl-n">放行转发</div><div class="tl-v">全部通过后反代到上游，并计入流量统计</div></div>
       </div>
-      <div class="hint" style="margin-top:14px">被拦截的请求可在「拦截记录」页查看明细，操作变更可在「操作审计」页追溯。</div>
+      <div class="hint" style="margin-top:14px">顺序与真实请求、规则测试完全一致（先准入后内容、先便宜后昂贵）。例外路径（后台 /admin、监控 /health、测速 /speed、首页与静态资源）不参与此链，保证后台始终可用。被拦截的请求可在「拦截记录」页查看明细，操作变更可在「操作记录」页追溯。</div>
     </div>
   </div>
 </div>
@@ -8129,8 +8744,22 @@ function fmtBeijing(iso, mode){
 }
 function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
-function reasonLabel(r){return {cn:'地区限制',whitelist:'域名未授权',ban:'IP 黑名单',ua:'UA 不允许',login_fail:'登录失败'}[r]||'其他拦截'}
-function reasonClass(r){return {cn:'pc',whitelist:'pw',ban:'pb',ua:'pu',login_fail:'pb'}[r]||'pw'}
+function reasonLabel(r){return {cn:'地区限制',whitelist:'上游域名未授权',host_ip:'IP 直连被拒',host_deny:'访问域名未授权',host:'访问域名未授权(旧)',ban:'IP 黑名单',ua:'UA 不允许',login_fail:'登录失败'}[r]||'其他拦截'}
+function reasonClass(r){return {cn:'pc',whitelist:'pw',host_ip:'pb',host_deny:'po',host:'pw',ban:'pb',ua:'pu',login_fail:'pb'}[r]||'pw'}
+const REASON_ORDER=['host_ip','host_deny','host','whitelist','ban','ua','cn','login_fail'];
+function renderReasonStats(counts){
+  const box=document.getElementById('blkReasonStats'); if(!box)return;
+  if(!counts){box.innerHTML='';return}
+  const keys=REASON_ORDER.filter(k=>counts[k]>0);
+  Object.keys(counts).forEach(k=>{if(!REASON_ORDER.includes(k)&&counts[k]>0)keys.push(k)});
+  if(!keys.length){box.innerHTML='';return}
+  const total=keys.reduce((s,k)=>s+counts[k],0);
+  box.innerHTML=keys.map(k=>`<button type="button" class="pill ${reasonClass(k)}" data-rs="${esc(k)}" title="点击按此原因筛选" style="cursor:pointer;border-radius:8px;padding:4px 10px;font:inherit">${esc(reasonLabel(k))} <b style="margin-left:4px">${Number(counts[k]).toLocaleString()}</b></button>`).join('')+`<span style="font-size:12px;color:var(--t3);align-self:center;margin-left:4px">共 ${total.toLocaleString()} 条 · 点击标签可筛选</span>`;
+  box.querySelectorAll('[data-rs]').forEach(el=>el.addEventListener('click',()=>{
+    const sel=document.getElementById('blkReason'); if(sel)sel.value=el.dataset.rs;
+    blkState.page=1; loadBlocks();
+  }));
+}
 
 function countryLabel(code){  if(!code) return '未知';
   const c = String(code).toUpperCase();
@@ -8139,7 +8768,7 @@ function countryLabel(code){  if(!code) return '未知';
   return fallback[c] || code;
 }
 
-const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',audit:'操作审计',speedm:'测速管理',report:'数据上报',settings:'网关设置'};
+const pageTitles={overview:'概览',traffic:'流量请求',realtime:'实时监控',blocks:'拦截记录',audit:'操作记录',speedm:'测速管理',report:'数据上报',settings:'网关设置'};
 let blocksTimer=null, realtimeWS=null, reportTimer=null;
 function clearRealtimeUI(){
   const ids=['rtConc','rtRps','rtRx','rtTx'];
@@ -8236,6 +8865,9 @@ async function loadConfig(){
     if(!r.ok)throw new Error('HTTP '+r.status);
     const c=await r.json();applyPort(c.effective_port);
     document.getElementById('chinaOnly').checked=!!c.china_only;
+    const hg=document.getElementById('hostGuardOn');if(hg)hg.checked=!!c.host_guard_on;
+    const ah=document.getElementById('allowedHosts');if(ah)ah.value=(c.allowed_hosts||[]).join('\n');
+    const ch=document.getElementById('curHostHint');if(ch){const h=c.current_host||'';ch.textContent=h?('当前访问域名（请确认它已填在上方白名单）：'+h):'当前访问域名：未知';}
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');
     document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
     const ro=document.getElementById('reportOn');if(ro)ro.checked=!!c.report_on;
@@ -8857,6 +9489,7 @@ async function loadBlocks(){
     const t=await r.json();
     const tb=document.getElementById('blockTable');
     const cnt=document.getElementById('blkCount');
+    renderReasonStats(t.reason_counts);
     blkState.total=t.total||0;
     const pages=Math.max(1,Math.ceil(blkState.total/blkState.size));
     if(blkState.page>pages)blkState.page=pages;
@@ -8866,7 +9499,7 @@ async function loadBlocks(){
     const prev=document.getElementById('blkPrev'), next=document.getElementById('blkNext');
     if(prev) prev.disabled=blkState.page<=1;
     if(next) next.disabled=blkState.page>=pages;
-    if(!t.items||!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="7"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">没有匹配的拦截事件</span></div></td></tr>';return}
+    if(!t.items||!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="8"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">没有匹配的拦截事件</span></div></td></tr>';return}
     tb.innerHTML=t.items.map(b=>{
       const ua=String(b.ua||'').trim();
       const uaShort=ua.length>60?ua.slice(0,58)+'…':ua;
@@ -8874,6 +9507,7 @@ async function loadBlocks(){
       <td data-label="时间"><span class="cell-v muted mono">${fmtBeijing(b.time,'full')}</span></td>
       <td data-label="IP 地址"><span class="cell-v mono ip-link" data-ip="${esc(b.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600">${esc(b.ip)}</span></td>
       <td data-label="地区"><span class="cell-v"><img class="flg" src="/admin/api/flag/${(b.country||'??').toLowerCase()}" onerror="this.style.display='none'" alt="">${esc(b.country_name||countryLabel(b.country||'??'))}</span></td>
+      <td data-label="访问域名"><span class="cell-v mono" style="font-size:12.5px;word-break:break-all" title="${esc(b.host||'')}">${b.host?esc(b.host):'<span style="color:var(--t3)">—</span>'}</span></td>
       <td data-label="拦截原因"><span class="cell-v"><span class="pill ${reasonClass(b.reason)}" title="${esc(b.reason_text||'')}">${esc(reasonLabel(b.reason))}</span></span></td>
       <td data-label="访问路径"><span class="cell-v" title="${esc(b.path)}">${esc(b.path)}</span></td>
       <td data-label="User-Agent"><span class="cell-v mono" style="font-size:12px;color:var(--t2);word-break:break-all" title="${esc(ua)}">${ua?esc(uaShort):'<span style="color:var(--t3)">—</span>'}</span></td>
@@ -8939,6 +9573,8 @@ function collect(){
   const lines=id=>((document.getElementById(id)?.value||'').split('\n')).map(x=>x.trim()).filter(Boolean);
   return{port:isNaN(raw)?0:raw,
     china_only:!!document.getElementById('chinaOnly')?.checked,
+    host_guard_on:!!document.getElementById('hostGuardOn')?.checked,
+    allowed_hosts:lines('allowedHosts'),
     whitelist:lines('whitelist'),
     ban_list:lines('banList'),
     allowed_uas:lines('allowedUAs'),
@@ -9393,12 +10029,27 @@ function switchSetTab(key){
 document.querySelectorAll('.set-tab').forEach(b=>b.addEventListener('click',()=>switchSetTab(b.dataset.st)));
 try{ const saved=localStorage.getItem('ep_set_tab'); if(saved&&document.getElementById('pane-'+saved))switchSetTab(saved); }catch(e){}
 
+document.getElementById('rtFillHost')?.addEventListener('click',()=>{
+  const el=document.getElementById('rtAccessHost'); if(el) el.value=location.host;
+});
 document.getElementById('rtFillUA')?.addEventListener('click',()=>{
   const el=document.getElementById('rtUA'); if(el) el.value=navigator.userAgent;
 });
+// 判定链面板由后端 ruleChainOrder 渲染，保证与真实请求、规则测试同源（静态 HTML 为加载前兜底）
+(async()=>{
+  try{
+    const r=await fetch('/admin/api/rules/chain');
+    if(!r.ok)return;
+    const d=await r.json();
+    const box=document.getElementById('rtChain');
+    if(!box||!d.chain||!d.chain.length)return;
+    box.innerHTML=d.chain.map(s=>`<div class="tl-i ${s.kind==='pass'?'pass':'block'}"><div class="tl-d"></div><div class="tl-n">${esc(s.name)}</div><div class="tl-v">${esc(s.detail)}</div></div>`).join('');
+  }catch(e){}
+})();
 document.getElementById('rtRun')?.addEventListener('click',async()=>{
   const box=document.getElementById('rtResult');
   const body={
+    access_host:(document.getElementById('rtAccessHost')?.value||'').trim(),
     ip:(document.getElementById('rtIP')?.value||'').trim(),
     host:(document.getElementById('rtHost')?.value||'').trim(),
     ua:(document.getElementById('rtUA')?.value||'').trim()
@@ -9409,12 +10060,14 @@ document.getElementById('rtRun')?.addEventListener('click',async()=>{
     const txt=await r.text();
     if(!r.ok)throw new Error(txt.trim()||('HTTP '+r.status));
     const d=JSON.parse(txt);
-    const steps=(d.steps||[]).map(st=>`<div class="tl-i ${st.status}"><div class="tl-d"></div><div class="tl-n">${esc(st.name)}</div><div class="tl-v">${esc(st.detail)}</div></div>`).join('');
+    const steps=(d.steps||[]).map(st=>`<div class="tl-i ${esc(st.status||'skip')}"><div class="tl-d"></div><div class="tl-n">${esc(st.name)}</div><div class="tl-v">${esc(st.detail)}</div></div>`).join('');
     const pass=d.result==='pass';
+    const reasonTxt=d.reason?'（原因码 '+esc(d.reason)+'）':'';
+    const adm=d.admin_access==='denied'?' · 后台访问：不可访问 /admin':(d.admin_access==='allowed'?' · 后台访问：允许':'');
     box.innerHTML=`<div class="tl">${steps}</div>
-      <div class="tl-res ${pass?'pass':'block'}">${pass?'✓ 该请求会被放行并转发':'✕ 该请求会被拦截'}</div>
+      <div class="tl-res ${pass?'pass':'block'}">${pass?'✓ 该请求会被放行并转发':('✕ 该请求会被拦截'+reasonTxt)}</div>
       <div style="margin-top:10px;font-size:12px;color:var(--t3);word-break:break-all">
-        来源 ${esc(d.ip)} · 地区 ${esc(d.country_name||d.country||'—')} · 客户端归类 ${esc(d.ua_class||'—')}
+        访问域名 ${esc(d.access_host||'—')} · 来源 ${esc(d.ip)} · 地区 ${esc(d.country_name||d.country||'—')} · 客户端归类 ${esc(d.ua_class||'—')}${adm}
       </div>`;
   }catch(e){
     box.innerHTML='<div style="color:var(--d);font-size:13px;padding:10px 0">测试失败：'+esc(e.message||'')+'</div>';
