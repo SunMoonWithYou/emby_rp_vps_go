@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="3.4.0"
+APP_VERSION="3.4.1"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -1322,6 +1322,8 @@ func snapshotIPRates() map[string][2]int64 {
 	return out
 }
 
+// countingReader 统计请求体（客户端→上游）字节，计入上行。
+// 只用于 pr.Out.Body，不要用于响应体，响应体由 countingWriter 按下行计，避免双计。
 type countingReader struct {
 	r  io.Reader
 	rb *reqBytes
@@ -1339,6 +1341,9 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// countingWriter 统计响应体（上游→客户端）字节，计入下行。
+// 实现 Hijack / Unwrap，让 WebSocket 等协议升级能透传；
+// 升级后的裸 TCP 双向 copy 由 ReverseProxy 接管，不计流量。
 type countingWriter struct {
 	http.ResponseWriter
 	rb *reqBytes
@@ -1361,6 +1366,16 @@ func (c *countingWriter) Flush() {
 		f.Flush()
 	}
 }
+
+func (c *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := c.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer 不支持 Hijack")
+	}
+	return h.Hijack()
+}
+
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 
 var netSpeedWake = make(chan struct{}, 1)
 
@@ -4910,6 +4925,7 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+
 			if resp.Body != nil {
 				rb := reqBytesFrom(resp.Request.Context())
 				resp.Body = struct {
@@ -4917,6 +4933,7 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 					io.Closer
 				}{&countingReader{r: resp.Body, rb: rb}, resp.Body}
 			}
+			// 下行流量已在 countingWriter 中统计，不再包装 resp.Body，避免双计
 			upHost := ""
 			if resp.Request != nil && resp.Request.URL != nil {
 				upHost = resp.Request.URL.Host
@@ -8286,24 +8303,37 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <button class="btn b s" id="ovApplyCustom" type="button">应用</button>
   </div>
 </div>
+
 <div class="sg">
-<div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>请求总数</div><div class="sv" id="ovReq">-</div><div class="ss">流量 <b id="ovBytes">0 B</b></div></div>
-<div class="stc g"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>平均每日请求</div><div class="sv" id="ovAvgReq">-</div><div class="ss">日均流量 <b id="ovAvgBytes">0 B</b></div></div>
-<div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">全部拦截类型</div></div>
-<div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
+  <!-- 1. 请求 -->
+  <div class="stc b"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>区间请求</div><div class="sv" id="ovReq">-</div><div class="ss">日均 <b id="ovAvgReq">-</b></div></div>
+  <!-- 2. 流量 -->
+  <div class="stc g"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1.06 6.69 3"/></svg>区间流量</div><div class="sv" id="ovBytes">-</div><div class="ss">日均 <b id="ovAvgBytes">0 B</b></div></div>
+  <!-- 3. IP -->
+  <div class="stc o"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>独立 IP</div><div class="sv" id="uniqueIPs">-</div><div class="ss">实时统计</div></div>
+  <!-- 4. 拦截 -->
+  <div class="stc r"><div class="sl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>拦截次数</div><div class="sv" id="ovBlocked" style="color:var(--d)">-</div><div class="ss">全部拦截类型</div></div>
 </div>
-<div class="card" style="margin-bottom:22px">
-<div class="ch"><div><h2 class="ct" id="ovByteTitle">流量趋势</h2><div class="cd" id="ovByteDesc">仅统计经本服务转发的内容流量（不含系统与其他进程）</div></div></div>
-<div style="position:relative;height:240px"><canvas id="miniByteChart"></canvas></div>
+
+<!-- 流量全宽图 -->
+<div class="card">
+  <div class="ch"><div><h2 class="ct" id="ovByteTitle">流量趋势</h2><div class="cd" id="ovByteDesc">今日 00:00–23:00 各时段整机端口流量（含其他进程，仅供参考）</div></div></div>
+  <div style="position:relative;height:240px"><canvas id="miniByteChart"></canvas></div>
 </div>
-<div class="g3">
-<div>
-<div class="card" style="margin-bottom:22px;"><div class="ch"><div><h2 class="ct" id="ovReqTitle">请求趋势</h2><div class="cd" id="ovReqDesc">按天统计请求次数</div></div></div><div style="position:relative;height:220px"><canvas id="miniTrendChart"></canvas></div></div>
-<div class="card"><div class="ch"><div><h2 class="ct">系统信息</h2></div></div><div id="sysInfo"></div></div>
+
+<!-- 请求全宽图 -->
+<div class="card">
+  <div class="ch"><div><h2 class="ct" id="ovReqTitle">请求趋势</h2><div class="cd" id="ovReqDesc">今日 00:00–23:00 各时段请求数（北京时间）</div></div></div>
+  <div style="position:relative;height:220px"><canvas id="miniTrendChart"></canvas></div>
 </div>
-<div class="card"><div class="ch"><div><h2 class="ct">最新拦截</h2></div><button class="btn g s" data-goto="blocks">查看全部</button></div><div id="ovBlocks"></div></div>
+
+<!-- 底部并排 -->
+<div class="g2">
+  <div class="card"><div class="ch"><div><h2 class="ct">系统信息</h2></div></div><div id="sysInfo"></div></div>
+  <div class="card"><div class="ch"><div><h2 class="ct">最新拦截</h2></div><button class="btn g s" data-goto="blocks">查看全部</button></div><div id="ovBlocks"></div></div>
 </div>
 </section>
+
 <section id="traffic" class="pg">
 <div class="ch" style="margin-bottom:14px;justify-content:flex-start;flex-wrap:wrap;gap:10px">
   <div class="flt" id="tfRangeBar">
@@ -8332,13 +8362,15 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <div class="stc o"><div class="sl">独立 IP</div><div class="sv" id="tfIPs">-</div><div class="ss">当前筛选</div></div>
   <div class="stc r"><div class="sl">拦截次数</div><div class="sv" id="tfBlocked" style="color:var(--d)">-</div><div class="ss">当前筛选</div></div>
 </div>
-<div class="card">
-<div class="ch"><div><h2 class="ct" id="tfReqTitle">请求量趋势</h2><div class="cd" id="tfReqDesc">按天统计请求次数</div></div></div>
-<div style="position:relative;height:260px"><canvas id="reqChart"></canvas></div>
-</div>
+
 <div class="card">
 <div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">仅统计经本服务转发的内容流量（不含系统与其他进程）</div></div></div>
 <div style="position:relative;height:260px"><canvas id="byteChart"></canvas></div>
+</div>
+
+<div class="card">
+<div class="ch"><div><h2 class="ct" id="tfReqTitle">请求量趋势</h2><div class="cd" id="tfReqDesc">按天统计请求次数</div></div></div>
+<div style="position:relative;height:260px"><canvas id="reqChart"></canvas></div>
 </div>
 <div class="card" style="margin-top:0">
 <div class="ch"><div><h2 class="ct" id="tfHostTitle">上游主机趋势</h2><div class="cd" id="tfHostDesc">筛选区间内访问最多的上游</div></div></div>
@@ -8357,8 +8389,8 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 <div class="sg" style="margin-bottom:18px">
   <div class="stc b"><div class="sl">当前并发</div><div class="sv" id="rtConc">-</div><div class="ss">正在处理的请求</div></div>
   <div class="stc g"><div class="sl">每秒请求</div><div class="sv" id="rtRps">-</div><div class="ss">最近 1 秒</div></div>
-  <div class="stc o"><div class="sl">↓ 接收</div><div class="sv" id="rtRx">-</div><div class="ss">转发速率</div></div>
-  <div class="stc r"><div class="sl">↑ 发送</div><div class="sv" id="rtTx">-</div><div class="ss">转发速率</div></div>
+  <div class="stc" style="box-shadow: inset 4px 0 0 #f59e0b"><div class="sl" style="color:#f59e0b">↓ 下行</div><div class="sv" id="rtRx">-</div><div class="ss">从上游接收的速率</div></div>
+  <div class="stc" style="box-shadow: inset 4px 0 0 #8b5cf6"><div class="sl" style="color:#8b5cf6">↑ 上行</div><div class="sv" id="rtTx">-</div><div class="ss">发送给用户的速率</div></div>
 </div>
 <div class="card">
 <div class="ch"><div><h2 class="ct">各 IP 实时网速</h2><div class="cd">最近 1 秒内有流量的 IP（按总速率排序，最多 20 个）</div></div></div>
@@ -8922,7 +8954,6 @@ function updateOvStats() {
     bytes += d.bytes || 0;
     bTotal += (d.blocked != null) ? d.blocked : ((d.blocked_cn||0)+(d.blocked_whitelist||0));
   });
-
   const days = filtered.length || 1;
   document.getElementById('ovReq').textContent = reqs.toLocaleString();
   document.getElementById('ovBytes').textContent = fmtBytes(bytes);
@@ -9055,21 +9086,34 @@ function renderSysInfo(sys, uptime){
 function renderOvCharts(){
   if(typeof Chart==='undefined') return;
   const v=ovChartSeries();
+  const ups = Array.isArray(v.ups) ? v.ups : [];
+  const downs = Array.isArray(v.downs) ? v.downs : [];
 
   const cvReq=document.getElementById('miniTrendChart');
   if(cvReq && v.labels.length){
     const cfg={type:'line',data:{labels:v.labels.map(l=>fmtAxisLabel(l,v.gran)),datasets:[
-      {label:'请求',data:v.reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',borderWidth:2,fill:true,tension:0.35,pointRadius:v.gran==='hour'?0:3}
-    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(v.labels,v.gran)}}},scales:{x:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:chartTickLimit(v.labels.length,v.gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
+      {label:'请求数',data:v.reqs,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',borderWidth:2,fill:true,tension:0.4,pointRadius:v.gran==='hour'?0:3,pointHoverRadius:6}
+    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(v.labels,v.gran),label:c=>'请求数：'+Number(c.parsed.y||0).toLocaleString()}}},scales:{x:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:chartTickLimit(v.labels.length,v.gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
     miniTrendChart=upsertChart(miniTrendChart,cvReq,cfg);
   }
 
   const cvByte=document.getElementById('miniByteChart');
   if(cvByte && v.labels.length){
-    const tot=v.ups.map((u,i)=>(u||0)+(v.downs[i]||0));
+    const tot=v.labels.map((_,i)=>((ups[i])||0)+((downs[i])||0));
     const cfgByte={type:'line',data:{labels:v.labels.map(l=>fmtAxisLabel(l,v.gran)),datasets:[
-      {label:'流量',data:tot,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.12)',borderWidth:2,fill:true,tension:0.4,pointRadius:v.gran==='hour'?0:3,pointHoverRadius:5}
-    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(v.labels,v.gran),label:c=>'流量：'+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:chartTickLimit(v.labels.length,v.gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
+      {label:'总流量',data:tot,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.15)',borderWidth:2,fill:true,tension:0.4,pointRadius:v.gran==='hour'?0:3,pointHoverRadius:6}
+    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:false,plugins:{legend:{display:false},tooltip:{callbacks:{
+      title:tooltipTitle(v.labels,v.gran),
+      label:c=>{
+        const i=c.dataIndex;
+        const u=ups[i]||0, d=downs[i]||0;
+        return [
+          '总吞吐：'+fmtBytes(c.parsed.y),
+          '↓ 下行：'+fmtBytes(d),
+          '↑ 上行：'+fmtBytes(u)
+        ];
+      }
+    }}},scales:{x:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:chartTickLimit(v.labels.length,v.gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
     miniByteChart=upsertChart(miniByteChart,cvByte,cfgByte);
   }
 }
@@ -9292,7 +9336,9 @@ function renderReqChart(labels,data,gran){
   gran=gran||'day';
   const labs=labels.map(l=>fmtAxisLabel(l,gran));
   const dense=labels.length>40;
-  const cfg={type:'line',data:{labels:labs,datasets:[{label:'请求数',data,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'请求数：'+Number(c.parsed.y||0).toLocaleString()}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
+  const cfg={type:'line',data:{labels:labs,datasets:[
+    {label:'请求数',data,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.15)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:6}
+  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'请求数：'+Number(c.parsed.y||0).toLocaleString()}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}}}}};
   reqChart=upsertChart(reqChart,cv,cfg);
 }
 function renderByteChart(labels,ups,downs,gran){
@@ -9302,8 +9348,19 @@ function renderByteChart(labels,ups,downs,gran){
   const dense=labels.length>40;
   const tot=(labels||[]).map((_,i)=>((ups&&ups[i])||0)+((downs&&downs[i])||0));
   const cfg={type:'line',data:{labels:labs,datasets:[
-    {label:'流量',data:tot,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.13)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:5}
-  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{title:tooltipTitle(labels,gran),label:c=>'流量：'+fmtBytes(c.parsed.y)}}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
+    {label:'总流量',data:tot,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,0.15)',borderWidth:2,fill:true,tension:0.4,pointRadius:dense||gran==='hour'?0:(labels.length>20?2:3),pointHoverRadius:6}
+  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},animation:dense?false:{duration:400},plugins:{legend:{display:false},tooltip:{callbacks:{
+    title:tooltipTitle(labels,gran),
+    label:c=>{
+      const i=c.dataIndex;
+      const u=(ups&&ups[i])||0, d=(downs&&downs[i])||0;
+      return [
+        '总吞吐：'+fmtBytes(c.parsed.y),
+        '↓ 下行：'+fmtBytes(d),
+        '↑ 上行：'+fmtBytes(u)
+      ];
+    }
+  }}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
 function renderHostChart(hostTop){
