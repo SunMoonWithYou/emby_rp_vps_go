@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
+# Emby 路径反代一键安装 / 管理脚本
+# 功能：编译并安装 Go 反代程序、注册 systemd 服务、提供交互菜单
+# 用法：sudo bash install.sh          # 进入菜单
+#       sudo bash install.sh install  # 直接安装
+#       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="3.4.1"
+APP_VERSION="3.5.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -46,7 +51,9 @@ require_systemd() {
 usage() {
   cat <<EOF
 Emby 路径反代 v${APP_VERSION} 一键安装
-  sudo $0 [menu|install|update|uninstall|status|start|stop|restart]
+  sudo $0          # 打开安装管理菜单（推荐）
+  sudo $0 menu    # 同上
+  sudo $0 [install|update|uninstall|status|start|stop|restart]
 EOF
 }
 
@@ -518,6 +525,8 @@ type errPageCtx struct {
 	Tech  string   // 技术详情（主要用于 5xx）
 }
 
+// serveError 生成并返回统一风格的 HTML 错误页。
+// 包含请求编号、拦截原因、排查建议；同时写一条带编号的日志方便定位。
 func serveError(w http.ResponseWriter, r *http.Request, status int, title, message string, ctx ...errPageCtx) {
 	var c errPageCtx
 	if len(ctx) > 0 {
@@ -646,6 +655,8 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	return u, nil
 }
 
+// Config 是网关运行时配置，序列化后存入 BoltDB 的 config 桶。
+// 后台保存时整份覆盖；端口变更会触发热切换监听。
 type Config struct {
 	Port        int      `json:"port"`
 	ChinaOnly   bool     `json:"china_only"`
@@ -778,6 +789,8 @@ func pageParams(r *http.Request, defLimit int) (int, int) {
 	return limit, offset
 }
 
+// isBannedIP 判断来源 IP 是否命中黑名单（精确 IP 或 CIDR）。
+// 命中后请求在判定链早期被拒绝，不进入反代。
 func isBannedIP(ipStr string, clientIP net.IP) bool {
 	a := currentACL()
 	if _, ok := a.exactBan[ipStr]; ok {
@@ -817,6 +830,8 @@ func uaClassOfEx(ua string) string {
 	return cls
 }
 
+// uaAllowed 检查 User-Agent 是否命中白名单关键字。
+// 白名单为空时全部放行；非空时必须包含任一关键字才放行。
 func uaAllowed(ua string) bool {
 	a := currentACL()
 	if len(a.uaNeedles) == 0 {
@@ -833,6 +848,8 @@ func uaAllowed(ua string) bool {
 
 func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPort }
 
+// startListen 在指定端口启动（或热切换）HTTP 监听。
+// 成功后关闭旧 Listener；失败时由调用方负责回滚配置。
 func startListen(srv *http.Server, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -854,6 +871,8 @@ func startListen(srv *http.Server, port int) error {
 	return nil
 }
 
+// loadConfig 从 BoltDB 读取配置到内存，并重建 ACL 缓存。
+// 首次启动或数据库为空时使用零值配置。
 func loadConfig() {
 	c := &Config{}
 	if db != nil {
@@ -871,6 +890,7 @@ func loadConfig() {
 	rebuildACL(c)
 }
 
+// saveConfig 将配置整份写入 BoltDB。后台保存、导入配置时调用。
 func saveConfig(c *Config) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -916,6 +936,8 @@ func rootDomain(hostport string) string {
 	return strings.Join(parts[n-2:], ".")
 }
 
+// whitelistMatch 判断上游目标域名是否在白名单中。
+// 支持精确匹配和 *.example.com 通配；空列表表示不限制。
 func whitelistMatch(list []string, targetHost string) bool {
 	if len(list) == 0 {
 		return true
@@ -3478,6 +3500,8 @@ func rebuildAggregatesFromDaily() {
 	pruneTopN(stats.IPDownBytes, 1000)
 }
 
+// loadStats 启动时从 BoltDB 恢复统计、拦截记录和操作记录到内存。
+// 兼容旧版单桶存储，必要时做一次迁移。
 func loadStats() {
 	stats = emptyStats()
 	if db == nil {
@@ -3522,6 +3546,14 @@ func loadStats() {
 				var bl []BlockEvent
 				if json.Unmarshal(data, &bl) == nil {
 					stats.Blocks = bl
+				}
+			}
+		}
+		if b := tx.Bucket([]byte("stats_audit")); b != nil {
+			if data := b.Get([]byte("data")); data != nil {
+				var au []AuditEvent
+				if json.Unmarshal(data, &au) == nil {
+					stats.Audit = au
 				}
 			}
 		}
@@ -3597,6 +3629,7 @@ func loadStats() {
 type statsSnapshot struct {
 	meta       []byte
 	blocks     []byte
+	audit      []byte
 	dailyItems []struct {
 		key  string
 		data []byte
@@ -3604,6 +3637,8 @@ type statsSnapshot struct {
 	dailyKeys map[string]struct{}
 }
 
+// marshalStatsLocked 在已持有 statsMu 的前提下，把内存统计序列化为可落盘快照。
+// 包含元数据、拦截记录、操作记录、按日统计。调用方负责加锁。
 func marshalStatsLocked() *statsSnapshot {
 	meta := statsMetaDisk{
 		SchemaVersion:    stats.SchemaVersion,
@@ -3624,7 +3659,8 @@ func marshalStatsLocked() *statsSnapshot {
 	}
 	metaBytes, _ := json.Marshal(meta)
 	blockBytes, _ := json.Marshal(stats.Blocks)
-	snap := &statsSnapshot{meta: metaBytes, blocks: blockBytes, dailyKeys: map[string]struct{}{}}
+	auditBytes, _ := json.Marshal(stats.Audit)
+	snap := &statsSnapshot{meta: metaBytes, blocks: blockBytes, audit: auditBytes, dailyKeys: map[string]struct{}{}}
 	for date, d := range stats.Daily {
 		if d == nil {
 			continue
@@ -3642,6 +3678,8 @@ func marshalStatsLocked() *statsSnapshot {
 	return snap
 }
 
+// persistStats 将统计快照写入 BoltDB（stats_meta / stats_daily / stats_blocks / stats_audit）。
+// 由定时任务和进程退出时调用，保证重启后数据可恢复。
 func persistStats(snap *statsSnapshot) {
 	if db == nil || snap == nil {
 		return
@@ -3671,7 +3709,14 @@ func persistStats(snap *statsSnapshot) {
 		if err != nil {
 			return err
 		}
-		return bb.Put([]byte("data"), snap.blocks)
+		if err := bb.Put([]byte("data"), snap.blocks); err != nil {
+			return err
+		}
+		ab, err := tx.CreateBucketIfNotExists([]byte("stats_audit"))
+		if err != nil {
+			return err
+		}
+		return ab.Put([]byte("data"), snap.audit)
 	})
 }
 
@@ -4107,6 +4152,75 @@ func isSelfOrLocalIP(ip, country string) bool {
 	return false
 }
 
+// 拦截频率限制：同一 IP 短时间内被拦太多次就直接返回极简 429
+// 不再记详细记录、不再渲染完整 HTML 错误页，降低持续重试带来的开销
+var blockRateMu sync.Mutex
+var blockRates = make(map[string]*blockRateEntry)
+
+type blockRateEntry struct {
+	count int
+	start time.Time
+}
+
+const (
+	blockRateWindow = 10 * time.Second
+	blockRateMax    = 12 // 10 秒内超过 12 次拦截就限速
+)
+
+// blockedRateLimited 判断该 IP 在短时间窗口内被拦截次数是否超限。
+// 超限返回 true，调用方应直接 drop，不再记详细记录、不再渲染完整错误页。
+func blockedRateLimited(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	blockRateMu.Lock()
+	defer blockRateMu.Unlock()
+	now := time.Now()
+	e, ok := blockRates[ip]
+	if !ok || now.Sub(e.start) > blockRateWindow {
+		blockRates[ip] = &blockRateEntry{count: 1, start: now}
+		// 简单清理，避免 map 无限增长
+		if len(blockRates) > 3000 {
+			for k, v := range blockRates {
+				if now.Sub(v.start) > blockRateWindow*3 {
+					delete(blockRates, k)
+				}
+			}
+		}
+		return false
+	}
+	e.count++
+	return e.count > blockRateMax
+}
+
+// dropOrMinimal429 限速后优先直接断开连接（不写响应体），失败时回退极简 429
+// dropOrMinimal429 在拦截频率超限时调用。
+// 优先 Hijack 后直接关闭连接（不写响应），失败时回退极简 429。
+func dropOrMinimal429(w http.ResponseWriter) {
+	if h, ok := w.(http.Hijacker); ok {
+		if conn, _, err := h.Hijack(); err == nil {
+			_ = conn.Close()
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Retry-After", "10")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write([]byte("429 too many requests\n"))
+}
+
+func truncStr(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// recordBlocked 记录一次拦截事件到内存统计，并计入对应原因计数。
+// 本机/本地 IP 不记录；Path/UA/Host 会被截断以控制体积。
+// 数据随 stats 定时落盘，重启不丢失。
 func recordBlocked(ip, country, path, reason, ua, host string) {
 	if isSelfOrLocalIP(ip, country) {
 		return
@@ -4133,7 +4247,7 @@ func recordBlocked(ip, country, path, reason, ua, host string) {
 	if country == "" {
 		country = "??"
 	}
-	ev := BlockEvent{Time: beijingRFC3339(time.Now()), IP: ip, Country: country, Host: host, Path: path, Reason: reason, ReasonText: reasonText, UA: ua}
+	ev := BlockEvent{Time: beijingRFC3339(time.Now()), IP: ip, Country: country, Host: truncStr(host, 120), Path: truncStr(path, 160), Reason: reason, ReasonText: reasonText, UA: truncStr(ua, 160)}
 	stats.Blocks = append(stats.Blocks, ev)
 	if len(stats.Blocks) > maxBlockEvents {
 		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
@@ -4736,6 +4850,8 @@ func saveAdminPassHash(hash string) error {
 	})
 }
 
+// recordAudit 追加一条后台操作记录（登录、改密、保存配置、拉黑等）。
+// 仅保留最近 maxAuditEvents 条；随 stats 持久化到 stats_audit 桶。
 func recordAudit(ip, action, detail string) {
 	statsMu.Lock()
 	defer statsMu.Unlock()
@@ -4897,6 +5013,8 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	}
 }
 
+// buildProxy 构造反向代理。请求经判定链放行后，由它转发到路径中指定的上游。
+// 支持 http/https、查询参数、WebSocket；会统计上下行流量。
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport: tr, FlushInterval: 0, BufferPool: proxyBufPool,
@@ -5198,6 +5316,8 @@ func activeSessionCount() int {
 	return n
 }
 
+// adminHandler 注册管理后台全部路由（登录、配置、统计、拦截记录、操作记录、上报等）。
+// 除登录相关接口外，均需通过 requireAuth 校验会话。
 func adminHandler() http.HandlerFunc {
 	mux := http.NewServeMux()
 
@@ -6204,6 +6324,8 @@ func startGeoDBUpdater() {
 	}()
 }
 
+// runServer 是程序主入口：打开数据库、加载配置与统计、启动后台任务、监听端口。
+// 收到 SIGINT/SIGTERM 时关闭服务并做最后一次统计落盘。
 func runServer(port int, adminUser, adminPass, dbFile string) {
 	proxyTr.v.Store(newTransport())
 	var err error
@@ -6323,6 +6445,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		// 判定链 ② IP 黑名单
 		clientIP := net.ParseIP(ip)
 		if isBannedIP(ip, clientIP) {
+			if blockedRateLimited(ip) {
+				dropOrMinimal429(w)
+				return
+			}
 			recordBlocked(ip, country, r.URL.RequestURI(), "ban", r.UserAgent(), r.Host)
 			serveError(w, r, http.StatusForbidden, "来源 IP 已被拉黑",
 				"您的来源 IP 命中了 IP 黑名单，请求在判定链第 ② 步被拒绝，未进入反代流程。",
@@ -6331,6 +6457,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		// 判定链 ③ UA 白名单
 		if !uaAllowed(r.UserAgent()) {
+			if blockedRateLimited(ip) {
+				dropOrMinimal429(w)
+				return
+			}
 			recordBlocked(ip, country, r.URL.RequestURI(), "ua", r.UserAgent(), r.Host)
 			serveError(w, r, http.StatusForbidden, "客户端不被允许",
 				"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求在判定链第 ③ 步被拒绝。",
@@ -6339,6 +6469,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		// 判定链 ④ 地区限制
 		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
+			if blockedRateLimited(ip) {
+				dropOrMinimal429(w)
+				return
+			}
 			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent(), r.Host)
 			serveError(w, r, http.StatusForbidden, "地区限制",
 				"当前来源 IP 的归属地不在允许范围内，请求在判定链第 ④ 步被拒绝。",
@@ -6353,6 +6487,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 		if !whitelistMatch(c.Whitelist, target.Host) {
+			if blockedRateLimited(ip) {
+				dropOrMinimal429(w)
+				return
+			}
 			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent(), r.Host)
 			serveError(w, r, http.StatusForbidden, "目标域名未授权",
 				"请求路径中的上游域名不在「上游域名白名单」内，请求在判定链第 ⑤ 步被拒绝，未向上游转发任何数据。",
@@ -6405,12 +6543,36 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			serveSpeedTest(w, r)
 			return
 		}
+		// ===== 访问判定链 =====
+		// ① 黑名单 IP（本处提前短路）
+		// ② 访问域名守卫（Host）
+		// ③ UA 白名单
+		// ④ 地区限制（ChinaOnly）
+		// ⑤ 上游域名白名单
+		// 任一环节拒绝即返回，不进入反代。高频拒绝会触发限速直接断连。
+		// 提前短路：已知黑名单 IP 直接拒绝，少做后续 Host / UA 等判断
+		ipEarly := getClientIP(r)
+		if isBannedIP(ipEarly, net.ParseIP(ipEarly)) {
+			if blockedRateLimited(ipEarly) {
+				dropOrMinimal429(w)
+				return
+			}
+			recordBlocked(ipEarly, countryOf(ipEarly), r.URL.RequestURI(), "ban", r.UserAgent(), r.Host)
+			serveError(w, r, http.StatusForbidden, "来源 IP 已被拉黑",
+				"您的来源 IP 命中了 IP 黑名单，请求在判定链早期被拒绝，未进入反代流程。",
+				errPageCtx{Code: "ban", Label: "IP 在黑名单中"})
+			return
+		}
 		// 判定链 ① 访问域名白名单：/health（监控）、/admin/（后台）、/speed/（测速链接）
 		// 已在上面放行，其余请求（首页、favicon、所有代理转发路径）都必须用允许的域名访问。
 		// 放在这里而不是 proxyHandler 内部，能保证通过 IP 打开时连首页都不暴露。
 		// 顺序与 ruleChainOrder 一致，后续 ②③④⑤ 在 proxyHandler 内依次执行。
 		if allowed, reason := accessHostAllowed(currentCfg(), r); !allowed {
 			ip := getClientIP(r)
+			if blockedRateLimited(ip) {
+				dropOrMinimal429(w)
+				return
+			}
 			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), reason, r.UserAgent(), r.Host)
 			title, label, msg := "禁止 IP 直连", "IP / localhost 直连被拒绝", "您正在使用服务器 IP、localhost 或单标签主机名访问，本服务已禁止这种访问方式。"
 			if reason == "host_deny" {
@@ -6438,6 +6600,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	_ = srv.Close()
 }
 
+// main 解析命令行参数。支持直接运行，或通过 "run" 子命令由 systemd 拉起。
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "run" {
@@ -9070,7 +9233,7 @@ function renderSysInfo(sys, uptime){
     kv('监听端口', sw.port!=null ? (':'+sw.port) : '—'),
     kv('内存占用', fmtBytes(sw.mem_heap||0)),
     kv('在线会话', (sw.logins!=null? sw.logins : '—') + ' 个'),
-    kv('统计丢弃', dropped>0 ? (Number(dropped).toLocaleString()+' 条') : '0 条', dropped>0?'var(--w)':''),
+    kv('统计丢弃', dropped>0 ? (Number(dropped).toLocaleString()+' 条 ⚠') : '0 条', dropped>0?'var(--w)':''),
   ];
   const diskPct = sw.disk_total ? Math.max(0, Math.round(sw.disk_free/sw.disk_total*100)) : 0;
   const env=[
@@ -10412,9 +10575,24 @@ local_ip() {
   printf '%s' "$ip"
 }
 port_listen() { (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
+# installed_port 返回当前应显示的监听端口。
+# 优先读正在运行进程的实际监听端口（后台改端口后 unit 不会同步），
+# 其次读 unit 文件中的 -port，最后回退默认端口。
 installed_port() {
   local p=""
-  if [[ -f "$DB_FILE" ]]; then p="$(sed -n 's/.*-port \([0-9]\{1,5\}\).*/\1/p' "$UNIT_FILE" 2>/dev/null | head -1)"; fi
+  # 优先读正在运行进程的实际监听端口（后台改端口后 unit 文件不会同步更新）
+  if command -v ss >/dev/null 2>&1; then
+    p="$(ss -lntup 2>/dev/null | awk -v name="$SERVICE_NAME" '
+      $0 ~ name && $1 == "tcp" {
+        split($5, a, ":");
+        port=a[length(a)];
+        if (port ~ /^[0-9]+$/) { print port; exit }
+      }')"
+  fi
+  # 回退：读 unit 文件里的 -port
+  if [[ -z "$p" && -f "$UNIT_FILE" ]]; then
+    p="$(sed -n 's/.*-port \([0-9]\{1,5\}\).*/\1/p' "$UNIT_FILE" 2>/dev/null | head -1)"
+  fi
   if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then printf '%s' "$p"; else printf '%s' "$DEFAULT_PORT"; fi
 }
 effective_port() { installed_port; }
@@ -10449,6 +10627,7 @@ EOF
   fi
 }
 
+# cmd_install 执行完整安装：检查环境、编译、写 unit、启动服务。
 cmd_install() {
   parse_install_args "$@"
   require_root install
@@ -10607,7 +10786,7 @@ menu_banner() {
   local ip ep svc bt W
   ip="$(local_ip)"; ep="$(effective_port)"; svc="$(svc_state_colored)"; bt="$(build_time)"; W="$(term_cols)"
   printf '\n%s%s%s\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
-  printf '  %s⚡ Emby 路径反代 v%s%s  %s·%s  %s管理菜单%s\n' "$C_B" "$APP_VERSION" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
+  printf '  %s⚡ Emby 路径反代 v%s%s  %s·%s  %s安装管理菜单%s\n' "$C_B" "$APP_VERSION" "$C_0" "$C_D" "$C_0" "$C_D" "$C_0"
   printf '%s%s%s\n\n' "$C_M" "$(hline "$W" "$BOX_H1")" "$C_0"
   printf '   %s服务%s   %s\n' "$C_D" "$C_0" "$svc"
   printf '   %s端口%s   %s:%s%s\n' "$C_D" "$C_0" "$C_C" "$ep" "$C_0"
@@ -10670,9 +10849,11 @@ menu_install_flow() {
   if ( cmd_install "${args[@]}" ); then return 0; fi
   warn "安装失败"; return 1
 }
+# cmd_menu 交互式安装管理菜单（安装 / 更新 / 卸载 / 状态 / 日志）。
+# 需要终端环境；非交互场景请直接使用子命令。
 cmd_menu() {
   if [[ $EUID -ne 0 ]]; then die "菜单需要 root 权限: sudo $0"; fi
-  if [[ ! -t 0 ]]; then die "菜单需要交互终端；非交互请用子命令"; fi
+  if [[ ! -t 0 ]]; then die "菜单需要交互终端。请先下载脚本再运行以使用菜单: curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/install.sh -o install.sh && sudo bash install.sh"; fi
   while true; do
     if [[ -t 1 ]]; then clear 2>/dev/null || true; fi
     menu_banner
