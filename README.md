@@ -84,7 +84,7 @@
 使用项目提供的一键安装脚本。
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/install.sh | bash -s install
 ```
 
 首次运行会进入安装菜单，可以选择：
