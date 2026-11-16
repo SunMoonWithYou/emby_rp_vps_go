@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="3.7.0"
+APP_VERSION="3.8.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -16,9 +16,14 @@ DB_FILE="${CONFIG_DIR}/emby.db"
 BUILD_HASH_FILE="${CONFIG_DIR}/build.sha256"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GO_MIN_MAJOR=1
-GO_MIN_MINOR=20
-GO_FALLBACK_VERSION="1.23.4"
-IPLOC_VERSION="latest"
+GO_MIN_MINOR=23
+GO_FALLBACK_VERSION="1.27.4"
+# 固定直接依赖版本，避免同一脚本在不同日期解析出不同依赖。
+IPLOC_VERSION="v1.0.20260701"
+BOLT_VERSION="v1.4.3"
+SYNC_VERSION="v0.10.0"
+CRYPTO_VERSION="v0.31.0"
+WEBSOCKET_VERSION="v1.5.3"
 
 BUILD_TMPDIR=""
 STAGE_TMPDIR=""
@@ -121,20 +126,41 @@ backup_runtime_data() {
 }
 
 health_check() {
-  local port="$1" body=""
+  local port="$1" body="" status="" line="" fd=""
   port_listen "$port" || return 1
+
   if command -v curl >/dev/null 2>&1; then
-    body="$(curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${port}/health" 2>/dev/null)" || return 1
-    [[ "$body" == *'"ok":true'* ]]
+    body="$(curl -fsS --connect-timeout 2 --max-time 4 \
+      "http://127.0.0.1:${port}/health" 2>/dev/null)" || return 1
+    [[ "$body" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]
     return
   fi
   if command -v wget >/dev/null 2>&1; then
-    body="$(wget -qO- --timeout=4 "http://127.0.0.1:${port}/health" 2>/dev/null)" || return 1
-    [[ "$body" == *'"ok":true'* ]]
+    body="$(wget -qO- --timeout=4 \
+      "http://127.0.0.1:${port}/health" 2>/dev/null)" || return 1
+    [[ "$body" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]
     return
   fi
-  # 无 curl/wget 时退化为 TCP 监听检查。
-  return 0
+
+  # 没有 curl/wget 时仍执行真实 HTTP 检查，不允许退化为仅 TCP 检查。
+  if ! exec {fd}<>"/dev/tcp/127.0.0.1/${port}"; then return 1; fi
+  printf 'GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&"$fd" || {
+    exec {fd}>&-; return 1;
+  }
+  IFS= read -r -t 4 status <&"$fd" || { exec {fd}>&-; return 1; }
+  status="${status%$'\r'}"
+  [[ "$status" =~ ^HTTP/1\.[01][[:space:]]+200([[:space:]]|$) ]] || {
+    exec {fd}>&-; return 1;
+  }
+  while IFS= read -r -t 4 line <&"$fd"; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && break
+  done
+  # -N 可读取没有换行符结尾的 JSON 响应体。
+  IFS= read -r -N 256 -t 4 body <&"$fd" || true
+  exec {fd}>&-
+  body="${body%$'\r'}"
+  [[ "$body" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]
 }
 go_version_ok() {
   command -v go >/dev/null 2>&1 || return 1
@@ -170,15 +196,56 @@ install_go_from_pkg() {
   hash -r 2>/dev/null || true
 }
 install_go_official() {
-  local arch url tmp
+  local arch url tmp stage backup actual expected
   arch="$(detect_go_arch)" || { warn "未知架构 $(uname -m)"; return 1; }
   url="https://go.dev/dl/go${GO_FALLBACK_VERSION}.linux-${arch}.tar.gz"
-  tmp="$(mktemp -d)"
+  # SHA256 来自 Go 官方下载页；版本固定后，校验值也随脚本固定。
+  case "$arch" in
+    amd64) expected="7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840" ;;
+    arm64) expected="3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92" ;;
+    armv6l) expected="e50964c41c6e187375387939e2f380de7250eba44e2259dfeb75c540d9d585c3" ;;
+    386) expected="6ecb45737d2315acb0dbbc97ea8e13e7c19d4c796abe8d68907c40bce6f50bf7" ;;
+    *) warn "当前架构没有内置 Go SHA256: $arch"; return 1 ;;
+  esac
+  tmp="$(mktemp -d)" || return 1
+  stage="$(mktemp -d /usr/local/go.stage.XXXXXX)" || { rm -rf "$tmp"; return 1; }
+  backup="${stage}.rollback"
   info "下载官方 Go: $url"
-  if command -v curl >/dev/null 2>&1; then curl -fsSL "$url" -o "$tmp/go.tgz"
-  elif command -v wget >/dev/null 2>&1; then wget -q "$url" -O "$tmp/go.tgz"
-  else rm -rf "$tmp"; return 1; fi
-  rm -rf /usr/local/go && tar -C /usr/local -xzf "$tmp/go.tgz" && rm -rf "$tmp"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 --connect-timeout 10 "$url" -o "$tmp/go.tgz" || { rm -rf "$tmp"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --tries=3 "$url" -O "$tmp/go.tgz" || { rm -rf "$tmp"; return 1; }
+  else
+    rm -rf "$tmp"; return 1
+  fi
+
+  actual="$(sha256sum "$tmp/go.tgz" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || { warn "Go 安装包 SHA256 校验失败"; rm -rf "$tmp"; return 1; }
+  tar -tzf "$tmp/go.tgz" >/dev/null 2>&1 || { warn "Go 安装包损坏，无法解压"; rm -rf "$tmp"; return 1; }
+
+  tar -C "$stage" --strip-components=1 -xzf "$tmp/go.tgz" || { rm -rf "$tmp" "$stage"; return 1; }
+  [[ -x "$stage/bin/go" ]] || { warn "Go 安装包中缺少可执行文件"; rm -rf "$tmp" "$stage"; return 1; }
+  "$stage/bin/go" version | grep -Fq "go${GO_FALLBACK_VERSION}" || { warn "解压后的 Go 版本与目标版本不一致"; rm -rf "$tmp" "$stage"; return 1; }
+
+  # 先备份旧版本，只有新版本就位并验证后才清理旧版本。
+  if [[ -e /usr/local/go ]]; then
+    mv /usr/local/go "$backup" || { rm -rf "$tmp" "$stage"; warn "无法备份现有 /usr/local/go"; return 1; }
+  fi
+  if ! mv "$stage" /usr/local/go; then
+    [[ -e "$backup" ]] && mv "$backup" /usr/local/go || true
+    rm -rf "$tmp" "$stage"
+    warn "替换 Go 失败，已尝试恢复旧版本"
+    return 1
+  fi
+  if ! /usr/local/go/bin/go version | grep -Fq "go${GO_FALLBACK_VERSION}"; then
+    rm -rf /usr/local/go
+    [[ -e "$backup" ]] && mv "$backup" /usr/local/go || true
+    rm -rf "$tmp"
+    warn "新 Go 启动验证失败，已尝试恢复旧版本"
+    return 1
+  fi
+  rm -rf "$backup" "$tmp"
   export PATH="/usr/local/go/bin:$PATH"
   hash -r 2>/dev/null || true
 }
@@ -11220,12 +11287,29 @@ ADMIN_HTML
     "$dir/main.go"
 }
 
+write_go_mod() {
+  local dir="$1"
+  cat > "$dir/go.mod" <<EOF
+module emby-proxy
+
+go 1.23
+
+require (
+    github.com/gorilla/websocket ${WEBSOCKET_VERSION}
+    github.com/phuslu/iploc ${IPLOC_VERSION}
+    go.etcd.io/bbolt ${BOLT_VERSION}
+    golang.org/x/crypto ${CRYPTO_VERSION}
+    golang.org/x/sync ${SYNC_VERSION}
+)
+EOF
+}
 compute_source_hash() {
   command -v sha256sum >/dev/null 2>&1 || die "缺少 sha256sum"
   local d h
-  d="$(mktemp -d)"
+  d="$(mktemp -d)" || die "无法创建源码指纹临时目录"
   write_go_source "$d"
-  h="$(cd "$d" && sha256sum main.go features.go admin.html chart.umd.min.js | sha256sum | awk '{print $1}')"
+  write_go_mod "$d"
+  h="$(cd "$d" && sha256sum main.go features.go admin.html chart.umd.min.js go.mod | sha256sum | awk '{print $1}')"
   rm -rf "$d"
   printf '%s' "$h"
 }
@@ -11277,17 +11361,13 @@ build_binary() {
   free_kb="$(df -Pk "$BUILD_TMPDIR" 2>/dev/null | awk 'NR==2 {print $4}')"
   [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb >= 122880 )) || die "临时目录可用空间不足 120 MiB，无法可靠编译"
   write_go_source "$BUILD_TMPDIR"
-  info "初始化模块并解析依赖..."
+  write_go_mod "$BUILD_TMPDIR"
+  info "初始化模块并解析固定版本依赖..."
   (
     cd "$BUILD_TMPDIR"
     export GOTOOLCHAIN=auto GOFLAGS=-mod=mod
-    go mod init emby-proxy >/dev/null 2>&1 || true
-    go get "github.com/phuslu/iploc@${IPLOC_VERSION}" >/dev/null 2>&1 || true
-    go get "go.etcd.io/bbolt@latest" >/dev/null 2>&1 || true
-    go get "golang.org/x/sync/singleflight@v0.10.0" >/dev/null 2>&1 || true
-    go get "golang.org/x/crypto/bcrypt@v0.31.0" >/dev/null 2>&1 || true
-    go get "github.com/gorilla/websocket@v1.5.3" >/dev/null 2>&1 || true
-    go mod tidy >/dev/null 2>&1 || die "依赖解析失败（可设 GOPROXY=https://goproxy.cn,direct 后重试）"
+    go mod tidy || die "依赖解析失败（可设 GOPROXY=https://goproxy.cn,direct 后重试）"
+    go mod verify || die "Go 依赖完整性校验失败"
   )
   info "编译中..."
   ( cd "$BUILD_TMPDIR" && CGO_ENABLED=0 GOTOOLCHAIN=auto GOFLAGS=-mod=mod go build -trimpath -ldflags "-s -w" -o "$out" . ) || die "go build 失败"
@@ -11366,6 +11446,7 @@ cmd_install() {
     if [[ -z "$ADMIN_PASS" ]]; then prompt_pass || die "已取消"; ADMIN_PASS="$PROMPT_RESULT"; PASS_GIVEN=1; fi
   fi
   [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "端口无效: $PORT"
+  [[ "$BIN_PATH" == /* && "$BIN_PATH" != *[[:space:]]* && "$BIN_PATH" != *%* ]] || die "二进制路径必须是绝对路径，且不能包含空白字符或百分号: $BIN_PATH"
   if [[ $BINARY_ONLY -eq 1 ]]; then info "更新模式：只替换程序"; fi
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
   if [[ ! -f "$DB_FILE" ]]; then
@@ -11529,11 +11610,21 @@ cmd_uninstall() {
     local ans=""; read -r ans || true
     [[ "$ans" == "y" || "$ans" == "Y" ]] || { info "已取消"; return 0; }
   fi
+  local installed_bin=""
+  installed_bin="$(installed_bin_path)"
   stop_and_disable
   [[ -f "$UNIT_FILE" ]] && { rm -f "$UNIT_FILE"; info "已删除服务单元"; }
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
-  [[ -f "$DEFAULT_BIN" ]] && { rm -f "$DEFAULT_BIN"; info "已删除程序: $DEFAULT_BIN"; }
+  if [[ -n "$installed_bin" && -f "$installed_bin" ]]; then
+    rm -f -- "$installed_bin"
+    info "已删除程序: $installed_bin"
+  fi
+  # 清理历史默认路径，避免早期版本迁移后留下旧二进制。
+  if [[ "$installed_bin" != "$DEFAULT_BIN" && -f "$DEFAULT_BIN" ]]; then
+    rm -f -- "$DEFAULT_BIN"
+    info "已删除旧程序: $DEFAULT_BIN"
+  fi
   if [[ $keep -eq 1 ]]; then warn "已保留配置目录: $CONFIG_DIR"
   else [[ -d "$CONFIG_DIR" ]] && { rm -rf "$CONFIG_DIR"; info "已删除配置目录"; }; fi
   rm -f "${DEFAULT_BIN}.tmp."* 2>/dev/null || true
@@ -11560,7 +11651,9 @@ term_cols() {
 hline() { local n="$1" ch="${2:-─}" s=""; (( n > 0 )) || return 0; printf -v s '%*s' "$n" ''; printf '%s' "${s// /$ch}"; }
 if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *[Uu][Tt][Ff]* ]]; then BOX_H1='━'; BOX_H2='─'; else BOX_H1='='; BOX_H2='-'; fi
 svc_state() {
-  if [[ ! -f "$UNIT_FILE" && ! -x "$BIN_PATH" && ! -x "$DEFAULT_BIN" ]]; then printf '未安装'; return; fi
+  local b=""
+  b="$(installed_bin_path)"
+  if [[ ! -f "$UNIT_FILE" && ( -z "$b" || ! -x "$b" ) ]]; then printf '未安装'; return; fi
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then printf '运行中'; else printf '已停止'; fi
 }
 svc_state_colored() {
@@ -11570,9 +11663,19 @@ svc_state_colored() {
     *)      printf '%s' "${C_D}○ 未安装${C_0}" ;;
   esac
 }
-has_binary() { [[ -x "$BIN_PATH" || -x "$DEFAULT_BIN" ]]; }
+has_binary() { local b; b="$(installed_bin_path)"; [[ -n "$b" && -x "$b" ]]; }
 has_install() { [[ -f "$UNIT_FILE" ]] && return 0; has_binary && return 0; [[ -d "$CONFIG_DIR" ]]; }
-installed_bin_path() { if [[ -x "$BIN_PATH" ]]; then printf '%s' "$BIN_PATH"; return; fi; if [[ -x "$DEFAULT_BIN" ]]; then printf '%s' "$DEFAULT_BIN"; fi; }
+installed_bin_path() {
+  local p=""
+  # 首选当前 unit 中 ExecStart 的程序路径，兼容 --bin 指定的自定义安装位置。
+  if [[ -f "$UNIT_FILE" ]]; then
+    p="$(sed -n 's/^ExecStart=//p' "$UNIT_FILE" | head -1 | awk '{print $1}')"
+    if [[ "$p" == /* && -x "$p" ]]; then printf '%s' "$p"; return 0; fi
+  fi
+  if [[ -x "$BIN_PATH" ]]; then printf '%s' "$BIN_PATH"; return 0; fi
+  if [[ -x "$DEFAULT_BIN" ]]; then printf '%s' "$DEFAULT_BIN"; return 0; fi
+  return 0
+}
 build_time() { local b; b="$(installed_bin_path)"; if [[ -n "$b" ]]; then date -r "$b" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '未知'; else printf '—'; fi; }
 menu_rule() { printf '   %s%s%s\n' "$C_D" "$(hline "$(term_cols)" "$BOX_H2")" "$C_0"; }
 menu_banner() {
