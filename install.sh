@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="3.5.2"
+APP_VERSION="3.7.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -21,6 +21,7 @@ GO_FALLBACK_VERSION="1.23.4"
 IPLOC_VERSION="latest"
 
 BUILD_TMPDIR=""
+STAGE_TMPDIR=""
 GENERATED_PASS=0
 PORT=$DEFAULT_PORT
 BIN_PATH=$DEFAULT_BIN
@@ -39,6 +40,7 @@ die()  { err "$*"; exit 1; }
 
 cleanup() {
   if [[ -n "$BUILD_TMPDIR" && -d "$BUILD_TMPDIR" ]]; then rm -rf "$BUILD_TMPDIR"; fi
+  if [[ -n "$STAGE_TMPDIR" && -d "$STAGE_TMPDIR" ]]; then rm -rf "$STAGE_TMPDIR"; fi
 }
 trap cleanup EXIT
 
@@ -86,6 +88,54 @@ parse_install_args() {
 }
 
 stop_and_disable() { systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true; }
+
+acquire_installer_lock() {
+  command -v flock >/dev/null 2>&1 || die "缺少 flock（util-linux），无法安全执行安装/更新并发保护"
+  mkdir -p /run/lock
+  exec 9>/run/lock/emby-proxy-installer.lock
+  flock -n 9 || die "检测到另一个安装/更新/卸载任务正在运行，请稍后重试"
+}
+
+backup_runtime_data() {
+  local stamp backup_dir
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="${CONFIG_DIR}/backups"
+  if ! mkdir -p "$backup_dir" || ! chmod 700 "$backup_dir"; then
+    if [[ -f "$UNIT_FILE" ]]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+    die "无法创建数据库备份目录，已尝试恢复原服务"
+  fi
+  if [[ -f "$DB_FILE" ]]; then
+    if ! cp -p "$DB_FILE" "${backup_dir}/emby.db.${stamp}"; then
+      rm -f "${backup_dir}/emby.db.${stamp}"
+      if [[ -f "$UNIT_FILE" ]]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+      die "数据库备份失败，已尝试恢复原服务并中止更新"
+    fi
+    info "已备份数据库: ${backup_dir}/emby.db.${stamp}"
+  fi
+  if [[ -f "$UNIT_FILE" ]]; then
+    cp -p "$UNIT_FILE" "${backup_dir}/service.unit.${stamp}" || warn "服务配置备份失败"
+  fi
+  # 仅保留最近 3 份数据库与服务配置备份，避免长期占满磁盘。
+  ls -1t "${backup_dir}"/emby.db.* 2>/dev/null | tail -n +4 | while IFS= read -r f; do rm -f -- "$f"; done || true
+  ls -1t "${backup_dir}"/service.unit.* 2>/dev/null | tail -n +4 | while IFS= read -r f; do rm -f -- "$f"; done || true
+}
+
+health_check() {
+  local port="$1" body=""
+  port_listen "$port" || return 1
+  if command -v curl >/dev/null 2>&1; then
+    body="$(curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${port}/health" 2>/dev/null)" || return 1
+    [[ "$body" == *'"ok":true'* ]]
+    return
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    body="$(wget -qO- --timeout=4 "http://127.0.0.1:${port}/health" 2>/dev/null)" || return 1
+    [[ "$body" == *'"ok":true'* ]]
+    return
+  fi
+  # 无 curl/wget 时退化为 TCP 监听检查。
+  return 0
+}
 go_version_ok() {
   command -v go >/dev/null 2>&1 || return 1
   local v major minor; v="$(go env GOVERSION 2>/dev/null || true)"; v="${v#go}"
@@ -199,6 +249,12 @@ var adminHTML []byte
 var chartJS []byte
 
 type targetCtxKey struct{}
+type targetResolutionCtxKey struct{}
+
+type targetResolution struct {
+	host string
+	ips  []net.IP
+}
 
 var httpPorts = map[string]bool{"80": true, "8080": true, "8000": true, "8008": true, "8081": true, "8088": true, "8888": true, "3000": true, "5000": true, "7001": true, "8090": true, "8096": true, "9000": true, "9090": true, "9200": true, "10000": true, "15672": true}
 
@@ -655,23 +711,136 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 	return u, nil
 }
 
+// isUnsafeResolvedIP 拒绝不可路由或高风险的特殊地址；RFC1918/ULA 私网地址允许，
+// 以兼容内网 Emby。显式 IP 目标可使用 loopback（例如同机 Emby），域名解析到
+// loopback 则拒绝，避免普通域名通过 DNS Rebinding 指向本机服务。
+func isUnsafeResolvedIP(ip net.IP, allowLoopback bool) bool {
+	if ip == nil {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	if ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	if ip.IsLoopback() {
+		return !allowLoopback
+	}
+	if !ip.IsGlobalUnicast() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// 共享地址空间、协议分配网段、基准测试网段及保留地址不作为域名上游。
+		for _, cidr := range []string{"100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "240.0.0.0/4"} {
+			_, network, err := net.ParseCIDR(cidr)
+			if err == nil && network.Contains(v4) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func resolveTargetIPs(ctx context.Context, target *url.URL) (*targetResolution, error) {
+	if target == nil || target.User != nil {
+		return nil, fmt.Errorf("上游地址格式不合法")
+	}
+	host := strings.TrimSuffix(strings.TrimSpace(target.Hostname()), ".")
+	if host == "" || strings.ContainsAny(host, " \t\r\n/%?#@[]") || strings.Contains(host, "%") {
+		return nil, fmt.Errorf("上游主机名不合法")
+	}
+	if p := target.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("上游端口不合法")
+		}
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return nil, fmt.Errorf("上游协议仅支持 http/https")
+	}
+
+	if literal := net.ParseIP(host); literal != nil {
+		if isUnsafeResolvedIP(literal, true) {
+			return nil, fmt.Errorf("上游 IP 属于不允许的特殊地址")
+		}
+		return &targetResolution{host: strings.ToLower(host), ips: []net.IP{append(net.IP(nil), literal...)}}, nil
+	}
+
+	allowLoopback := strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost")
+	answers, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("上游域名解析失败: %w", err)
+	}
+	if len(answers) == 0 {
+		return nil, fmt.Errorf("上游域名没有可用 IP")
+	}
+	ips := make([]net.IP, 0, len(answers))
+	seen := make(map[string]struct{}, len(answers))
+	for _, answer := range answers {
+		ip := answer.IP
+		if isUnsafeResolvedIP(ip, allowLoopback) {
+			return nil, fmt.Errorf("上游域名解析到不允许的特殊 IP")
+		}
+		key := ip.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		ips = append(ips, append(net.IP(nil), ip...))
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("上游域名没有可用 IP")
+	}
+	return &targetResolution{host: strings.ToLower(host), ips: ips}, nil
+}
+
+// dialPinned 只拨号到本次请求预先校验过的 DNS 结果，避免解析校验与实际连接之间
+// 再次查询 DNS 所产生的 rebinding 窗口。TLS 仍使用 URL 中的原始主机名校验证书。
+func dialPinned(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	resolution, ok := ctx.Value(targetResolutionCtxKey{}).(*targetResolution)
+	if !ok || resolution == nil || !strings.EqualFold(strings.TrimSuffix(host, "."), resolution.host) {
+		return nil, fmt.Errorf("缺少已校验的上游 DNS 结果")
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, ip := range resolution.ips {
+		conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可拨号的上游 IP")
+	}
+	return nil, lastErr
+}
+
 // Config 是网关运行时配置，序列化后存入 BoltDB 的 config 桶。
 // 后台保存时整份覆盖；端口变更会触发热切换监听。
 type Config struct {
-	Port        int      `json:"port"`
-	ChinaOnly   bool     `json:"china_only"`
-	Whitelist   []string `json:"whitelist"`
-	BanList     []string `json:"ban_list"`
-	AllowedUAs  []string `json:"allowed_uas"`
+	Port       int      `json:"port"`
+	ChinaOnly  bool     `json:"china_only"`
+	Whitelist  []string `json:"whitelist"`
+	BanList    []string `json:"ban_list"`
+	AllowedUAs []string `json:"allowed_uas"`
 	// 访问域名守卫：校验浏览器地址栏里的 Host，禁止用服务器 IP 直连反代。
 	// 与上面的 Whitelist（路径里允许反代到的上游域名）是两个不同维度，互不影响。
-	HostGuardOn  bool     `json:"host_guard_on"`  // 总开关，默认 false 以兼容旧配置
+	HostGuardOn  bool     `json:"host_guard_on"` // 总开关，默认 false 以兼容旧配置
 	AllowedHosts []string `json:"allowed_hosts"` // 允许访问的域名；留空则只禁 IP/localhost 直连
-	ReportURL   string   `json:"report_url"`
-	ReportToken string   `json:"report_token"`
-	ReportOn    bool     `json:"report_on"`
-	ReportNote  string   `json:"report_note"`
-	AdminAllow  []string `json:"admin_allow"`
+	ReportURL    string   `json:"report_url"`
+	ReportToken  string   `json:"report_token"`
+	ReportOn     bool     `json:"report_on"`
+	ReportNote   string   `json:"report_note"`
+	AdminAllow   []string `json:"admin_allow"`
 	// 反爬加固：三项独立开关的早筛层，位于判定链之前，默认全关以兼容旧配置。
 	HoneypotOn   bool `json:"honeypot_on"`     // 蜜罐路径：命中即断连并自动拉黑
 	ScanGuardOn  bool `json:"scan_guard_on"`   // 扫描器 UA / 空 UA：命中即断连并自动拉黑
@@ -2187,28 +2356,28 @@ func topListText(m map[string]int64, n int, asBytes bool) string {
 func renderDailyTemplate(tmpl string, p reportPayload, date string, jsonSafe bool) string {
 	total := p.UpBytes + p.DownBytes
 	repl := map[string]string{
-		"{{date}}":         date,
-		"{{period_start}}": p.PeriodStart,
-		"{{period_end}}":   p.PeriodEnd,
-		"{{node}}":         p.Node,
-		"{{note}}":         p.Note,
-		"{{version}}":      p.Version,
-		"{{requests}}":     fmt.Sprintf("%d", p.Requests),
-		"{{requests_raw}}": strconv.FormatInt(p.Requests, 10),
-		"{{up}}":           humanBytes(p.UpBytes),
-		"{{down}}":         humanBytes(p.DownBytes),
-		"{{total}}":        humanBytes(total),
-		"{{up_raw}}":       strconv.FormatInt(p.UpBytes, 10),
-		"{{down_raw}}":     strconv.FormatInt(p.DownBytes, 10),
-		"{{blocked}}":      fmt.Sprintf("%d", p.Blocked),
-		"{{blocked_cn}}":   fmt.Sprintf("%d", p.BlockedCN),
-		"{{blocked_wl}}":   fmt.Sprintf("%d", p.BlockedWL),
-		"{{blocked_ban}}":  fmt.Sprintf("%d", p.BlockedBan),
-		"{{blocked_ua}}":   fmt.Sprintf("%d", p.BlockedUA),
-		"{{ips_top}}":      topListText(p.IPs, 5, false),
-		"{{ip_bytes_top}}": topListText(p.IPBytes, 5, true),
-		"{{hosts_top}}":    topListText(p.Hosts, 5, false),
-		"{{countries_top}}": topListText(p.Countries, 8, false),
+		"{{date}}":                date,
+		"{{period_start}}":        p.PeriodStart,
+		"{{period_end}}":          p.PeriodEnd,
+		"{{node}}":                p.Node,
+		"{{note}}":                p.Note,
+		"{{version}}":             p.Version,
+		"{{requests}}":            fmt.Sprintf("%d", p.Requests),
+		"{{requests_raw}}":        strconv.FormatInt(p.Requests, 10),
+		"{{up}}":                  humanBytes(p.UpBytes),
+		"{{down}}":                humanBytes(p.DownBytes),
+		"{{total}}":               humanBytes(total),
+		"{{up_raw}}":              strconv.FormatInt(p.UpBytes, 10),
+		"{{down_raw}}":            strconv.FormatInt(p.DownBytes, 10),
+		"{{blocked}}":             fmt.Sprintf("%d", p.Blocked),
+		"{{blocked_cn}}":          fmt.Sprintf("%d", p.BlockedCN),
+		"{{blocked_wl}}":          fmt.Sprintf("%d", p.BlockedWL),
+		"{{blocked_ban}}":         fmt.Sprintf("%d", p.BlockedBan),
+		"{{blocked_ua}}":          fmt.Sprintf("%d", p.BlockedUA),
+		"{{ips_top}}":             topListText(p.IPs, 5, false),
+		"{{ip_bytes_top}}":        topListText(p.IPBytes, 5, true),
+		"{{hosts_top}}":           topListText(p.Hosts, 5, false),
+		"{{countries_top}}":       topListText(p.Countries, 8, false),
 		"{{ips_top_lines}}":       topListLines(p.IPs, 5, false),
 		"{{ip_bytes_top_lines}}":  topListLines(p.IPBytes, 5, true),
 		"{{hosts_top_lines}}":     topListLines(p.Hosts, 5, false),
@@ -2778,8 +2947,8 @@ type queuedReport struct {
 	Attempts    int    `json:"attempts"`
 	LastErr     string `json:"last_err,omitempty"`
 	Trigger     string `json:"trigger,omitempty"`
-	URL         string `json:"url,omitempty"`         // 留空使用全局 report_url
-	Token       string `json:"token,omitempty"`       // 留空使用全局 report_token
+	URL         string `json:"url,omitempty"`          // 留空使用全局 report_url
+	Token       string `json:"token,omitempty"`        // 留空使用全局 report_token
 	ContentType string `json:"content_type,omitempty"` // 留空为 application/json
 }
 
@@ -3594,11 +3763,11 @@ func loadStats() {
 		return
 	}
 	migrated := false
-	_ = db.View(func(tx *bolt.Tx) error {
+	viewErr := db.View(func(tx *bolt.Tx) error {
 		if b := tx.Bucket([]byte("stats_meta")); b != nil {
 			if data := b.Get([]byte("data")); data != nil {
 				var m statsMetaDisk
-				if json.Unmarshal(data, &m) == nil {
+				if err := json.Unmarshal(data, &m); err == nil {
 					stats.SchemaVersion = m.SchemaVersion
 					stats.TodayDate = m.TodayDate
 					stats.TodayRequests = m.TodayRequests
@@ -3614,32 +3783,42 @@ func loadStats() {
 					stats.BlockedBan = m.BlockedBan
 					stats.BlockedUA = m.BlockedUA
 					stats.LastProxyAt = m.LastProxyAt
+				} else {
+					log.Printf("[stats] 统计元数据损坏，跳过该部分: %v", err)
 				}
 			}
 		}
 		if b := tx.Bucket([]byte("stats_daily")); b != nil {
-			_ = b.ForEach(func(k, v []byte) error {
+			if err := b.ForEach(func(k, v []byte) error {
 				d := newDayStat()
-				if json.Unmarshal(v, d) == nil {
-					ensureDayMaps(d)
-					stats.Daily[string(k)] = d
+				if err := json.Unmarshal(v, d); err != nil {
+					log.Printf("[stats] 日期 %s 的统计数据损坏，已跳过: %v", string(k), err)
+					return nil
 				}
+				ensureDayMaps(d)
+				stats.Daily[string(k)] = d
 				return nil
-			})
+			}); err != nil {
+				return fmt.Errorf("读取每日统计失败: %w", err)
+			}
 		}
 		if b := tx.Bucket([]byte("stats_blocks")); b != nil {
 			if data := b.Get([]byte("data")); data != nil {
 				var bl []BlockEvent
-				if json.Unmarshal(data, &bl) == nil {
+				if err := json.Unmarshal(data, &bl); err == nil {
 					stats.Blocks = bl
+				} else {
+					log.Printf("[stats] 拦截记录损坏，已跳过: %v", err)
 				}
 			}
 		}
 		if b := tx.Bucket([]byte("stats_audit")); b != nil {
 			if data := b.Get([]byte("data")); data != nil {
 				var au []AuditEvent
-				if json.Unmarshal(data, &au) == nil {
+				if err := json.Unmarshal(data, &au); err == nil {
 					stats.Audit = au
+				} else {
+					log.Printf("[stats] 操作记录损坏，已跳过: %v", err)
 				}
 			}
 		}
@@ -3647,15 +3826,20 @@ func loadStats() {
 			if b := tx.Bucket([]byte("stats")); b != nil {
 				if data := b.Get([]byte("data")); data != nil {
 					old := emptyStats()
-					if json.Unmarshal(data, &old) == nil {
+					if err := json.Unmarshal(data, &old); err == nil {
 						stats = old
 						migrated = true
+					} else {
+						log.Printf("[stats] 旧版统计数据损坏，未执行迁移: %v", err)
 					}
 				}
 			}
 		}
 		return nil
 	})
+	if viewErr != nil {
+		log.Printf("[stats] 读取统计数据库失败: %v；已保留空统计结构供服务继续运行", viewErr)
+	}
 	if stats.CountryCounts == nil {
 		stats.CountryCounts = map[string]int64{}
 	}
@@ -3704,11 +3888,16 @@ func loadStats() {
 		statsMu.Lock()
 		snap := marshalStatsLocked()
 		statsMu.Unlock()
-		persistStats(snap)
-		_ = db.Update(func(tx *bolt.Tx) error {
-			_ = tx.DeleteBucket([]byte("stats"))
+		if err := persistStats(snap); err != nil {
+			log.Printf("[stats] 旧版统计迁移写入失败，保留原始 stats 桶以便下次恢复: %v", err)
+		} else if err := db.Update(func(tx *bolt.Tx) error {
+			if err := tx.DeleteBucket([]byte("stats")); err != nil && err != bolt.ErrBucketNotFound {
+				return err
+			}
 			return nil
-		})
+		}); err != nil {
+			log.Printf("[stats] 新统计已写入，但删除旧 stats 桶失败: %v", err)
+		}
 	}
 }
 
@@ -3721,6 +3910,7 @@ type statsSnapshot struct {
 		data []byte
 	}
 	dailyKeys map[string]struct{}
+	err       error
 }
 
 // marshalStatsLocked 在已持有 statsMu 的前提下，把内存统计序列化为可落盘快照。
@@ -3743,9 +3933,18 @@ func marshalStatsLocked() *statsSnapshot {
 		BlockedUA:        stats.BlockedUA,
 		LastProxyAt:      stats.LastProxyAt,
 	}
-	metaBytes, _ := json.Marshal(meta)
-	blockBytes, _ := json.Marshal(stats.Blocks)
-	auditBytes, _ := json.Marshal(stats.Audit)
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return &statsSnapshot{err: fmt.Errorf("序列化统计元数据失败: %w", err)}
+	}
+	blockBytes, err := json.Marshal(stats.Blocks)
+	if err != nil {
+		return &statsSnapshot{err: fmt.Errorf("序列化拦截记录失败: %w", err)}
+	}
+	auditBytes, err := json.Marshal(stats.Audit)
+	if err != nil {
+		return &statsSnapshot{err: fmt.Errorf("序列化操作记录失败: %w", err)}
+	}
 	snap := &statsSnapshot{meta: metaBytes, blocks: blockBytes, audit: auditBytes, dailyKeys: map[string]struct{}{}}
 	for date, d := range stats.Daily {
 		if d == nil {
@@ -3753,7 +3952,8 @@ func marshalStatsLocked() *statsSnapshot {
 		}
 		b, err := json.Marshal(d)
 		if err != nil {
-			continue
+			snap.err = fmt.Errorf("序列化日期 %s 的统计数据失败: %w", date, err)
+			return snap
 		}
 		snap.dailyItems = append(snap.dailyItems, struct {
 			key  string
@@ -3766,11 +3966,18 @@ func marshalStatsLocked() *statsSnapshot {
 
 // persistStats 将统计快照写入 BoltDB（stats_meta / stats_daily / stats_blocks / stats_audit）。
 // 由定时任务和进程退出时调用，保证重启后数据可恢复。
-func persistStats(snap *statsSnapshot) {
-	if db == nil || snap == nil {
-		return
+func persistStats(snap *statsSnapshot) error {
+	if db == nil {
+		return fmt.Errorf("database not ready")
 	}
-	_ = db.Update(func(tx *bolt.Tx) error {
+	if snap == nil {
+		return fmt.Errorf("empty stats snapshot")
+	}
+	if snap.err != nil {
+		log.Printf("[stats] %v；本次未写入数据库，保留旧数据", snap.err)
+		return snap.err
+	}
+	err := db.Update(func(tx *bolt.Tx) error {
 		mb, err := tx.CreateBucketIfNotExists([]byte("stats_meta"))
 		if err != nil {
 			return err
@@ -3782,14 +3989,18 @@ func persistStats(snap *statsSnapshot) {
 		if err != nil {
 			return err
 		}
-		_ = dbkt.ForEach(func(k, _ []byte) error {
+		if err := dbkt.ForEach(func(k, _ []byte) error {
 			if _, ok := snap.dailyKeys[string(k)]; !ok {
-				_ = dbkt.Delete(k)
+				return dbkt.Delete(k)
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 		for _, it := range snap.dailyItems {
-			_ = dbkt.Put([]byte(it.key), it.data)
+			if err := dbkt.Put([]byte(it.key), it.data); err != nil {
+				return err
+			}
 		}
 		bb, err := tx.CreateBucketIfNotExists([]byte("stats_blocks"))
 		if err != nil {
@@ -3804,6 +4015,11 @@ func persistStats(snap *statsSnapshot) {
 		}
 		return ab.Put([]byte("data"), snap.audit)
 	})
+	if err != nil {
+		log.Printf("[stats] 统计数据写入数据库失败: %v", err)
+		return err
+	}
+	return nil
 }
 
 func saveStatsOnce() {
@@ -4494,7 +4710,6 @@ func truncStr(s string, n int) string {
 	return s[:n] + "…"
 }
 
-
 // estimateBlockedBytes 估算一次被拦截请求的消耗流量。
 // 请求侧：请求行 + 头 + Content-Length（未知则按 0）。
 // 响应侧：统一错误页大约 3KB；登录失败等短响应按较小值。
@@ -5093,15 +5308,24 @@ body{min-height:100dvh;background:var(--bg);color:var(--t);font:15px/1.6 -apple-
 </div>
 <script>
 let captchaId = '';
+let captchaObjectURL = '';
 async function loadCaptcha() {
   try {
     const r = await fetch('/admin/api/captcha?t=' + Date.now(), {cache:'no-store'});
     if (!r.ok) throw new Error('验证码加载失败');
     captchaId = r.headers.get('X-Captcha-Id') || '';
     const blob = await r.blob();
-    document.getElementById('capImg').src = URL.createObjectURL(blob);
+    const nextURL = URL.createObjectURL(blob);
+    const img = document.getElementById('capImg');
+    const previousURL = captchaObjectURL;
+    img.src = nextURL;
+    captchaObjectURL = nextURL;
+    if (previousURL) URL.revokeObjectURL(previousURL);
   } catch(e) { console.error(e); }
 }
+window.addEventListener('beforeunload', () => {
+  if (captchaObjectURL) URL.revokeObjectURL(captchaObjectURL);
+});
 document.getElementById('capImg').addEventListener('click', () => { document.getElementById('captcha').value=''; loadCaptcha(); });
 document.getElementById('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -5265,6 +5489,38 @@ func checkCaptchaRate(ip string) bool {
 	return e.Count.Add(1) <= captchaRateLimit
 }
 
+// startAuthStateCleaner 定期清理长期未活动的来源 IP 记录，避免随机 IP 请求导致内存持续增长。
+func startAuthStateCleaner() {
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for now := range t.C {
+			nowNS := now.UnixNano()
+			loginFailers.Range(func(k, v any) bool {
+				e, ok := v.(*loginFailEntry)
+				if !ok {
+					loginFailers.Delete(k)
+					return true
+				}
+				lockedUntil := e.Locked.Load()
+				lastWindow := e.Window.Load()
+				if lockedUntil <= nowNS &&
+					(lastWindow == 0 || nowNS-lastWindow > int64(24*time.Hour)) {
+					loginFailers.CompareAndDelete(k, v)
+				}
+				return true
+			})
+			captchaLimiters.Range(func(k, v any) bool {
+				e, ok := v.(*captchaRateEntry)
+				if !ok || e.WindowStart.Load() == 0 || nowNS-e.WindowStart.Load() > int64(2*time.Minute) {
+					captchaLimiters.CompareAndDelete(k, v)
+				}
+				return true
+			})
+		}
+	}()
+}
+
 type switchTransport struct{ v atomic.Value }
 
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -5294,11 +5550,12 @@ var proxyBufPool = &bufferPool{}
 
 func newTransport() *http.Transport {
 	return &http.Transport{
-		Proxy:             http.ProxyFromEnvironment,
-		DialContext:       (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2: true, MaxIdleConns: 512, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 45 * time.Second, ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
+		// 反代上游必须走已校验并固定的 IP，不能被 HTTP_PROXY/HTTPS_PROXY 绕过。
+		Proxy: nil, DialContext: dialPinned,
+		ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 90 * time.Second, ExpectContinueTimeout: 1 * time.Second,
+		MaxResponseHeaderBytes: 1 << 20,
+		DisableCompression:     true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
 	}
 }
 
@@ -6462,15 +6719,15 @@ func adminHandler() http.HandlerFunc {
 			_ = json.Unmarshal(mustJSON(p), &payloadObj)
 			w.WriteHeader(http.StatusOK)
 			resp := map[string]any{
-				"ok":          err == nil,
-				"payload":     payloadObj,
-				"resp_status": status,
-				"resp_body":   respBody,
-				"error":       errString(err),
-				"queued":      err != nil,
-				"record_id":   rec.ID,
+				"ok":           err == nil,
+				"payload":      payloadObj,
+				"resp_status":  status,
+				"resp_body":    respBody,
+				"error":        errString(err),
+				"queued":       err != nil,
+				"record_id":    rec.ID,
 				"content_type": ct,
-				"target":      tURL,
+				"target":       tURL,
 			}
 			if c.DailyTmplOn {
 				resp["text"] = string(body)
@@ -6643,34 +6900,47 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	}
 	defer db.Close()
 
-	_ = db.Update(func(tx *bolt.Tx) error {
+	legacyImported := make([]string, 0, 3)
+	if err := db.Update(func(tx *bolt.Tx) error {
 		cfgB := tx.Bucket([]byte("config"))
 		if cfgB == nil || cfgB.Get([]byte("data")) == nil {
-			cfgPath := filepath.Join(filepath.Dir(dbFile), "config.json")
-			if b, err := os.ReadFile(cfgPath); err == nil {
-				bk, _ := tx.CreateBucketIfNotExists([]byte("config"))
-				_ = bk.Put([]byte("data"), b)
-				_ = os.Rename(cfgPath, cfgPath+".bak")
-			}
-			statsPath := filepath.Join(filepath.Dir(dbFile), "stats.json")
-			if b, err := os.ReadFile(statsPath); err == nil {
-				bk, _ := tx.CreateBucketIfNotExists([]byte("stats"))
-				_ = bk.Put([]byte("data"), b)
-				_ = os.Rename(statsPath, statsPath+".bak")
-			}
-			passPath := filepath.Join(filepath.Dir(dbFile), "admin.pass")
-			if b, err := os.ReadFile(passPath); err == nil {
-				bk, _ := tx.CreateBucketIfNotExists([]byte("auth"))
-				_ = bk.Put([]byte("admin_pass"), b)
-				_ = os.Rename(passPath, passPath+".bak")
+			for _, item := range []struct {
+				file, bucket, key string
+			}{
+				{file: "config.json", bucket: "config", key: "data"},
+				{file: "stats.json", bucket: "stats", key: "data"},
+				{file: "admin.pass", bucket: "auth", key: "admin_pass"},
+			} {
+				path := filepath.Join(filepath.Dir(dbFile), item.file)
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					if !os.IsNotExist(readErr) {
+						return fmt.Errorf("读取旧文件 %s 失败: %w", item.file, readErr)
+					}
+					continue
+				}
+				bucket, createErr := tx.CreateBucketIfNotExists([]byte(item.bucket))
+				if createErr != nil {
+					return createErr
+				}
+				if putErr := bucket.Put([]byte(item.key), data); putErr != nil {
+					return putErr
+				}
+				legacyImported = append(legacyImported, path)
 			}
 		}
 		return nil
-	})
-
-	for _, legacy := range []string{"geo_cache.json", "geo_cache.json.bak", "stats.json.bak", "config.json.bak", "admin.pass.bak"} {
-		_ = os.Remove(filepath.Join(filepath.Dir(dbFile), legacy))
+	}); err != nil {
+		log.Printf("[migration] 导入旧配置失败，保留旧文件供恢复: %v", err)
+	} else {
+		for _, path := range legacyImported {
+			if err := os.Rename(path, path+".bak"); err != nil {
+				log.Printf("[migration] 已导入但备份旧文件 %s 失败: %v", path, err)
+			}
+		}
 	}
+
+	// 旧版迁移备份保留，不在启动时自动删除，方便异常时人工恢复。
 
 	loadConfig()
 	var storedHash string
@@ -6722,6 +6992,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	detectSelfPublicIP()
 	publishStatsView()
 	initSessionsCleanup()
+	startAuthStateCleaner()
 	startGeoDBUpdater()
 	defer saveStatsOnce()
 
@@ -6809,12 +7080,22 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
+		resolution, resolveErr := resolveTargetIPs(r.Context(), target)
+		if resolveErr != nil {
+			log.Printf("[upstream] 拒绝目标 %q: %v", target.Host, resolveErr)
+			serveError(w, r, http.StatusForbidden, "上游地址未通过安全检查",
+				"目标地址无法解析，或解析结果包含不允许的特殊 IP。内网 Emby 地址（如 192.168.x.x、10.x.x.x、172.16-31.x.x）仍允许使用；请检查目标域名解析和地址格式。",
+				errPageCtx{Code: "upstream_ip", Label: "上游地址安全校验失败"})
+			return
+		}
+
 		recordRequestStart(ip, country, target.Host, r.UserAgent())
 
 		concurrent.Add(1)
 		defer concurrent.Add(-1)
 		rb := &reqBytes{ip: ip}
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
+		ctx = context.WithValue(ctx, targetResolutionCtxKey{}, resolution)
 		ctx = withReqBytes(ctx, rb)
 		proxy.ServeHTTP(&countingWriter{ResponseWriter: w, rb: rb}, r.WithContext(ctx))
 		up, down := rb.up.Load(), rb.down.Load()
@@ -6963,7 +7244,12 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	_ = srv.Close()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("优雅关闭超时，强制关闭连接: %v", err)
+		_ = srv.Close()
+	}
 }
 
 // main 解析命令行参数。支持直接运行，或通过 "run" 子命令由 systemd 拉起。
@@ -7261,11 +7547,13 @@ func adminAllowContains(c *Config, ipStr string) bool {
 // 管理后台「判定链顺序」面板三处共用此顺序，避免各写一份后逐渐漂移。
 //
 // 排序原则：先准入后内容，先便宜后昂贵。
-//   ① 访问域名白名单：纯字符串解析，最外层准入，挡掉 IP 直连 / 盗链 / 扫描器
-//   ② IP 黑名单：内存查表，明确拉黑的来源直接丢弃
-//   ③ UA 白名单：内存字符串匹配
-//   ④ 地区限制：要查 IP 归属库，放到便宜规则之后，只对存活下来的请求执行
-//   ⑤ 上游域名白名单：需先 parseTarget 解析请求路径，只有真正反代才需要
+//
+//	① 访问域名白名单：纯字符串解析，最外层准入，挡掉 IP 直连 / 盗链 / 扫描器
+//	② IP 黑名单：内存查表，明确拉黑的来源直接丢弃
+//	③ UA 白名单：内存字符串匹配
+//	④ 地区限制：要查 IP 归属库，放到便宜规则之后，只对存活下来的请求执行
+//	⑤ 上游域名白名单：需先 parseTarget 解析请求路径，只有真正反代才需要
+//
 // 例外路径（/health、/admin/、/speed/、favicon、内置资源、首页）不参与此链，
 // 保持「后台与监控永远可用、首页不暴露内容」的既有行为。
 type ruleStepSpec struct {
@@ -9598,27 +9886,37 @@ function ovChartSeries(){
   return {labels,reqs,ups,downs,gran};
 }
 
+let ovLoading = false;
 async function loadOverview(){
+  if(ovLoading || document.hidden) return;
+  ovLoading = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  const opts = {cache:'no-store', signal:controller.signal};
   try{
-    const r=await fetch('/admin/api/traffic?slim=1',{cache:'no-store'});
+    const r=await fetch('/admin/api/traffic?slim=1',opts);
     if(!r.ok)throw new Error('HTTP '+r.status);
     const t=await r.json();
     document.getElementById('uniqueIPs').textContent=(t.unique_ips!=null?t.unique_ips:Object.keys(t.ip_counts||{}).length).toLocaleString();
     ovTrendData = t.trend || [];
     refreshOverview();
-    
-    const r2=await fetch('/admin/api/blocks?limit=5',{cache:'no-store'});
+
+    const r2=await fetch('/admin/api/blocks?limit=5',opts);
     if(r2.ok){const b=await r2.json();renderOvBlocks(b.items||[]);}
-    
-    const r3=await fetch('/admin/api/config',{cache:'no-store'});
+
+    const r3=await fetch('/admin/api/config',opts);
     if(r3.ok){const c=await r3.json();state.cfgCache=c;}
     let sys=null;
     try{
-      const r4=await fetch('/admin/api/system',{cache:'no-store'});
+      const r4=await fetch('/admin/api/system',opts);
       if(r4.ok) sys=await r4.json();
     }catch(e){}
     renderSysInfo(sys, sys&&sys.uptime_sec!=null?sys.uptime_sec:(t.uptime_sec||0));
-  }catch(e){console.error('loadOverview error:',e)}
+  }catch(e){if(e.name!=='AbortError')console.error('loadOverview error:',e);}
+  finally{
+    clearTimeout(timeout);
+    ovLoading = false;
+  }
 }
 
 function renderSysInfo(sys, uptime){
@@ -10903,6 +11201,7 @@ loadConfig();
   },50);
 })();
 let ovTimer=setInterval(()=>{if(!document.hidden)loadOverview()},5000);
+window.addEventListener('beforeunload',()=>clearInterval(ovTimer));
 document.addEventListener('visibilitychange',()=>{
   if(!document.hidden){
     loadOverview();
@@ -10955,6 +11254,16 @@ ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${u} -db ${DB_FILE}
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=${CONFIG_DIR}
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -10964,6 +11273,9 @@ build_binary() {
   if [[ -n "$PREBUILT" ]]; then [[ -f "$PREBUILT" ]] || die "预构建二进制不存在: $PREBUILT"; cp -f "$PREBUILT" "$out"; chmod 0755 "$out"; return; fi
   ensure_go
   BUILD_TMPDIR="$(mktemp -d)"
+  local free_kb
+  free_kb="$(df -Pk "$BUILD_TMPDIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+  [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb >= 122880 )) || die "临时目录可用空间不足 120 MiB，无法可靠编译"
   write_go_source "$BUILD_TMPDIR"
   info "初始化模块并解析依赖..."
   (
@@ -11045,6 +11357,7 @@ cmd_install() {
   parse_install_args "$@"
   require_root install
   require_systemd
+  acquire_installer_lock
   setup_journal_limit
   
   if [[ -t 0 ]] && [[ $BINARY_ONLY -eq 0 ]] && [[ $PORT_GIVEN -eq 0 || $PASS_GIVEN -eq 0 ]]; then
@@ -11065,6 +11378,7 @@ cmd_install() {
   fi
   local expected_unit; expected_unit="$(make_unit)"
   local need_compile=0 need_reload=0 new_hash=""
+  local rollback_unit="" had_old_unit=0 unit_restore_failed=0
   if [[ -n "$PREBUILT" || $FORCE -eq 1 ]]; then need_compile=1
   elif [[ ! -x "$BIN_PATH" || ! -f "$BUILD_HASH_FILE" ]]; then need_compile=1
   else
@@ -11079,19 +11393,47 @@ cmd_install() {
     print_access_info; return
   fi
   if [[ $need_compile -eq 1 ]]; then
-    local stage; stage="$(mktemp -d)/emby-proxy"
+    STAGE_TMPDIR="$(mktemp -d)"
+    local stage="${STAGE_TMPDIR}/emby-proxy"
     build_binary "$stage"
     info "二进制编译完成"
+    local rollback_bin="${BIN_PATH}.rollback.$$"
+    local had_old_bin=0
+    if [[ -x "$BIN_PATH" ]]; then
+      cp -p "$BIN_PATH" "$rollback_bin" || die "备份旧程序失败，已取消更新"
+      had_old_bin=1
+      info "已备份旧程序: $rollback_bin"
+    fi
     stop_and_disable
+    backup_runtime_data
     mkdir -p "$(dirname "$BIN_PATH")"
     local tmp_dst="${BIN_PATH}.tmp.$$"
-    cp -f "$stage" "$tmp_dst"; chmod 0755 "$tmp_dst"; mv -f "$tmp_dst" "$BIN_PATH"
+    if ! cp -f "$stage" "$tmp_dst"; then
+      rm -f "$tmp_dst"
+      if [[ $had_old_bin -eq 1 ]]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+      die "复制新程序失败，已保留旧程序"
+    fi
+    chmod 0755 "$tmp_dst"
+    if ! mv -f "$tmp_dst" "$BIN_PATH"; then
+      rm -f "$tmp_dst"
+      if [[ $had_old_bin -eq 1 ]]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+      die "替换新程序失败，已保留旧程序"
+    fi
     info "已安装二进制: $BIN_PATH"
     if [[ -z "$PREBUILT" ]]; then [[ -n "$new_hash" ]] || new_hash="$(compute_source_hash)"; printf '%s' "$new_hash" > "$BUILD_HASH_FILE"; else rm -f "$BUILD_HASH_FILE"; fi
   fi
   if [[ $need_reload -eq 1 ]]; then
+    if [[ $need_compile -eq 0 ]]; then
+      systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+      backup_runtime_data
+    fi
     local unit_content="$expected_unit"
     local first_boot=0
+    rollback_unit="${UNIT_FILE}.rollback.$$"
+    if [[ -f "$UNIT_FILE" ]]; then
+      cp -p "$UNIT_FILE" "$rollback_unit" || die "备份旧服务配置失败，已取消更新"
+      had_old_unit=1
+    fi
     if [[ ! -f "$DB_FILE" ]] || ! grep -q "admin_pass_hash" "$DB_FILE" 2>/dev/null; then
       first_boot=1
       unit_content="${unit_content/ -db / -admin-pass $(systemd_quote "$ADMIN_PASS") -db }"
@@ -11101,7 +11443,7 @@ cmd_install() {
     info "已更新 systemd unit"; systemctl daemon-reload
   fi
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE_NAME"
+  systemctl restart "$SERVICE_NAME" || true
   sleep 2
   if [[ ${first_boot:-0} -eq 1 ]] && systemctl is-active --quiet "$SERVICE_NAME"; then
     printf '%s\n' "$expected_unit" > "$UNIT_FILE"
@@ -11113,16 +11455,53 @@ cmd_install() {
   local waited=0 ep
   ep="$(effective_port)"
   while [[ $waited -lt 20 ]]; do
-    if systemctl is-active --quiet "$SERVICE_NAME" && port_listen "$ep"; then break; fi
+    if systemctl is-active --quiet "$SERVICE_NAME" && health_check "$ep"; then break; fi
     sleep 1; waited=$((waited + 1))
   done
-  if systemctl is-active --quiet "$SERVICE_NAME" && port_listen "$ep"; then
-    info "🎉 安装完成！端口 $ep 已监听"
-    print_access_info
-  elif systemctl is-active --quiet "$SERVICE_NAME"; then
-    warn "服务已启动，端口暂未监听（稍等几秒）"
+  if systemctl is-active --quiet "$SERVICE_NAME" && health_check "$ep"; then
+    info "🎉 安装完成！服务、端口与 HTTP 健康检查均通过"
+    [[ -n "${rollback_bin:-}" && -f "${rollback_bin:-}" ]] && rm -f "$rollback_bin"
+    [[ -n "$rollback_unit" && -f "$rollback_unit" ]] && rm -f "$rollback_unit"
     print_access_info
   else
+    if [[ $need_reload -eq 1 ]]; then
+      systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+      if [[ $had_old_unit -eq 1 && -f "$rollback_unit" ]]; then
+        if cp -p "$rollback_unit" "$UNIT_FILE"; then
+          rm -f "$rollback_unit"
+        else
+          unit_restore_failed=1
+          warn "恢复旧服务配置失败，备份仍保留在 $rollback_unit"
+        fi
+      else
+        rm -f "$UNIT_FILE"
+      fi
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [[ ${need_compile:-0} -eq 1 && ${had_old_bin:-0} -eq 1 && -f "${rollback_bin:-}" ]]; then
+      warn "新版本启动失败，正在恢复旧程序..."
+      systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+      if cp -p "$rollback_bin" "${BIN_PATH}.restore.$$" && mv -f "${BIN_PATH}.restore.$$" "$BIN_PATH"; then
+        rm -f "$BUILD_HASH_FILE" # 下次更新强制重新编译，避免旧二进制误判为最新
+        if [[ $unit_restore_failed -eq 0 ]]; then
+          systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+          systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+          if systemctl is-active --quiet "$SERVICE_NAME"; then
+            info "旧程序已恢复并重新启动"
+          else
+            err "旧程序已恢复，但服务仍未启动，请检查日志"
+          fi
+        else
+          err "旧程序已恢复，但服务配置恢复失败；为避免用错误配置启动，已保持服务停止"
+        fi
+      else
+        rm -f "${BIN_PATH}.restore.$$"
+        err "旧程序回滚失败，请手动恢复: $rollback_bin"
+      fi
+    elif [[ $need_reload -eq 1 && $had_old_unit -eq 1 && $unit_restore_failed -eq 0 ]]; then
+      systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+      systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
     err "启动失败，最近日志如下（可直接复制给我）："
     printf '\033[0;90m%s\033[0m\n' "------------------------------------------------------------"
     journalctl -u "$SERVICE_NAME" -n 60 --no-pager -o cat 2>/dev/null || true
@@ -11143,6 +11522,7 @@ cmd_uninstall() {
   done
   require_root uninstall
   require_systemd
+  acquire_installer_lock
   if [[ $assume_yes -eq 0 ]]; then
     if [[ ! -t 0 ]]; then die "非交互请加 --yes"; fi
     if [[ $keep -eq 1 ]]; then printf '即将卸载（保留配置）。输入 y 确认: '; else printf '即将卸载并删除所有配置。输入 y 确认: '; fi
@@ -11165,7 +11545,7 @@ cmd_update() {
   if [[ ! -f "$UNIT_FILE" ]] && ! has_binary; then die "还没有安装，请先执行: sudo $0 install"; fi
   cmd_install --force --code-only "$@"
 }
-cmd_ctl() { require_root "$1"; require_systemd; systemctl "$1" "$SERVICE_NAME"; }
+cmd_ctl() { require_root "$1"; require_systemd; acquire_installer_lock; systemctl "$1" "$SERVICE_NAME"; }
 cmd_status() { require_systemd; systemctl status "$SERVICE_NAME" --no-pager -l || true; }
 C_R=$'\033[1;31m'; C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'; C_B=$'\033[1m'; C_D=$'\033[2m'; C_C=$'\033[1;36m'; C_0=$'\033[0m'; C_M=$'\033[0;35m'
 if [[ ! -t 1 ]]; then C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_C=""; C_0=""; C_M=""; fi
