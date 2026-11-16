@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="3.5.0"
+APP_VERSION="3.5.2"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -504,7 +504,7 @@ func autoPageTips(status int, code string) []string {
 	}
 	switch {
 	case status == http.StatusNotFound:
-		return []string{"核对访问路径是否完整，注意不要遗漏开头的斜杠。", "反代请求的格式为 /https://上游域名/路径。"}
+		return []string{"核对访问路径是否完整，注意不要遗漏开头的斜杠。", "反代请求的格式为 /上游域名/路径 或 /https://上游域名/路径（http(s) 前缀可省略）。"}
 	case status == http.StatusGone:
 		return []string{"测速链接有 7 天有效期与可用次数上限，请联系管理员重新生成。"}
 	case status == http.StatusTooManyRequests:
@@ -590,7 +590,7 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	}
 	ex1 := scheme + "://" + host + "/https://上游域名/路径"
 	ex2 := scheme + "://" + host + "/http://192.168.1.10:8096/emby/Items?api_key=xxx"
-	usage := `<div class="usage">在访问域名后直接拼上目标地址即可反代：<code>` + pageEsc(ex1) + `</code>示例：<code>` + pageEsc(ex2) + `</code><div class="hint">支持 http / https、查询参数与 WebSocket；目标域名需位于「上游域名白名单」中（若已启用）。</div></div>`
+	usage := `<div class="usage">在访问域名后直接拼上目标地址即可反代：<code>` + pageEsc(ex1) + `</code>示例：<code>` + pageEsc(ex2) + `</code><div class="hint">目标写完整的域名+路径或 IP+路径均可，http:// / https:// 前缀可省略（省略时按端口自动选择协议）；支持查询参数与 WebSocket；目标需位于「上游域名白名单」中（若已启用）。</div></div>`
 	renderPage(w, pageData{
 		Status: http.StatusOK, Kind: "green", Title: "服务运行中",
 		Summary: "网关已就绪",
@@ -672,6 +672,13 @@ type Config struct {
 	ReportOn    bool     `json:"report_on"`
 	ReportNote  string   `json:"report_note"`
 	AdminAllow  []string `json:"admin_allow"`
+	// 反爬加固：三项独立开关的早筛层，位于判定链之前，默认全关以兼容旧配置。
+	HoneypotOn   bool `json:"honeypot_on"`     // 蜜罐路径：命中即断连并自动拉黑
+	ScanGuardOn  bool `json:"scan_guard_on"`   // 扫描器 UA / 空 UA：命中即断连并自动拉黑
+	RateLimitOn  bool `json:"rate_limit_on"`   // 单 IP 全局限速（令牌桶 + 并发上限）
+	RatePerSec   int  `json:"rate_per_sec"`    // 每秒请求数上限，默认 30
+	RateBurst    int  `json:"rate_burst"`      // 突发上限，默认 60
+	MaxConnPerIP int  `json:"max_conn_per_ip"` // 单 IP 并发连接上限，默认 64
 	// 昨日日报自定义格式
 	DailyTmplOn    bool   `json:"daily_tmpl_on"`    // 开启后日报以渲染文本发送，关闭则发送标准 JSON
 	DailyTmpl      string `json:"daily_tmpl"`       // 模板内容，支持 {{date}} {{requests}} 等占位符
@@ -936,33 +943,110 @@ func rootDomain(hostport string) string {
 	return strings.Join(parts[n-2:], ".")
 }
 
-// whitelistMatch 判断上游目标域名是否在白名单中。
+// whitelistEntry 表示一条上游白名单规则，由 parseWhitelistEntry 解析。
+// 支持的写法（http:// 或 https:// 前缀可写可不写，写了会自动忽略）：
+//
+//	example.com           普通域名：沿用根域名匹配
+//	*.example.com         通配子域名
+//	1.2.3.4               IP（匹配任意端口）
+//	example.com/emby      完整域名+路径：域名精确匹配，且目标路径必须以 /emby 开头
+//	1.2.3.4:8096/emby     完整 IP+端口+路径：端口参与匹配，路径按前缀匹配
+type whitelistEntry struct {
+	host string // 规范化后的主机（不含路径）
+	port string // 显式指定的端口，未指定为空
+	path string // 要求的目标路径前缀（以 / 开头），未要求为空
+	wild bool   // 是否 *. 通配
+}
+
+func parseWhitelistEntry(w string) (whitelistEntry, bool) {
+	w = strings.TrimSpace(w)
+	if i := strings.IndexAny(w, "#;"); i >= 0 {
+		w = strings.TrimSpace(w[:i])
+	}
+	if w == "" {
+		return whitelistEntry{}, false
+	}
+	// 忽略可选的 http:// / https:// 前缀
+	low := strings.ToLower(w)
+	for _, p := range []string{"https://", "http://"} {
+		if strings.HasPrefix(low, p) {
+			w = strings.TrimSpace(w[len(p):])
+			break
+		}
+	}
+	e := whitelistEntry{}
+	if strings.HasPrefix(w, "*.") {
+		e.wild = true
+		w = strings.TrimPrefix(w, "*.")
+	}
+	if i := strings.IndexByte(w, '/'); i >= 0 {
+		e.path = w[i:]
+		w = w[:i]
+	}
+	e.host = strings.ToLower(strings.TrimSpace(w))
+	if e.host == "" {
+		return whitelistEntry{}, false
+	}
+	if _, p, err := net.SplitHostPort(e.host); err == nil && p != "" {
+		e.port = p
+	}
+	return e, true
+}
+
+// whitelistEntryMatch 判断反代目标（host 可带端口、path 为目标路径）是否命中一条规则。
+func whitelistEntryMatch(e whitelistEntry, targetHost, targetPath string) bool {
+	host := strings.ToLower(strings.TrimSpace(targetHost))
+	if e.port != "" {
+		// 规则里显式写了端口：要求目标端口一致（"完整的 IP" 匹配）
+		h, p, err := net.SplitHostPort(host)
+		if err != nil || !strings.EqualFold(p, e.port) {
+			return false
+		}
+		host = strings.ToLower(h)
+	} else {
+		host = normalizeHost(host)
+	}
+	eh := normalizeHost(e.host)
+	if e.wild {
+		if host != eh && !strings.HasSuffix(host, "."+eh) {
+			return false
+		}
+	} else if host != eh {
+		// 带路径的规则要求"完整域名"，不做根域名自动放宽
+		if e.path != "" || !strings.EqualFold(rootDomain(eh), rootDomain(host)) {
+			return false
+		}
+	}
+	if e.path != "" {
+		p := targetPath
+		if p == "" {
+			p = "/"
+		}
+		if !strings.HasPrefix(p, e.path) {
+			return false
+		}
+		// 边界检查：/emby 不应把 /emby123 也放进来
+		if len(p) > len(e.path) && p[len(e.path)] != '/' {
+			return false
+		}
+	}
+	return true
+}
+
+// whitelistMatch 判断上游目标域名是否在白名单中（不考虑路径，供无目标路径的场景使用）。
 // 支持精确匹配和 *.example.com 通配；空列表表示不限制。
 func whitelistMatch(list []string, targetHost string) bool {
+	return whitelistMatchPath(list, targetHost, "")
+}
+
+// whitelistMatchPath 在主机匹配的基础上支持「域名+路径」「IP:端口+路径」规则。
+// 空列表表示不限制。
+func whitelistMatchPath(list []string, targetHost, targetPath string) bool {
 	if len(list) == 0 {
 		return true
 	}
-	target := normalizeHost(targetHost)
-	targetRoot := rootDomain(target)
 	for _, w := range list {
-		w = strings.TrimSpace(w)
-		if i := strings.IndexAny(w, "#;"); i >= 0 {
-			w = strings.TrimSpace(w[:i])
-		}
-		if w == "" {
-			continue
-		}
-		if strings.HasPrefix(w, "*.") {
-			suf := strings.ToLower(strings.TrimPrefix(w, "*."))
-			if target == suf || strings.HasSuffix(target, "."+suf) {
-				return true
-			}
-			continue
-		}
-		if strings.EqualFold(normalizeHost(w), target) {
-			return true
-		}
-		if strings.EqualFold(rootDomain(w), targetRoot) {
+		if e, ok := parseWhitelistEntry(w); ok && whitelistEntryMatch(e, targetHost, targetPath) {
 			return true
 		}
 	}
@@ -1111,6 +1195,8 @@ type BlockEvent struct {
 	Reason     string `json:"reason"`
 	ReasonText string `json:"reason_text"`
 	UA         string `json:"ua"`
+	ReqBytes   int64  `json:"req_bytes"`  // 估算请求消耗（头+体）
+	RespBytes  int64  `json:"resp_bytes"` // 估算响应消耗（错误页）
 }
 
 type DayStat struct {
@@ -4211,6 +4297,196 @@ func dropOrMinimal429(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("429 too many requests\n"))
 }
 
+// ===== 反爬早筛层：蜜罐路径 / 扫描器 UA / 全局限速 =====
+// 三者都在判定链之前执行，命中后直接断连（不回错误页，避免向扫描器确认服务存在）。
+// 与 blockedRateLimited 的区别：后者只统计「已被拦截」的请求，这里统计所有请求。
+
+// dropConn 直接断开 TCP 连接，不返回任何响应体。
+// 尽量 Hijack 后直接 Close；HTTP/2 等不支持 Hijack 的场景回退为无体的 403。
+func dropConn(w http.ResponseWriter) {
+	if h, ok := w.(http.Hijacker); ok {
+		if conn, _, err := h.Hijack(); err == nil {
+			_ = conn.Close()
+			return
+		}
+	}
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+}
+
+// honeypotExact 是正常 Emby 客户端绝不会请求的路径，命中即判定为扫描行为。
+var honeypotExact = map[string]bool{
+	"/.env": true, "/.env.bak": true, "/.env.local": true,
+	"/.git/config": true, "/.git/head": true, "/.svn/entries": true,
+	"/.aws/credentials": true, "/.docker/config.json": true, "/.ds_store": true,
+	"/wp-login.php": true, "/wp-admin.php": true, "/xmlrpc.php": true,
+	"/config.php": true, "/admin.php": true, "/phpinfo.php": true, "/info.php": true,
+	"/shell.php": true, "/webshell.php": true, "/db.php": true,
+	"/backup.zip": true, "/backup.tar.gz": true, "/backup.sql": true,
+	"/db.sql": true, "/dump.sql": true, "/database.sql": true,
+	"/actuator/env": true, "/actuator/health": true, "/server-status": true,
+	"/manager/html": true, "/jmx-console/": true, "/boaform/admin/formlogin": true,
+	"/solr/admin": true, "/console/login": true, "/owa/auth/logon.aspx": true,
+}
+
+// honeypotPrefix 覆盖成片的扫描器路径前缀（WordPress / 数据库面板 / 框架控制台等）。
+var honeypotPrefix = []string{
+	"/wp-admin", "/wp-content", "/wp-includes", "/wp-json", "/wp-login",
+	"/phpmyadmin", "/phpmyadmin2", "/pma/", "/myadmin", "/mysql/", "/sqlmanager",
+	"/vendor/phpunit", "/cgi-bin/", "/actuator/", "/druid/", "/nacos/",
+	"/hudson/", "/jenkins/", "/zabbix/", "/.well-known/security.txt.bak",
+}
+
+// isHoneypotPath 判断请求路径是否命中蜜罐。
+func isHoneypotPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	low := strings.ToLower(p)
+	if honeypotExact[low] {
+		return true
+	}
+	for _, pre := range honeypotPrefix {
+		if strings.HasPrefix(low, pre) {
+			return true
+		}
+	}
+	// 目录遍历与敏感文件探测：任意层级出现 .git/.svn/.env 也视为扫描
+	if strings.Contains(low, "/.git/") || strings.Contains(low, "/.svn/") ||
+		strings.Contains(low, "/.env") || strings.Contains(low, "/phpmyadmin/") {
+		return true
+	}
+	return false
+}
+
+// scannerUAMarkers 是自动化扫描工具的典型 UA 片段（小写）。
+// 刻意不收录 okhttp / axios 这类被正常 App 使用的库，减少误伤。
+var scannerUAMarkers = []string{
+	"sqlmap", "nikto", "nmap", "zgrab", "masscan", "censys", "shodan", "nuclei",
+	"acunetix", "netsparker", "appscan", "openvas", "qualys", "wpscan", "awvs",
+	"dirbuster", "gobuster", "feroxbuster", "ffuf", "dirsearch", "xray", "jaeles",
+	"python-requests", "python-urllib", "go-http-client", "libwww-perl",
+	"curl/", "wget/", "scrapy", "phantomjs", "zap/", "paros", "httpx/",
+}
+
+// isScannerUA 判断 UA 是否明显来自扫描脚本；空 UA 同样判定为脚本（播放器都会带 UA）。
+func isScannerUA(ua string) bool {
+	ua = strings.ToLower(strings.TrimSpace(ua))
+	if ua == "" {
+		return true
+	}
+	for _, m := range scannerUAMarkers {
+		if strings.Contains(ua, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// autoBanMu 串行化自动拉黑，避免并发请求读改写配置时互相覆盖。
+var autoBanMu sync.Mutex
+
+// autoBanIP 把来源 IP 持久化写入黑名单，用于蜜罐与扫描器 UA 这类确定性扫描行为。
+// 保护措施：跳过私网/本机/非法 IP，黑名单超过 5000 条后停止自动追加，已存在则不重复写入。
+func autoBanIP(ip, reason string) {
+	clientIP := net.ParseIP(ip)
+	if clientIP == nil || clientIP.IsLoopback() || clientIP.IsPrivate() || clientIP.IsUnspecified() {
+		return
+	}
+	autoBanMu.Lock()
+	defer autoBanMu.Unlock()
+	old := currentCfg()
+	if old == nil || len(old.BanList) >= 5000 {
+		return
+	}
+	for _, b := range old.BanList {
+		if strings.TrimSpace(b) == ip {
+			return
+		}
+	}
+	nc := *old
+	nc.BanList = append(append([]string{}, old.BanList...), ip)
+	if err := saveConfig(&nc); err != nil {
+		return
+	}
+	cfgPtr.Store(&nc)
+	rebuildACL(&nc)
+	recordAudit("system", "auto_ban", ip+"（"+reason+"）")
+}
+
+type rateBucket struct {
+	tokens float64
+	last   time.Time
+	seen   time.Time
+}
+
+var (
+	rateMu        sync.Mutex
+	rateBuckets   = map[string]*rateBucket{}
+	rateLastSweep time.Time
+)
+
+// globalRateLimited 单 IP 令牌桶限速：超出每秒速率或突发上限返回 true。
+func globalRateLimited(ip string, perSec, burst int) bool {
+	if ip == "" {
+		return false
+	}
+	if perSec <= 0 {
+		perSec = 30
+	}
+	if burst <= 0 {
+		burst = 60
+	}
+	now := time.Now()
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	b, ok := rateBuckets[ip]
+	if !ok {
+		b = &rateBucket{tokens: float64(burst), last: now, seen: now}
+		rateBuckets[ip] = b
+		// 惰性清理，避免扫描器刷出大量 IP 导致 map 膨胀
+		if len(rateBuckets) > 4000 && now.Sub(rateLastSweep) > time.Minute {
+			for k, v := range rateBuckets {
+				if now.Sub(v.seen) > 3*time.Minute {
+					delete(rateBuckets, k)
+				}
+			}
+			rateLastSweep = now
+		}
+	}
+	if el := now.Sub(b.last).Seconds(); el > 0 {
+		b.tokens += el * float64(perSec)
+		if b.tokens > float64(burst) {
+			b.tokens = float64(burst)
+		}
+		b.last = now
+	}
+	b.seen = now
+	if b.tokens < 1 {
+		return true
+	}
+	b.tokens--
+	return false
+}
+
+// ipInflight 记录每个 IP 当前在途请求数，用于单 IP 并发上限。
+var ipInflight sync.Map
+
+// ipConnAcquire 申请一个并发名额；超限返回 ok=false。
+func ipConnAcquire(ip string, limit int) (func(), bool) {
+	if ip == "" || limit <= 0 {
+		return func() {}, true
+	}
+	v, _ := ipInflight.LoadOrStore(ip, new(int64))
+	p := v.(*int64)
+	if atomic.AddInt64(p, 1) > int64(limit) {
+		atomic.AddInt64(p, -1)
+		return func() {}, false
+	}
+	return func() { atomic.AddInt64(p, -1) }, true
+}
+
 func truncStr(s string, n int) string {
 	if n <= 0 || len(s) <= n {
 		return s
@@ -4218,10 +4494,35 @@ func truncStr(s string, n int) string {
 	return s[:n] + "…"
 }
 
+
+// estimateBlockedBytes 估算一次被拦截请求的消耗流量。
+// 请求侧：请求行 + 头 + Content-Length（未知则按 0）。
+// 响应侧：统一错误页大约 3KB；登录失败等短响应按较小值。
+func estimateBlockedBytes(r *http.Request) (req, resp int64) {
+	if r == nil {
+		return 0, 2800
+	}
+	var h int64 = 48
+	h += int64(len(r.Method) + len(r.URL.RequestURI()))
+	for k, vs := range r.Header {
+		h += int64(len(k) + 4)
+		for _, v := range vs {
+			h += int64(len(v) + 2)
+		}
+	}
+	body := r.ContentLength
+	if body < 0 {
+		body = 0
+	}
+	req = h + body
+	resp = 3200 // 典型 serveError HTML 页大小
+	return
+}
+
 // recordBlocked 记录一次拦截事件到内存统计，并计入对应原因计数。
 // 本机/本地 IP 不记录；Path/UA/Host 会被截断以控制体积。
 // 数据随 stats 定时落盘，重启不丢失。
-func recordBlocked(ip, country, path, reason, ua, host string) {
+func recordBlocked(ip, country, path, reason, ua, host string, reqBytes, respBytes int64) {
 	if isSelfOrLocalIP(ip, country) {
 		return
 	}
@@ -4247,7 +4548,12 @@ func recordBlocked(ip, country, path, reason, ua, host string) {
 	if country == "" {
 		country = "??"
 	}
-	ev := BlockEvent{Time: beijingRFC3339(time.Now()), IP: ip, Country: country, Host: truncStr(host, 120), Path: truncStr(path, 160), Reason: reason, ReasonText: reasonText, UA: truncStr(ua, 160)}
+	ev := BlockEvent{
+		Time: beijingRFC3339(time.Now()), IP: ip, Country: country,
+		Host: truncStr(host, 120), Path: truncStr(path, 160),
+		Reason: reason, ReasonText: reasonText, UA: truncStr(ua, 160),
+		ReqBytes: reqBytes, RespBytes: respBytes,
+	}
 	stats.Blocks = append(stats.Blocks, ev)
 	if len(stats.Blocks) > maxBlockEvents {
 		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
@@ -4917,7 +5223,7 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 	}
 
 	ua := ""
-	recordBlocked(ip, countryOf(ip), "/admin/api/login", "login_fail", ua, "")
+	recordBlocked(ip, countryOf(ip), "/admin/api/login", "login_fail", ua, "", 0, 180)
 	recordAudit(ip, "login_fail", reason)
 
 	if fails >= loginFailLimit {
@@ -5767,6 +6073,7 @@ func adminHandler() http.HandlerFunc {
 				"time": ev.Time, "ip": ev.IP, "country": ev.Country, "host": ev.Host,
 				"country_name": countryName(ev.Country),
 				"path":         ev.Path, "reason": ev.Reason, "reason_text": ev.ReasonText, "ua": ev.UA,
+				"req_bytes": ev.ReqBytes, "resp_bytes": ev.RespBytes,
 			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -6449,7 +6756,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				dropOrMinimal429(w)
 				return
 			}
-			recordBlocked(ip, country, r.URL.RequestURI(), "ban", r.UserAgent(), r.Host)
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ip, country, r.URL.RequestURI(), "ban", r.UserAgent(), r.Host, reqB, respB)
 			serveError(w, r, http.StatusForbidden, "来源 IP 已被拉黑",
 				"您的来源 IP 命中了 IP 黑名单，请求在判定链第 ② 步被拒绝，未进入反代流程。",
 				errPageCtx{Code: "ban", Label: "IP 在黑名单中"})
@@ -6461,7 +6769,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				dropOrMinimal429(w)
 				return
 			}
-			recordBlocked(ip, country, r.URL.RequestURI(), "ua", r.UserAgent(), r.Host)
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ip, country, r.URL.RequestURI(), "ua", r.UserAgent(), r.Host, reqB, respB)
 			serveError(w, r, http.StatusForbidden, "客户端不被允许",
 				"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求在判定链第 ③ 步被拒绝。",
 				errPageCtx{Code: "ua", Label: "User-Agent 不在允许列表"})
@@ -6473,7 +6782,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				dropOrMinimal429(w)
 				return
 			}
-			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent(), r.Host)
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ip, country, r.URL.RequestURI(), "cn", r.UserAgent(), r.Host, reqB, respB)
 			serveError(w, r, http.StatusForbidden, "地区限制",
 				"当前来源 IP 的归属地不在允许范围内，请求在判定链第 ④ 步被拒绝。",
 				errPageCtx{Code: "cn", Label: "仅允许中国大陆 IP 访问"})
@@ -6486,12 +6796,13 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			serveHome(w, r)
 			return
 		}
-		if !whitelistMatch(c.Whitelist, target.Host) {
+		if !whitelistMatchPath(c.Whitelist, target.Host, target.Path) {
 			if blockedRateLimited(ip) {
 				dropOrMinimal429(w)
 				return
 			}
-			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent(), r.Host)
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent(), r.Host, reqB, respB)
 			serveError(w, r, http.StatusForbidden, "目标域名未授权",
 				"请求路径中的上游域名不在「上游域名白名单」内，请求在判定链第 ⑤ 步被拒绝，未向上游转发任何数据。",
 				errPageCtx{Code: "whitelist", Label: "上游目标域名未授权"})
@@ -6526,6 +6837,19 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			redirectIcon(w, r, iconLogoURL)
 			return
 		}
+		// 根路径下的图标类内置资源都属于页面元素：与 /logo.png 同理，在访问域名守卫之前放行。
+		// 保证拦截提示页与首页的图标可正常显示，浏览器的自动请求也不会被记入拦截日志。
+		switch r.URL.Path {
+		case "/favicon.ico", "/favicon.svg":
+			redirectIcon(w, r, iconFaviconURL)
+			return
+		case "/favicon.png", "/favicon-16x16.png", "/favicon-32x32.png", "/favicon-96x96.png":
+			redirectIcon(w, r, icon192URL)
+			return
+		case "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png":
+			redirectIcon(w, r, iconLogoURL)
+			return
+		}
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"uptime_sec":%d}`, int64(time.Since(startedAt).Seconds()))))
@@ -6543,6 +6867,45 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			serveSpeedTest(w, r)
 			return
 		}
+		// ===== 反爬早筛层（判定链之前）=====
+		// ① 蜜罐路径：正常客户端不会访问，命中即断连并自动拉黑
+		// ② 扫描器 UA / 空 UA：命中即断连并自动拉黑
+		// ③ 单 IP 全局限速：超出速率或并发上限即断连（不拉黑，避免误伤 NAT 后的大量用户）
+		// 三项均为独立开关，关闭时完全不影响原有判定链。
+		guardCfg := currentCfg()
+		if guardCfg != nil && (guardCfg.HoneypotOn || guardCfg.ScanGuardOn || guardCfg.RateLimitOn) {
+			guardIP := getClientIP(r)
+			if guardCfg.HoneypotOn && isHoneypotPath(r.URL.Path) {
+				reqB, respB := estimateBlockedBytes(r)
+				recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "honeypot", r.UserAgent(), r.Host, reqB, respB)
+				autoBanIP(guardIP, "蜜罐路径 "+truncStr(r.URL.Path, 60))
+				dropConn(w)
+				return
+			}
+			if guardCfg.ScanGuardOn && isScannerUA(r.UserAgent()) {
+				reqB, respB := estimateBlockedBytes(r)
+				recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "scan_ua", r.UserAgent(), r.Host, reqB, respB)
+				autoBanIP(guardIP, "扫描器 UA "+truncStr(r.UserAgent(), 60))
+				dropConn(w)
+				return
+			}
+			if guardCfg.RateLimitOn {
+				if globalRateLimited(guardIP, guardCfg.RatePerSec, guardCfg.RateBurst) {
+					reqB, respB := estimateBlockedBytes(r)
+					recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "rate", r.UserAgent(), r.Host, reqB, respB)
+					dropConn(w)
+					return
+				}
+				release, ok := ipConnAcquire(guardIP, guardCfg.MaxConnPerIP)
+				if !ok {
+					reqB, respB := estimateBlockedBytes(r)
+					recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "rate", r.UserAgent(), r.Host, reqB, respB)
+					dropConn(w)
+					return
+				}
+				defer release()
+			}
+		}
 		// ===== 访问判定链 =====
 		// ① 黑名单 IP（本处提前短路）
 		// ② 访问域名守卫（Host）
@@ -6557,14 +6920,16 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				dropOrMinimal429(w)
 				return
 			}
-			recordBlocked(ipEarly, countryOf(ipEarly), r.URL.RequestURI(), "ban", r.UserAgent(), r.Host)
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ipEarly, countryOf(ipEarly), r.URL.RequestURI(), "ban", r.UserAgent(), r.Host, reqB, respB)
 			serveError(w, r, http.StatusForbidden, "来源 IP 已被拉黑",
 				"您的来源 IP 命中了 IP 黑名单，请求在判定链早期被拒绝，未进入反代流程。",
 				errPageCtx{Code: "ban", Label: "IP 在黑名单中"})
 			return
 		}
 		// 判定链 ① 访问域名白名单：/health（监控）、/admin/（后台）、/speed/（测速链接）
-		// 已在上面放行，其余请求（首页、favicon、所有代理转发路径）都必须用允许的域名访问。
+		// 及 /logo.png、favicon 等页面元素已在上面放行，其余请求（首页、所有代理转发路径）
+		// 都必须用允许的域名访问。
 		// 放在这里而不是 proxyHandler 内部，能保证通过 IP 打开时连首页都不暴露。
 		// 顺序与 ruleChainOrder 一致，后续 ②③④⑤ 在 proxyHandler 内依次执行。
 		if allowed, reason := accessHostAllowed(currentCfg(), r); !allowed {
@@ -6573,7 +6938,8 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				dropOrMinimal429(w)
 				return
 			}
-			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), reason, r.UserAgent(), r.Host)
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ip, countryOf(ip), r.URL.RequestURI(), reason, r.UserAgent(), r.Host, reqB, respB)
 			title, label, msg := "禁止 IP 直连", "IP / localhost 直连被拒绝", "您正在使用服务器 IP、localhost 或单标签主机名访问，本服务已禁止这种访问方式。"
 			if reason == "host_deny" {
 				title, label, msg = "访问域名未授权", "访问域名不在允许列表中", "当前浏览器使用的域名不在「允许访问的域名」列表中。"
@@ -6914,7 +7280,7 @@ var ruleChainOrder = []ruleStepSpec{
 	{"ban", "IP 黑名单", "来源 IP 精确匹配或命中 CIDR 段", "block"},
 	{"ua", "UA 白名单", "客户端 UA 需包含白名单关键字，空=不限制", "block"},
 	{"cn", "地区限制", "开启「仅允许中国大陆 IP」时，非大陆来源被拒", "block"},
-	{"whitelist", "上游域名白名单", "路径中的目标域名需匹配白名单（支持根域名），空=不限制", "block"},
+	{"whitelist", "上游域名白名单", "路径中的目标需匹配白名单（支持 域名 / *.域名 / 域名+路径 / IP:端口+路径，http(s) 前缀可省略），空=不限制", "block"},
 	{"forward", "放行转发", "全部通过后反代到上游，并计入流量统计", "pass"},
 }
 
@@ -6938,6 +7304,7 @@ func registerExtraRoutes(mux *http.ServeMux) {
 			IP         string `json:"ip"`
 			UA         string `json:"ua"`
 			Host       string `json:"host"`        // 目标上游：路径里要反代的域名
+			Path       string `json:"path"`        // 目标路径：反代地址里域名后面的部分
 			AccessHost string `json:"access_host"` // 请求 Host：浏览器地址栏用的域名
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
@@ -6955,6 +7322,10 @@ func registerExtraRoutes(mux *http.ServeMux) {
 		c := currentCfg()
 		ua := req.UA
 		host := strings.TrimSpace(req.Host)
+		targetPath := strings.TrimSpace(req.Path)
+		if targetPath != "" && !strings.HasPrefix(targetPath, "/") {
+			targetPath = "/" + targetPath
+		}
 		// 留空时用当前后台请求自身的访问域名（含回环代理 X-Forwarded-Host 兼容），
 		// 与真实守卫 requestAccessHost 取自同一份逻辑。
 		accessHost := strings.TrimSpace(req.AccessHost)
@@ -7031,17 +7402,17 @@ func registerExtraRoutes(mux *http.ServeMux) {
 			}
 		}
 
-		// ⑤ 上游域名白名单（真实请求里由 parseTarget 解析路径得到目标域名）
+		// ⑤ 上游域名白名单（真实请求里由 parseTarget 解析路径得到目标域名与路径）
 		if final == "pass" {
 			if host == "" {
 				add(4, "pass", "未填写目标上游，跳过校验")
 			} else if len(c.Whitelist) == 0 {
 				add(4, "pass", "未启用（空=不限制）")
-			} else if whitelistMatch(c.Whitelist, host) {
-				add(4, "pass", host+" 在白名单内")
+			} else if whitelistMatchPath(c.Whitelist, host, targetPath) {
+				add(4, "pass", host+targetPath+" 在白名单内")
 			} else {
 				final, blockedReason = "block", "whitelist"
-				add(4, "block", host+" 不在白名单内")
+				add(4, "block", host+targetPath+" 不在白名单内")
 			}
 		}
 
@@ -7068,7 +7439,7 @@ func registerExtraRoutes(mux *http.ServeMux) {
 
 		cls := uaClassOfEx(ua)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok": true, "ip": ip, "ua": ua, "host": host, "access_host": accessHost,
+			"ok": true, "ip": ip, "ua": ua, "host": host, "path": targetPath, "access_host": accessHost,
 			"country": country, "country_name": cname, "ua_class": cls,
 			"result": final, "reason": blockedReason, "admin_access": adminAccess, "steps": steps,
 		})
@@ -7177,7 +7548,9 @@ func registerExtraRoutes(mux *http.ServeMux) {
 				}
 			}
 			rows = append(rows, []string{ev.Time, ev.IP, ev.Country, countryName(ev.Country),
-				blockReasonText(ev.Reason), ev.Host, ev.Path, ev.UA})
+				blockReasonText(ev.Reason), ev.Host, ev.Path, ev.UA,
+				strconv.FormatInt(ev.ReqBytes, 10), strconv.FormatInt(ev.RespBytes, 10),
+				strconv.FormatInt(ev.ReqBytes+ev.RespBytes, 10)})
 		}
 		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 			rows[i], rows[j] = rows[j], rows[i]
@@ -7188,7 +7561,7 @@ func registerExtraRoutes(mux *http.ServeMux) {
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
 		_, _ = w.Write([]byte("\xEF\xBB\xBF"))
 		cw := csv.NewWriter(w)
-		_ = cw.Write([]string{"时间", "IP", "国家/地区码", "国家/地区", "拦截原因", "访问域名(Host)", "访问路径", "User-Agent"})
+		_ = cw.Write([]string{"时间", "IP", "国家/地区码", "国家/地区", "拦截原因", "访问域名(Host)", "访问路径", "User-Agent", "请求字节", "响应字节", "合计字节"})
 		for _, row := range rows {
 			_ = cw.Write(row)
 		}
@@ -8578,6 +8951,9 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <option value="host_deny">└ 非白名单域名</option>
     <option value="ban">IP 黑名单</option>
     <option value="ua">UA 不允许</option>
+    <option value="honeypot">蜜罐路径</option>
+    <option value="scan_ua">扫描器 UA</option>
+    <option value="rate">请求过快</option>
     <option value="login_fail">登录失败</option>
   </select>
   <input id="blkIP" class="inp m" type="text" placeholder="精确 IP" style="max-width:150px">
@@ -8588,7 +8964,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <button type="button" class="btn g s" id="blkExport">导出 CSV</button>
 </div>
 <div id="blkReasonStats" style="display:flex;flex-wrap:wrap;gap:8px;margin:-4px 0 14px"></div>
-<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>访问域名</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP 地址</th><th>国家/地区</th><th>访问域名</th><th>拦截原因</th><th>访问路径</th><th>User-Agent</th><th>消耗流量</th><th>操作</th></tr></thead><tbody id="blockTable"></tbody></table></div>
   <div class="pgbar">
     <span id="blkPageInfo"></span>
     <div style="display:flex;gap:8px">
@@ -8781,9 +9157,23 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <div class="ch"><div><h2 class="ct">安全与访问控制</h2><div class="cd">代理转发的准入规则；保存后立即生效并预编译匹配</div></div></div>
     <div class="row"><div><div class="rl">仅允许中国大陆 IP</div><div class="rd">非大陆来源将被拒绝</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
     <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
-    <div class="row"><div><div class="rl">禁止 IP 直连 / 访问域名白名单</div><div class="rd">开启后，只有通过下方允许的域名访问代理才被放行；用服务器 IP、localhost 或其它域名访问一律返回 403。管理后台 /admin/、健康检查 /health 与测速链接不受限制，不会被锁在门外</div></div><label class="sw"><input type="checkbox" id="hostGuardOn"><span class="tr2"></span></label></div>
+    <div class="row"><div><div class="rl">禁止 IP 直连 / 访问域名白名单</div><div class="rd">开启后，只有通过下方允许的域名访问代理才被放行；用服务器 IP、localhost 或其它域名访问一律返回 403。管理后台 /admin/、健康检查 /health、测速链接与 favicon 等页面元素不受限制，不会被锁在门外</div></div><label class="sw"><input type="checkbox" id="hostGuardOn"><span class="tr2"></span></label></div>
     <div class="fi"><label class="fl">允许访问的域名</label><div class="hint" style="margin-bottom:8px">每行一个，支持 *.example.com 通配；也可直接粘贴完整网址（会自动忽略 https:// 与路径）。留空表示只禁止 IP / localhost 直连，任意域名均可访问。前面挂了 Nginx / CDN 时，请回传 X-Forwarded-Host 或保留原始 Host，否则后端看到的会是回环 IP。注意：只填根域不会放行子域，用到的子域请逐个添加或改用通配</div><textarea id="allowedHosts" class="tarea" placeholder="emby.example.com&#10;*.example.com"></textarea><div class="hint" id="curHostHint" style="margin-top:8px;color:var(--pd)">当前访问域名：加载中…</div></div>
-    <div class="fi"><label class="fl">上游域名白名单（可反代到的目标）</label><div class="hint" style="margin-bottom:8px">每行一个域名，支持根域名匹配；限制路径里能反代到哪些上游主机，与上面的访问域名无关</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com"></textarea></div>
+    <div style="border-top:1px dashed var(--bd);margin:16px 0 12px"></div>
+    <div class="ch" style="margin-bottom:6px"><div><h2 class="ct" style="font-size:15px">反爬加固（早筛层）</h2><div class="cd">在判定链之前执行，命中后直接断开连接、不返回任何页面；只作用于代理转发路径，/admin/、/health、/speed/ 与页面图标不受影响</div></div></div>
+    <div class="row"><div><div class="rl">蜜罐路径拦截</div><div class="rd">命中 /.env、/wp-login.php、/phpmyadmin、/.git/config 等正常客户端永不访问的路径时立即断连，并把来源 IP 自动写入黑名单（可在上方 IP 黑名单里移除）。真实用户不可能踩到，几乎零误伤</div></div><label class="sw"><input type="checkbox" id="honeypotOn"><span class="tr2"></span></label></div>
+    <div class="row"><div><div class="rl">扫描器 UA 拦截</div><div class="rd">UA 含 sqlmap / nikto / nmap / zgrab / nuclei / curl / python-requests 等工具特征，或 UA 为空时立即断连并自动拉黑。注意：如果你自己用脚本或 curl 调试，请先关掉再调</div></div><label class="sw"><input type="checkbox" id="scanGuardOn"><span class="tr2"></span></label></div>
+    <div class="row"><div><div class="rl">单 IP 全局限速</div><div class="rd">统计所有请求（不只是被拦截的），超出速率或并发上限直接断连，用于压住目录爆破与批量探测。只断连不拉黑，避免误伤同一 NAT 后的多个用户</div></div><label class="sw"><input type="checkbox" id="rateLimitOn"><span class="tr2"></span></label></div>
+    <div class="fi" id="rateFields" style="display:none">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">
+        <div><label class="fl">每秒请求数</label><input id="ratePerSec" class="inp m" type="number" min="1" max="10000" placeholder="30"></div>
+        <div><label class="fl">突发上限</label><input id="rateBurst" class="inp m" type="number" min="1" max="100000" placeholder="60"></div>
+        <div><label class="fl">单 IP 并发</label><input id="maxConnPerIP" class="inp m" type="number" min="1" max="10000" placeholder="64"></div>
+      </div>
+      <div class="hint" style="margin-top:8px">留空即使用默认值 30 / 60 / 64。播放高清视频建议并发不低于 32；填 0 或负数会被忽略</div>
+    </div>
+    <div style="border-top:1px dashed var(--bd);margin:16px 0 12px"></div>
+    <div class="fi"><label class="fl">上游域名白名单（可反代到的目标）</label><div class="hint" style="margin-bottom:8px">每行一条，http(s):// 前缀可省略。支持：域名（如 example.com，自动匹配根域名）、通配（*.cdn.example.com）、完整域名+路径（如 example.com/emby，仅放行该路径前缀）、IP:端口+路径（如 1.2.3.4:8096/emby，端口参与匹配）。限制路径里能反代到哪些上游主机，与上面的访问域名无关</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com&#10;example.com/emby&#10;1.2.3.4:8096/emby"></textarea></div>
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
     <div class="fi"><label class="fl">后台访问来源</label><div class="hint" style="margin-bottom:8px">留空表示不限制；填写后只有这些 IP/CIDR 能打开管理后台（不影响代理转发）。保存时会校验本机 IP 是否在列表内，避免把自己锁在门外。</div><textarea id="adminAllow" class="tarea" style="min-height:70px" placeholder="192.168.1.0/24&#10;203.0.113.8"></textarea></div>
     <div class="acts"><button class="btn b" id="saveAll" style="width:100%">保存设置</button></div>
@@ -8818,6 +9208,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
       <div class="fi"><label class="fl">访问域名 / Host</label><div class="hint" style="margin-bottom:8px">浏览器地址栏里的域名，对应「访问域名白名单」；留空则用当前后台访问域名</div><input id="rtAccessHost" class="inp m" placeholder="例如 emby.example.com:8520"></div>
       <div class="fi"><label class="fl">来源 IP</label><input id="rtIP" class="inp m" placeholder="留空则用当前浏览器出口 IP"></div>
       <div class="fi"><label class="fl">目标上游</label><input id="rtHost" class="inp m" placeholder="例如 emby.example.com:8096"></div>
+      <div class="fi"><label class="fl">目标路径（可选）</label><input id="rtPath" class="inp m" placeholder="例如 /emby，配合「域名+路径」白名单规则测试"></div>
       <div class="fi"><label class="fl">User-Agent</label><textarea id="rtUA" class="tarea" style="min-height:70px" placeholder="粘贴客户端的 UA，例如 Infuse/7.8 (iPhone; iOS 17.0)"></textarea></div>
       <div class="acts"><button class="btn b" id="rtRun">开始测试</button><button class="btn g" id="rtFillHost">填入当前域名</button><button class="btn g" id="rtFillUA">填入本浏览器 UA</button></div>
       <div id="rtResult" style="margin-top:6px"></div>
@@ -8830,7 +9221,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">IP 黑名单</div><div class="tl-v">来源 IP 精确匹配或命中 CIDR 段</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">UA 白名单</div><div class="tl-v">客户端 UA 需包含白名单关键字，空=不限制</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">地区限制</div><div class="tl-v">开启「仅允许中国大陆 IP」时，非大陆来源被拒</div></div>
-        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">上游域名白名单</div><div class="tl-v">路径中的目标域名需匹配白名单（支持根域名），空=不限制</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">上游域名白名单</div><div class="tl-v">路径中的目标需匹配白名单（支持 域名 / *.域名 / 域名+路径 / IP:端口+路径，http(s) 前缀可省略），空=不限制</div></div>
         <div class="tl-i pass"><div class="tl-d"></div><div class="tl-n">放行转发</div><div class="tl-v">全部通过后反代到上游，并计入流量统计</div></div>
       </div>
       <div class="hint" style="margin-top:14px">顺序与真实请求、规则测试完全一致（先准入后内容、先便宜后昂贵）。例外路径（后台 /admin、监控 /health、测速 /speed、首页与静态资源）不参与此链，保证后台始终可用。被拦截的请求可在「拦截记录」页查看明细，操作变更可在「操作记录」页追溯。</div>
@@ -8939,7 +9330,7 @@ function fmtBeijing(iso, mode){
 }
 function nowBeijingDateStr(){ return fmtBeijing(new Date(), 'date'); }
 
-function reasonLabel(r){return {cn:'地区限制',whitelist:'上游域名未授权',host_ip:'IP 直连被拒',host_deny:'访问域名未授权',host:'访问域名未授权(旧)',ban:'IP 黑名单',ua:'UA 不允许',login_fail:'登录失败'}[r]||'其他拦截'}
+function reasonLabel(r){return {cn:'地区限制',whitelist:'上游域名未授权',host_ip:'IP 直连被拒',host_deny:'访问域名未授权',host:'访问域名未授权(旧)',ban:'IP 黑名单',ua:'UA 不允许',honeypot:'蜜罐路径',scan_ua:'扫描器 UA',rate:'请求过快',login_fail:'登录失败'}[r]||'其他拦截'}
 function reasonClass(r){return {cn:'pc',whitelist:'pw',host_ip:'pb',host_deny:'po',host:'pw',ban:'pb',ua:'pu',login_fail:'pb'}[r]||'pw'}
 const REASON_ORDER=['host_ip','host_deny','host','whitelist','ban','ua','cn','login_fail'];
 function renderReasonStats(counts){
@@ -9054,6 +9445,13 @@ document.addEventListener('click',e=>{const btn=e.target.closest('[data-goto]');
 
 function applyPort(p){if(!p)return;state.port=p;document.getElementById('portInput').value=p}
 
+function toggleRateFields(){
+  const on=!!document.getElementById('rateLimitOn')?.checked;
+  const box=document.getElementById('rateFields');
+  if(box)box.style.display=on?'':'none';
+}
+document.getElementById('rateLimitOn')?.addEventListener('change',toggleRateFields);
+
 async function loadConfig(){
   try{
     const r=await fetch('/admin/api/config',{cache:'no-store'});
@@ -9061,6 +9459,13 @@ async function loadConfig(){
     const c=await r.json();applyPort(c.effective_port);
     document.getElementById('chinaOnly').checked=!!c.china_only;
     const hg=document.getElementById('hostGuardOn');if(hg)hg.checked=!!c.host_guard_on;
+    const hp=document.getElementById('honeypotOn');if(hp)hp.checked=!!c.honeypot_on;
+    const sg=document.getElementById('scanGuardOn');if(sg)sg.checked=!!c.scan_guard_on;
+    const rl=document.getElementById('rateLimitOn');if(rl)rl.checked=!!c.rate_limit_on;
+    const rps=document.getElementById('ratePerSec');if(rps)rps.value=c.rate_per_sec||'';
+    const rb=document.getElementById('rateBurst');if(rb)rb.value=c.rate_burst||'';
+    const mc=document.getElementById('maxConnPerIP');if(mc)mc.value=c.max_conn_per_ip||'';
+    toggleRateFields();
     const ah=document.getElementById('allowedHosts');if(ah)ah.value=(c.allowed_hosts||[]).join('\n');
     const ch=document.getElementById('curHostHint');if(ch){const h=c.current_host||'';ch.textContent=h?('当前访问域名（请确认它已填在上方白名单）：'+h):'当前访问域名：未知';}
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');
@@ -9719,7 +10124,7 @@ async function loadBlocks(){
     const prev=document.getElementById('blkPrev'), next=document.getElementById('blkNext');
     if(prev) prev.disabled=blkState.page<=1;
     if(next) next.disabled=blkState.page>=pages;
-    if(!t.items||!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="8"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">没有匹配的拦截事件</span></div></td></tr>';return}
+    if(!t.items||!t.items.length){tb.innerHTML='<tr class="emp-row"><td colspan="9"><div class="emp"><b>暂无记录</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">没有匹配的拦截事件</span></div></td></tr>';return}
     tb.innerHTML=t.items.map(b=>{
       const ua=String(b.ua||'').trim();
       const uaShort=ua.length>60?ua.slice(0,58)+'…':ua;
@@ -9731,6 +10136,7 @@ async function loadBlocks(){
       <td data-label="拦截原因"><span class="cell-v"><span class="pill ${reasonClass(b.reason)}" title="${esc(b.reason_text||'')}">${esc(reasonLabel(b.reason))}</span></span></td>
       <td data-label="访问路径"><span class="cell-v" title="${esc(b.path)}">${esc(b.path)}</span></td>
       <td data-label="User-Agent"><span class="cell-v mono" style="font-size:12px;color:var(--t2);word-break:break-all" title="${esc(ua)}">${ua?esc(uaShort):'<span style="color:var(--t3)">—</span>'}</span></td>
+      <td data-label="消耗流量"><span class="cell-v" title="请求 ${fmtBytes(b.req_bytes||0)} / 响应 ${fmtBytes(b.resp_bytes||0)}">${(b.req_bytes||b.resp_bytes)?fmtBytes((b.req_bytes||0)+(b.resp_bytes||0)):'—'}</span></td>
       <td data-label="操作"><span class="cell-v"><button type="button" class="btn d s ban-ip-btn" data-ip="${esc(b.ip)}" style="padding:4px 8px;font-size:12px">拉黑</button></span></td>
     </tr>`}).join('');
     tb.querySelectorAll('.ip-link').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
@@ -9794,6 +10200,12 @@ function collect(){
   return{port:isNaN(raw)?0:raw,
     china_only:!!document.getElementById('chinaOnly')?.checked,
     host_guard_on:!!document.getElementById('hostGuardOn')?.checked,
+    honeypot_on:!!document.getElementById('honeypotOn')?.checked,
+    scan_guard_on:!!document.getElementById('scanGuardOn')?.checked,
+    rate_limit_on:!!document.getElementById('rateLimitOn')?.checked,
+    rate_per_sec:(parseInt(document.getElementById('ratePerSec')?.value||'',10)||0),
+    rate_burst:(parseInt(document.getElementById('rateBurst')?.value||'',10)||0),
+    max_conn_per_ip:(parseInt(document.getElementById('maxConnPerIP')?.value||'',10)||0),
     allowed_hosts:lines('allowedHosts'),
     whitelist:lines('whitelist'),
     ban_list:lines('banList'),
@@ -10272,6 +10684,7 @@ document.getElementById('rtRun')?.addEventListener('click',async()=>{
     access_host:(document.getElementById('rtAccessHost')?.value||'').trim(),
     ip:(document.getElementById('rtIP')?.value||'').trim(),
     host:(document.getElementById('rtHost')?.value||'').trim(),
+    path:(document.getElementById('rtPath')?.value||'').trim(),
     ua:(document.getElementById('rtUA')?.value||'').trim()
   };
   box.innerHTML='<div style="color:var(--t3);font-size:13px;padding:10px 0">测试中…</div>';
@@ -10287,7 +10700,7 @@ document.getElementById('rtRun')?.addEventListener('click',async()=>{
     box.innerHTML=`<div class="tl">${steps}</div>
       <div class="tl-res ${pass?'pass':'block'}">${pass?'✓ 该请求会被放行并转发':('✕ 该请求会被拦截'+reasonTxt)}</div>
       <div style="margin-top:10px;font-size:12px;color:var(--t3);word-break:break-all">
-        访问域名 ${esc(d.access_host||'—')} · 来源 ${esc(d.ip)} · 地区 ${esc(d.country_name||d.country||'—')} · 客户端归类 ${esc(d.ua_class||'—')}${adm}
+        访问域名 ${esc(d.access_host||'—')} · 来源 ${esc(d.ip)} · 地区 ${esc(d.country_name||d.country||'—')} · 客户端归类 ${esc(d.ua_class||'—')}${d.path?' · 目标路径 '+esc(d.path):''}${adm}
       </div>`;
   }catch(e){
     box.innerHTML='<div style="color:var(--d);font-size:13px;padding:10px 0">测试失败：'+esc(e.message||'')+'</div>';
