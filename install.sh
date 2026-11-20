@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="3.8.0"
+APP_VERSION="3.9.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -4187,14 +4187,9 @@ func detectSelfPublicIP() {
 	}()
 }
 
-// provinceOf 仅对中国 IP 解析省份。优先用已有 geo 缓存（30 天），
-// 缓存未命中时走现有 geoFetch（与 IP 详情相同来源），结果会写入缓存。
 func provinceOf(ipStr string) string {
 	ipStr = strings.TrimSpace(ipStr)
-	if ipStr == "" {
-		return ""
-	}
-	if countryOf(ipStr) != "CN" {
+	if ipStr == "" || countryOf(ipStr) != "CN" {
 		return ""
 	}
 	geoMu.RLock()
@@ -4203,7 +4198,6 @@ func provinceOf(ipStr string) string {
 	if ok && e.Region != "" && time.Now().Unix()-e.At < 30*86400 {
 		return normalizeProvince(e.Region)
 	}
-	// 缓存未命中：同步拉取一次（单 IP 仅一次，之后走缓存）
 	v, err, _ := geoGroup.Do(ipStr, func() (interface{}, error) {
 		geoMu.RLock()
 		cached, ok := geoMap[ipStr]
@@ -4229,35 +4223,25 @@ func provinceOf(ipStr string) string {
 	return normalizeProvince(ge.Region)
 }
 
-// normalizeProvince 把各种写法统一成短名（广东、北京、香港…）
 func normalizeProvince(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "未知"
 	}
-	// 常见英文/全称 → 短名
 	repl := map[string]string{
-		"Guangdong": "广东", "Guangdong Province": "广东",
-		"Beijing": "北京", "Beijing Shi": "北京",
-		"Shanghai": "上海", "Shanghai Shi": "上海",
-		"Tianjin": "天津", "Tianjin Shi": "天津",
-		"Chongqing": "重庆", "Chongqing Shi": "重庆",
-		"Zhejiang": "浙江", "Jiangsu": "江苏", "Shandong": "山东",
-		"Henan": "河南", "Sichuan": "四川", "Hubei": "湖北",
-		"Hunan": "湖南", "Fujian": "福建", "Anhui": "安徽",
-		"Liaoning": "辽宁", "Jilin": "吉林", "Heilongjiang": "黑龙江",
-		"Shaanxi": "陕西", "Shanxi": "山西", "Hebei": "河北",
-		"Jiangxi": "江西", "Guangxi": "广西", "Yunnan": "云南",
-		"Guizhou": "贵州", "Gansu": "甘肃", "Hainan": "海南",
-		"Qinghai": "青海", "Ningxia": "宁夏", "Xinjiang": "新疆",
-		"Tibet": "西藏", "Xizang": "西藏", "Inner Mongolia": "内蒙古",
-		"Hong Kong": "香港", "Macao": "澳门", "Macau": "澳门",
-		"Taiwan": "台湾",
+		"Guangdong": "广东", "Beijing": "北京", "Shanghai": "上海", "Tianjin": "天津",
+		"Chongqing": "重庆", "Zhejiang": "浙江", "Jiangsu": "江苏", "Shandong": "山东",
+		"Henan": "河南", "Sichuan": "四川", "Hubei": "湖北", "Hunan": "湖南",
+		"Fujian": "福建", "Anhui": "安徽", "Liaoning": "辽宁", "Jilin": "吉林",
+		"Heilongjiang": "黑龙江", "Shaanxi": "陕西", "Shanxi": "山西", "Hebei": "河北",
+		"Jiangxi": "江西", "Guangxi": "广西", "Yunnan": "云南", "Guizhou": "贵州",
+		"Gansu": "甘肃", "Hainan": "海南", "Qinghai": "青海", "Ningxia": "宁夏",
+		"Xinjiang": "新疆", "Tibet": "西藏", "Xizang": "西藏", "Inner Mongolia": "内蒙古",
+		"Hong Kong": "香港", "Macao": "澳门", "Macau": "澳门", "Taiwan": "台湾",
 	}
 	if n, ok := repl[s]; ok {
 		return n
 	}
-	// 去掉常见后缀
 	for _, suf := range []string{"省", "市", "自治区", "特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区"} {
 		if strings.HasSuffix(s, suf) {
 			s = strings.TrimSuffix(s, suf)
@@ -4739,23 +4723,44 @@ func isHoneypotPath(p string) bool {
 	return false
 }
 
-// scannerUAMarkers 是自动化扫描工具的典型 UA 片段（小写）。
-// 刻意不收录 okhttp / axios 这类被正常 App 使用的库，减少误伤。
-var scannerUAMarkers = []string{
+// hardScannerUA：确定性高的扫描工具，命中即断连并自动拉黑。
+var hardScannerUA = []string{
 	"sqlmap", "nikto", "nmap", "zgrab", "masscan", "censys", "shodan", "nuclei",
 	"acunetix", "netsparker", "appscan", "openvas", "qualys", "wpscan", "awvs",
 	"dirbuster", "gobuster", "feroxbuster", "ffuf", "dirsearch", "xray", "jaeles",
-	"python-requests", "python-urllib", "go-http-client", "libwww-perl",
-	"curl/", "wget/", "scrapy", "phantomjs", "zap/", "paros", "httpx/",
+	"libwww-perl", "scrapy", "phantomjs", "zap/", "paros", "httpx/",
 }
 
-// isScannerUA 判断 UA 是否明显来自扫描脚本；空 UA 同样判定为脚本（播放器都会带 UA）。
+// softScannerUA：可能被正常自动化使用，只断连不自动拉黑。
+var softScannerUA = []string{
+	"python-requests", "python-urllib", "go-http-client",
+	"curl/", "wget/",
+}
+
 func isScannerUA(ua string) bool {
 	ua = strings.ToLower(strings.TrimSpace(ua))
 	if ua == "" {
 		return true
 	}
-	for _, m := range scannerUAMarkers {
+	for _, m := range hardScannerUA {
+		if strings.Contains(ua, m) {
+			return true
+		}
+	}
+	for _, m := range softScannerUA {
+		if strings.Contains(ua, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldAutoBanUA(ua string) bool {
+	ua = strings.ToLower(strings.TrimSpace(ua))
+	if ua == "" {
+		return false
+	}
+	for _, m := range hardScannerUA {
 		if strings.Contains(ua, m) {
 			return true
 		}
@@ -7331,7 +7336,9 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			if guardCfg.ScanGuardOn && isScannerUA(r.UserAgent()) {
 				reqB, respB := estimateBlockedBytes(r)
 				recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "scan_ua", r.UserAgent(), r.Host, reqB, respB)
-				autoBanIP(guardIP, "扫描器 UA "+truncStr(r.UserAgent(), 60))
+				if shouldAutoBanUA(r.UserAgent()) {
+					autoBanIP(guardIP, "扫描器 UA "+truncStr(r.UserAgent(), 60))
+				}
 				dropConn(w)
 				return
 			}
@@ -11392,13 +11399,39 @@ loadConfig();
 })();
 let ovTimer=setInterval(()=>{if(!document.hidden)loadOverview()},5000);
 window.addEventListener('beforeunload',()=>clearInterval(ovTimer));
+let lastHiddenAt=0;
+const STALE_MS=60*1000;
+function refreshCurrentTab(){
+  const on=id=>document.getElementById(id)?.classList.contains('on');
+  if(on('overview')) loadOverview();
+  if(on('traffic')) loadTraffic();
+  if(on('blocks')) loadBlocks();
+  if(on('audit')) loadAudit();
+  if(on('speedm')||on('settings')) loadSpeedTokens();
+  if(on('speedm')) loadSpeedResults();
+  if(on('report')){ if(typeof loadReportPage==='function') loadReportPage(); else { typeof loadReportRecords==='function'&&loadReportRecords(); typeof loadReportQueueStat==='function'&&loadReportQueueStat(); } }
+  if(on('realtime')){
+    if(typeof realtimeWS!=='undefined' && realtimeWS){ try{realtimeWS.close()}catch(e){} }
+    if(typeof connectRealtime==='function') connectRealtime();
+  }
+}
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden){
-    loadOverview();
-    if(document.getElementById('blocks')?.classList.contains('on'))loadBlocks();
-    if(document.getElementById('audit')?.classList.contains('on'))loadAudit();
+  if(document.hidden){
+    lastHiddenAt=Date.now();
+    return;
+  }
+  const away=lastHiddenAt? Date.now()-lastHiddenAt : 0;
+  lastHiddenAt=0;
+  if(away>=STALE_MS){
+    refreshCurrentTab();
+  }else{
+    const on=id=>document.getElementById(id)?.classList.contains('on');
+    if(on('overview')) loadOverview();
+    if(on('blocks')) loadBlocks();
+    if(on('audit')) loadAudit();
   }
 });
+window.addEventListener('pageshow',e=>{ if(e.persisted) refreshCurrentTab(); });
 </script>
 </body>
 </html>
