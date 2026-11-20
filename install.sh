@@ -1445,6 +1445,7 @@ type DayStat struct {
 	BlockedBan    int64            `json:"blocked_ban"`
 	BlockedUA     int64            `json:"blocked_ua"`
 	Countries     map[string]int64 `json:"countries,omitempty"`
+	Provinces     map[string]int64 `json:"provinces,omitempty"`
 	IPs           map[string]int64 `json:"ips,omitempty"`
 	IPBytes       map[string]int64 `json:"ip_bytes,omitempty"`
 	IPUpBytes     map[string]int64 `json:"ip_up_bytes,omitempty"`
@@ -1471,6 +1472,7 @@ func uaRawKey(ua string) string {
 func newDayStat() *DayStat {
 	return &DayStat{
 		Countries:     map[string]int64{},
+		Provinces:     map[string]int64{},
 		IPs:           map[string]int64{},
 		IPBytes:       map[string]int64{},
 		IPUpBytes:     map[string]int64{},
@@ -1488,6 +1490,9 @@ func newDayStat() *DayStat {
 func ensureDayMaps(d *DayStat) {
 	if d.Countries == nil {
 		d.Countries = map[string]int64{}
+	}
+	if d.Provinces == nil {
+		d.Provinces = map[string]int64{}
 	}
 	if d.IPs == nil {
 		d.IPs = map[string]int64{}
@@ -3655,6 +3660,7 @@ func pruneStatsLocked() {
 		pruneTopN(day.IPDownBytes, 500)
 		pruneTopN(day.Hosts, 300)
 		pruneTopN(day.Countries, 200)
+		pruneTopN(day.Provinces, 50)
 	}
 	if len(stats.Audit) > maxAuditEvents {
 		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
@@ -3690,6 +3696,13 @@ func startStatsWorker() {
 				d := dayOf(t)
 				d.Requests++
 				d.Countries[c]++
+				if c == "CN" && ev.IP != "" {
+					prov := provinceOf(ev.IP)
+					if prov == "" {
+						prov = "未知"
+					}
+					d.Provinces[prov]++
+				}
 				if ev.IP != "" {
 					d.IPs[ev.IP]++
 				}
@@ -4172,6 +4185,89 @@ func detectSelfPublicIP() {
 			}
 		}
 	}()
+}
+
+// provinceOf 仅对中国 IP 解析省份。优先用已有 geo 缓存（30 天），
+// 缓存未命中时走现有 geoFetch（与 IP 详情相同来源），结果会写入缓存。
+func provinceOf(ipStr string) string {
+	ipStr = strings.TrimSpace(ipStr)
+	if ipStr == "" {
+		return ""
+	}
+	if countryOf(ipStr) != "CN" {
+		return ""
+	}
+	geoMu.RLock()
+	e, ok := geoMap[ipStr]
+	geoMu.RUnlock()
+	if ok && e.Region != "" && time.Now().Unix()-e.At < 30*86400 {
+		return normalizeProvince(e.Region)
+	}
+	// 缓存未命中：同步拉取一次（单 IP 仅一次，之后走缓存）
+	v, err, _ := geoGroup.Do(ipStr, func() (interface{}, error) {
+		geoMu.RLock()
+		cached, ok := geoMap[ipStr]
+		geoMu.RUnlock()
+		if ok && cached.Region != "" && time.Now().Unix()-cached.At < 30*86400 {
+			return cached, nil
+		}
+		ge, err := geoFetch(ipStr)
+		if err == nil {
+			geoMu.Lock()
+			geoMap[ipStr] = ge
+			geoMu.Unlock()
+		}
+		return ge, err
+	})
+	if err != nil {
+		return "未知"
+	}
+	ge, _ := v.(geoEntry)
+	if ge.Region == "" {
+		return "未知"
+	}
+	return normalizeProvince(ge.Region)
+}
+
+// normalizeProvince 把各种写法统一成短名（广东、北京、香港…）
+func normalizeProvince(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "未知"
+	}
+	// 常见英文/全称 → 短名
+	repl := map[string]string{
+		"Guangdong": "广东", "Guangdong Province": "广东",
+		"Beijing": "北京", "Beijing Shi": "北京",
+		"Shanghai": "上海", "Shanghai Shi": "上海",
+		"Tianjin": "天津", "Tianjin Shi": "天津",
+		"Chongqing": "重庆", "Chongqing Shi": "重庆",
+		"Zhejiang": "浙江", "Jiangsu": "江苏", "Shandong": "山东",
+		"Henan": "河南", "Sichuan": "四川", "Hubei": "湖北",
+		"Hunan": "湖南", "Fujian": "福建", "Anhui": "安徽",
+		"Liaoning": "辽宁", "Jilin": "吉林", "Heilongjiang": "黑龙江",
+		"Shaanxi": "陕西", "Shanxi": "山西", "Hebei": "河北",
+		"Jiangxi": "江西", "Guangxi": "广西", "Yunnan": "云南",
+		"Guizhou": "贵州", "Gansu": "甘肃", "Hainan": "海南",
+		"Qinghai": "青海", "Ningxia": "宁夏", "Xinjiang": "新疆",
+		"Tibet": "西藏", "Xizang": "西藏", "Inner Mongolia": "内蒙古",
+		"Hong Kong": "香港", "Macao": "澳门", "Macau": "澳门",
+		"Taiwan": "台湾",
+	}
+	if n, ok := repl[s]; ok {
+		return n
+	}
+	// 去掉常见后缀
+	for _, suf := range []string{"省", "市", "自治区", "特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区"} {
+		if strings.HasSuffix(s, suf) {
+			s = strings.TrimSuffix(s, suf)
+			break
+		}
+	}
+	if s == "" {
+		return "未知"
+	}
+	return s
 }
 
 func countryOf(ipStr string) string {
@@ -6265,6 +6361,7 @@ func adminHandler() http.HandlerFunc {
 			Hosts         map[string]int64 `json:"hosts,omitempty"`
 			IPs           map[string]int64 `json:"ips,omitempty"`
 			Countries     map[string]int64 `json:"countries,omitempty"`
+			Provinces     map[string]int64 `json:"provinces,omitempty"`
 			UAClass       map[string]int64 `json:"ua_class,omitempty"`
 			UARaw         map[string]int64 `json:"ua_raw,omitempty"`
 		}
@@ -6300,6 +6397,7 @@ func adminHandler() http.HandlerFunc {
 				Hosts:         topNMap(d.Hosts, 50),
 				IPs:           topNMap(d.IPs, 100),
 				Countries:     topNMap(d.Countries, 50),
+				Provinces:     topNMap(d.Provinces, 50),
 				UAClass:       topNMap(d.UAClass, 30),
 				UARaw:         topNMap(d.UARaw, 20),
 			})
@@ -7463,6 +7561,7 @@ func cloneDayStat(d *DayStat) *DayStat {
 	}
 	n := *d
 	n.Countries = cloneInt64Map(d.Countries)
+	n.Provinces = cloneInt64Map(d.Provinces)
 	n.IPs = cloneInt64Map(d.IPs)
 	n.IPBytes = cloneInt64Map(d.IPBytes)
 	n.IPUpBytes = cloneInt64Map(d.IPUpBytes)
@@ -10117,7 +10216,7 @@ function buildTrafficView(trend){
   const {from,to}=dateRangeBounds();
   const isToday = !!from && from === to;
   const labels=[],reqs=[],bytes=[],ups=[],downs=[];
-  const ipMap={},ctryMap={},hostMap={},uaMap={},uaRawMap={};
+  const ipMap={},ctryMap={},provMap={},hostMap={},uaMap={},uaRawMap={};
   let totalReq=0,totalBytes=0,totalUp=0,totalDown=0,blocked=0,rawDayCount=0,gran='hour';
   filtered.forEach(d=>{
     totalReq+=d.requests||0; totalBytes+=d.bytes||0;
@@ -10125,6 +10224,7 @@ function buildTrafficView(trend){
     blocked+=(d.blocked!=null)?d.blocked:((d.blocked_cn||0)+(d.blocked_whitelist||0));
     Object.entries(d.ips||{}).forEach(([k,v])=>{ipMap[k]=(ipMap[k]||0)+v});
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
+    Object.entries(d.provinces||{}).forEach(([k,v])=>{provMap[k]=(provMap[k]||0)+v});
     Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
     Object.entries(d.ua_class||{}).forEach(([k,v])=>{uaMap[k]=(uaMap[k]||0)+v});
     Object.entries(d.ua_raw||{}).forEach(([k,v])=>{uaRawMap[k]=(uaRawMap[k]||0)+v});
@@ -10180,7 +10280,7 @@ function buildTrafficView(trend){
   const ipMapTrim={}, ctryMapTrim={};
   ipEntries.slice(0,ipTopN).forEach(([k,v])=>{ipMapTrim[k]=v});
   ctryEntries.slice(0,ctryTopN).forEach(([k,v])=>{ctryMapTrim[k]=v});
-  return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN,uaMap,uaRawMap,days:filtered};
+  return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,provMap,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN,uaMap,uaRawMap,days:filtered};
 }
 function applyTrafficView(){
   const v=buildTrafficView(trafficTrendData);
@@ -10210,7 +10310,7 @@ function applyTrafficView(){
   if(state.ipUpBytes) for(const k in state.ipUpBytes) ipBytesMap[k]=(ipBytesMap[k]||0)+state.ipUpBytes[k];
   if(state.ipDownBytes) for(const k in state.ipDownBytes) ipBytesMap[k]=(ipBytesMap[k]||0)+state.ipDownBytes[k];
   renderIP(v.ipMap,ipBytesMap,v.ipTotalUnique,v.ipTopN);
-  renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN);
+  renderRegion(v.ctryMap,v.ctryTotalUnique,v.ctryTopN,v.provMap);
   renderUADist(v.uaMap,v.uaRawMap);
   renderHourHeat(v.days);
 }
@@ -10321,19 +10421,42 @@ function renderIP(map,bytesMap,totalUnique,topN){
   box.innerHTML=html;
   box.querySelectorAll('.ip-row').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
 }
-function renderRegion(map,totalUnique,topN){
+function renderRegion(map,totalUnique,topN,provMap){
   topN=topN||20;
   const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
   const box=document.getElementById('regionDist');
   if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有地区记录</span></div>';return}
   const total=rows.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;
   const more=(totalUnique||rows.length)>rows.length;
+  const hasProv=provMap&&Object.keys(provMap).length>0;
   let html=rows.map(([code,n])=>{
     const nm=countryLabel(code);
-    return `<div class="dr"><span class="dn" title="${nm}"><img class="flg" src="/admin/api/flag/${code.toLowerCase()}" onerror="this.style.display='none'"> <span class="tx">${nm}</span></span><div class="bar t"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
+    const isCN=code==='CN'&&hasProv;
+    const clickable=isCN?' style="cursor:pointer" title="点击展开/收起省份统计" data-cn="1"':'';
+    const arrow=isCN?' <span class="cn-arrow" style="font-size:11px;color:var(--t3);margin-left:4px">▸</span>':'';
+    return `<div class="dr"${clickable}><span class="dn" title="${nm}"><img class="flg" src="/admin/api/flag/${code.toLowerCase()}" onerror="this.style.display='none'"> <span class="tx">${nm}</span>${arrow}</span><div class="bar t"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
   }).join('');
+  if(hasProv){
+    const pRows=Object.entries(provMap).sort((a,b)=>b[1]-a[1]);
+    const pMax=pRows[0]?pRows[0][1]:1;
+    const pTotal=pRows.reduce((s,r)=>s+r[1],0)||1;
+    html+=`<div class="prov-box" style="display:none;margin:6px 0 10px 28px;padding:8px 12px;background:var(--panel);border-radius:10px;border:1px solid var(--bd)">
+      <div style="font-size:12px;color:var(--t3);margin-bottom:6px">中国 · 省份分布（当前范围）</div>
+      ${pRows.map(([name,n])=>`<div class="dr" style="padding:4px 0"><span class="dn"><span class="tx" style="font-size:13px">${esc(name)}</span></span><div class="bar t"><i style="width:${(n/pMax*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/pTotal*100).toFixed(0)}%</span></span></div>`).join('')}
+    </div>`;
+  }
   if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个地区</div>`;
   box.innerHTML=html;
+  const cnRow=box.querySelector('[data-cn="1"]');
+  const provBox=box.querySelector('.prov-box');
+  if(cnRow&&provBox){
+    cnRow.addEventListener('click',()=>{
+      const open=provBox.style.display!=='none';
+      provBox.style.display=open?'none':'block';
+      const arrow=cnRow.querySelector('.cn-arrow');
+      if(arrow) arrow.textContent=open?'▸':'▾';
+    });
+  }
 }
 
 function renderUADist(map,rawMap){
