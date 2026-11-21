@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.1.0"
+APP_VERSION="4.2.1"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -274,7 +274,8 @@ package main
 // 数据路径（v4.0 起）：
 //   - 纯转发。httputil.ReverseProxy 直接写回客户端，
 //     不再用 countingReader / countingWriter 逐块计数。
-//   - 实时网速改为读 /proc/net/dev 网卡累计字节，按秒差分。
+//   - 实时网速优先用 iptables 对监听端口做内核级计数（只统计本服务端口，
+//     不进转发路径）；无 iptables 时回退 /proc/net/dev 整机网卡，按秒差分。
 //
 // 访问控制（判定链，命中即拒绝）：
 //   ① IP 黑名单
@@ -317,6 +318,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -869,31 +871,103 @@ func resolveTargetIPs(ctx context.Context, target *url.URL) (*targetResolution, 
 	}
 
 	allowLoopback := strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost")
-	answers, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	cacheKey := strings.ToLower(host)
+	if cached, ok := lookupDNSCache(cacheKey); ok {
+		return &targetResolution{host: cacheKey, ips: cached}, nil
+	}
+	// v4.1.1 修复"反代会卡"：缓存过期瞬间并发请求不再各自阻塞在 DNS 上
+	//（singleflight 合并为一次查询）；解析失败时回退到已过期的旧结果，
+	// DNS 抖动/故障期间反代仍可继续转发，不会整体卡死。
+	ipsV, err, _ := dnsGroup.Do(cacheKey, func() (interface{}, error) {
+		answers, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			if stale, ok := lookupDNSCacheStale(cacheKey); ok {
+				// 续期旧结果：DNS 故障期间不必每个缓存周期都重复等待解析超时。
+				storeDNSCache(cacheKey, stale)
+				return stale, nil
+			}
+			return nil, fmt.Errorf("上游域名解析失败: %w", err)
+		}
+		if len(answers) == 0 {
+			return nil, fmt.Errorf("上游域名没有可用 IP")
+		}
+		ips := make([]net.IP, 0, len(answers))
+		seen := make(map[string]struct{}, len(answers))
+		for _, answer := range answers {
+			ip := answer.IP
+			if isUnsafeResolvedIP(ip, allowLoopback) {
+				return nil, fmt.Errorf("上游域名解析到不允许的特殊 IP")
+			}
+			key := ip.String()
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			ips = append(ips, append(net.IP(nil), ip...))
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("上游域名没有可用 IP")
+		}
+		storeDNSCache(cacheKey, ips)
+		return ips, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("上游域名解析失败: %w", err)
+		return nil, err
 	}
-	if len(answers) == 0 {
-		return nil, fmt.Errorf("上游域名没有可用 IP")
+	ips, _ := ipsV.([]net.IP)
+	return &targetResolution{host: cacheKey, ips: ips}, nil
+}
+
+type dnsCacheEntry struct {
+	ips []net.IP
+	exp time.Time
+}
+
+var (
+	dnsCacheMu sync.Mutex
+	dnsCache   = map[string]dnsCacheEntry{}
+	dnsGroup   singleflight.Group
+)
+
+func lookupDNSCache(host string) ([]net.IP, bool) {
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	e, ok := dnsCache[host]
+	if !ok || time.Now().After(e.exp) {
+		return nil, false
 	}
-	ips := make([]net.IP, 0, len(answers))
-	seen := make(map[string]struct{}, len(answers))
-	for _, answer := range answers {
-		ip := answer.IP
-		if isUnsafeResolvedIP(ip, allowLoopback) {
-			return nil, fmt.Errorf("上游域名解析到不允许的特殊 IP")
+	// v4.1.2 优化：缓存内容只在 storeDNSCache 时整体替换、调用方只读不写，
+	// 直接返回引用，省去每个请求一次的 IP 切片拷贝。
+	return e.ips, true
+}
+
+// lookupDNSCacheStale 忽略过期时间取缓存结果，仅在 DNS 解析失败时兜底使用。
+func lookupDNSCacheStale(host string) ([]net.IP, bool) {
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	e, ok := dnsCache[host]
+	if !ok || len(e.ips) == 0 {
+		return nil, false
+	}
+	return e.ips, true
+}
+
+func storeDNSCache(host string, ips []net.IP) {
+	cp := make([]net.IP, len(ips))
+	for i, ip := range ips {
+		cp[i] = append(net.IP(nil), ip...)
+	}
+	dnsCacheMu.Lock()
+	dnsCache[host] = dnsCacheEntry{ips: cp, exp: time.Now().Add(300 * time.Second)}
+	if len(dnsCache) > 256 {
+		now := time.Now()
+		for k, v := range dnsCache {
+			if now.After(v.exp) {
+				delete(dnsCache, k)
+			}
 		}
-		key := ip.String()
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		ips = append(ips, append(net.IP(nil), ip...))
 	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("上游域名没有可用 IP")
-	}
-	return &targetResolution{host: strings.ToLower(host), ips: ips}, nil
+	dnsCacheMu.Unlock()
 }
 
 // dialPinned 只拨号到本次请求预先校验过的 DNS 结果，避免解析校验与实际连接之间
@@ -1015,9 +1089,11 @@ func currentCfg() *Config {
 }
 
 type compiledACL struct {
-	exactBan  map[string]struct{}
-	cidrs     []*net.IPNet
-	uaNeedles []string
+	exactBan   map[string]struct{}
+	cidrs      []*net.IPNet
+	uaNeedles  []string // 已转小写的 UA 关键字
+	uaKeywords []string // 原始关键字（展示用），与 uaNeedles 一一对应
+	whitelist  []whitelistEntry // 预编译的上游白名单，避免每请求重复解析规则字符串
 }
 
 var aclPtr atomic.Pointer[compiledACL]
@@ -1044,9 +1120,16 @@ func rebuildACL(c *Config) {
 		a.exactBan[b] = struct{}{}
 	}
 	for _, u := range c.AllowedUAs {
-		u = strings.ToLower(strings.TrimSpace(u))
-		if u != "" {
-			a.uaNeedles = append(a.uaNeedles, u)
+		k := strings.TrimSpace(u)
+		if k == "" {
+			continue
+		}
+		a.uaKeywords = append(a.uaKeywords, k)
+		a.uaNeedles = append(a.uaNeedles, strings.ToLower(k))
+	}
+	for _, wl := range c.Whitelist {
+		if e, ok := parseWhitelistEntry(wl); ok {
+			a.whitelist = append(a.whitelist, e)
 		}
 	}
 	aclPtr.Store(a)
@@ -1099,16 +1182,32 @@ func isBannedIP(ipStr string, clientIP net.IP) bool {
 }
 
 func uaWhitelistKeyword(ua string) string {
-	for _, u := range currentCfg().AllowedUAs {
-		k := strings.TrimSpace(u)
-		if k == "" {
-			continue
-		}
-		if strings.Contains(strings.ToLower(ua), strings.ToLower(k)) {
-			return k
+	a := currentACL()
+	if len(a.uaNeedles) == 0 {
+		return ""
+	}
+	// v4.1.2 优化：UA 只转一次小写，关键字用 ACL 里已转好的，不再每关键字重复 ToLower。
+	low := strings.ToLower(ua)
+	for i, n := range a.uaNeedles {
+		if strings.Contains(low, n) {
+			return a.uaKeywords[i]
 		}
 	}
 	return ""
+}
+
+// matchWhitelist 用 rebuildACL 预编译的白名单条目匹配目标。
+// 语义与 whitelistMatchPath 完全一致，只是省去每请求的规则字符串解析开销。
+func (a *compiledACL) matchWhitelist(targetHost, targetPath string) bool {
+	if len(a.whitelist) == 0 {
+		return true
+	}
+	for _, e := range a.whitelist {
+		if whitelistEntryMatch(e, targetHost, targetPath) {
+			return true
+		}
+	}
+	return false
 }
 
 func uaClassOfEx(ua string) string {
@@ -1730,8 +1829,8 @@ func snapshotIPRates() map[string][2]int64 {
 	return out
 }
 
-// countingReader 统计请求体（客户端→上游）字节，计入上行。
-// 只用于 pr.Out.Body，不要用于响应体，响应体由 countingWriter 按下行计，避免双计。
+// countingReader 统计请求体（客户端→本进程）字节，计入下行（接收）。
+// 只用于转发到上游的请求体，不要用于响应体。
 type countingReader struct {
 	r  io.Reader
 	rb *reqBytes
@@ -1749,7 +1848,21 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// countingWriter 统计响应体（上游→客户端）字节，计入下行。
+// countingReadCloser 在计数的同时保留 Close，避免上游连接泄漏。
+type countingReadCloser struct {
+	r countingReader
+	c io.Closer
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *countingReadCloser) Close() error {
+	if c.c != nil {
+		return c.c.Close()
+	}
+	return nil
+}
+
+// countingWriter 统计响应体（本进程→客户端）字节，计入上行（发送）。
 // 实现 Hijack / Unwrap，让 WebSocket 等协议升级能透传；
 // 升级后的裸 TCP 双向 copy 由 ReverseProxy 接管，不计流量。
 type countingWriter struct {
@@ -1944,13 +2057,181 @@ func accumulateNIC(dRx, dTx int64) {
 	statsMu.Unlock()
 }
 
+// portAcct 用 iptables/ip6tables 对监听端口做内核级字节计数。
+// 不进入 Go 转发路径，不影响播放流畅度。仅统计进出该端口的 TCP 流量。
+var (
+	portAcctMu   sync.Mutex
+	portAcctPort int
+	portAcctOK   atomic.Bool
+)
+
+func iptablesCmd(bin string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	return cmd.Run()
+}
+
+func iptablesOut(bin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	b, err := cmd.Output()
+	return string(b), err
+}
+
+func ensureAcctChain(bin, chain, match string) {
+	_ = iptablesCmd(bin, "-N", chain)
+	_ = iptablesCmd(bin, "-F", chain)
+	_ = iptablesCmd(bin, "-A", chain, "-p", "tcp", match)
+	// 跳转规则：先删旧的再插，避免重复。
+	_ = iptablesCmd(bin, "-D", chainParent(chain), "-p", "tcp", match, "-j", chain)
+	_ = iptablesCmd(bin, "-I", chainParent(chain), "-p", "tcp", match, "-j", chain)
+}
+
+func chainParent(chain string) string {
+	if strings.HasSuffix(chain, "_OUT") {
+		return "OUTPUT"
+	}
+	return "INPUT"
+}
+
+func removePortJump(bin string, port int) {
+	if port <= 0 {
+		return
+	}
+	dport := fmt.Sprintf("--dport=%d", port)
+	sport := fmt.Sprintf("--sport=%d", port)
+	_ = iptablesCmd(bin, "-D", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-D", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT")
+}
+
+// removeAllPortJumps 移除 INPUT/OUTPUT 中所有跳转到 EMBY_PROXY_IN/OUT 的规则。
+// 用于启动时清理异常退出（kill -9 / 崩溃）残留的旧端口跳转规则。
+func removeAllPortJumps(bin string) {
+	for _, dir := range []string{"INPUT", "OUTPUT"} {
+		chain := "EMBY_PROXY_IN"
+		if dir == "OUTPUT" {
+			chain = "EMBY_PROXY_OUT"
+		}
+		out, err := iptablesOut(bin, "-S", dir)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasSuffix(line, "-j "+chain) {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 3 || fields[0] != "-A" {
+				continue
+			}
+			// 按 -S 输出的原始参数重建 -D 规则，保证精确删除
+			_ = iptablesCmd(bin, append([]string{"-D", dir}, fields[1:]...)...)
+		}
+	}
+}
+
+func setupPortAcct(port int) {
+	if port <= 0 {
+		return
+	}
+	portAcctMu.Lock()
+	defer portAcctMu.Unlock()
+	if portAcctPort == port && portAcctOK.Load() {
+		return
+	}
+	dport := fmt.Sprintf("--dport=%d", port)
+	sport := fmt.Sprintf("--sport=%d", port)
+	ok := false
+	for _, bin := range []string{"iptables", "ip6tables"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			continue
+		}
+		// v4.2.0: 先清掉所有指向计数链的跳转规则（含 kill -9 等异常退出残留的旧端口规则），
+		// 避免残留堆积；随后再插入本端口的跳转。
+		removeAllPortJumps(bin)
+		ensureAcctChain(bin, "EMBY_PROXY_IN", dport)
+		ensureAcctChain(bin, "EMBY_PROXY_OUT", sport)
+		// v4.2.0: 用 -C 验证跳转规则确实插入成功（无权限/容器环境会静默失败），
+		// 失败则整体回退网卡统计，避免计数恒为 0 还被当作"端口模式"。
+		if iptablesCmd(bin, "-C", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN") == nil &&
+			iptablesCmd(bin, "-C", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT") == nil {
+			ok = true
+		}
+	}
+	portAcctPort = port
+	portAcctOK.Store(ok)
+	if ok {
+		log.Printf("[acct] 已对监听端口 %d 启用 iptables 流量计数（仅本端口，不影响转发）", port)
+	} else {
+		log.Printf("[acct] 未找到 iptables，流量统计回退为整机网卡")
+	}
+}
+
+func parseIptablesBytes(out string) int64 {
+	var total int64
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// 计数行形如: pkts bytes target ...  或  pkts bytes  tcp ...
+		if _, err := strconv.ParseInt(fields[0], 10, 64); err != nil {
+			continue
+		}
+		n, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		total += n
+	}
+	return total
+}
+
+func readPortAcctBytes() (rx, tx int64, ok bool) {
+	if !portAcctOK.Load() {
+		return 0, 0, false
+	}
+	for _, bin := range []string{"iptables", "ip6tables"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			continue
+		}
+		in, err1 := iptablesOut(bin, "-L", "EMBY_PROXY_IN", "-v", "-n", "-x")
+		out, err2 := iptablesOut(bin, "-L", "EMBY_PROXY_OUT", "-v", "-n", "-x")
+		if err1 != nil && err2 != nil {
+			continue
+		}
+		rx += parseIptablesBytes(in)
+		tx += parseIptablesBytes(out)
+		ok = true
+	}
+	return rx, tx, ok
+}
+
+// cleanupPortAcct 退出时移除 iptables 跳转规则（计数链本身保留，无副作用）。
+func cleanupPortAcct() {
+	for _, bin := range []string{"iptables", "ip6tables"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			continue
+		}
+		removePortJump(bin, portAcctPort)
+	}
+}
+
 func startNetSpeedSampler() {
 	go func() {
 		var lastRx, lastTx int64
 		var lastT time.Time
-		// 始终按秒采样：既更新实时速率，也把增量计入分时/今日/总计。
+		// v4.2.0: 优先用 iptables 端口计数，只统计本服务监听端口的流量；
+		// 没有 iptables 或规则未生效时回退读 /proc/net/dev 整机网卡。
+		// 两种模式都不在 Go 转发路径上做任何计数，保持纯转发 0 修改。
 		for {
-			rx, tx := readNetDevBytes()
+			rx, tx, portOK := readPortAcctBytes()
+			if !portOK {
+				rx, tx = readNetDevBytes()
+			}
 			now := time.Now()
 			if !lastT.IsZero() {
 				dt := now.Sub(lastT).Seconds()
@@ -3560,79 +3841,105 @@ async function pingTest(){
   const times=[];
   for(let i=0;i<4;i++){
     const t0=performance.now();
-    await fetch(DL+'?size=1',{cache:'no-store'});
-    times.push(performance.now()-t0);
+    const ac=new AbortController();
+    const to=setTimeout(()=>ac.abort(), 3000);
+    try{
+      await fetch(DL+'?size=1&t='+Math.random(),{cache:'no-store',signal:ac.signal});
+      times.push(performance.now()-t0);
+    }catch(e){
+      if(e.name!=='AbortError') throw e;
+      times.push(3000);
+    }finally{ clearTimeout(to); }
   }
   times.sort((a,b)=>a-b);
-  return {ping:Math.round(times[0]), jit:Math.round(times[2]-times[0])};
+  return {ping:Math.round(times[0]), jit:Math.round(Math.max(0, times[2]-times[0]))};
 }
 async function downTest(seconds){
   const deadline=performance.now()+seconds*1000;
   let bytes=0, winBytes=0, winT0=performance.now(), live=0, peak=0, downErr=null;
-  const pump=async(id)=>{
+  const ac=new AbortController();
+  const hardStop=setTimeout(()=>ac.abort(), seconds*1000+800);
+  try{
     while(performance.now()<deadline){
       try{
-        const resp=await fetch(DL+'?size=1024&t='+Math.random(),{cache:'no-store'});
+        const resp=await fetch(DL+'?size=32&t='+Math.random(),{cache:'no-store',signal:ac.signal});
         if(!resp.ok) throw new Error('数据流 HTTP '+resp.status);
         const rd=resp.body.getReader();
         for(;;){
+          if(performance.now()>=deadline){ try{rd.cancel()}catch(e){} ac.abort(); break; }
           const {done,value}=await rd.read();
           if(done)break;
           bytes+=value.byteLength; winBytes+=value.byteLength;
           const dt=performance.now()-winT0;
-          if(dt>=500){
+          if(dt>=400){
             live=winBytes*8/(dt/1000)/1e6;
             peak=Math.max(peak,live); setGauge(live);
             winBytes=0; winT0=performance.now();
           }
         }
+        if(performance.now()>=deadline) break;
       }catch(e){
+        if(e.name==='AbortError') break;
         if(!downErr) downErr=e.message||'网络错误';
         break;
       }
     }
-  };
-  await pump(1);
+  }finally{
+    clearTimeout(hardStop);
+    try{ac.abort()}catch(e){}
+  }
   if(bytes===0){
     const msg=downErr||'未收到数据';
     if(/410/.test(msg)) throw new Error('链接已失效，请重新生成测速链接');
     throw new Error(msg);
   }
-  const secs=(performance.now()-(deadline-seconds*1000))/1000;
+  const secs=Math.min(seconds, (performance.now()-(deadline-seconds*1000))/1000);
   return {mbps:bytes*8/secs/1e6, peak};
 }
 
 async function upTest(seconds){
   const t0=performance.now(), deadline=t0+seconds*1000;
-  const chunk=new Uint8Array(8*1048576);
+  const chunk=new Uint8Array(2*1048576);
   for(let off=0;off<chunk.length;off+=65536){
     crypto.getRandomValues(chunk.subarray(off,Math.min(off+65536,chunk.length)));
   }
-  let upErr=null, done=false, total=0;
-  const send=()=>{
-    return new Promise((res)=>{
-      const xhr=new XMLHttpRequest();
-      xhr._last=0;
-      xhr.open('POST','/speed/'+TOKEN+'/up');
-      xhr.setRequestHeader('Content-Type','application/octet-stream');
-      xhr.upload.onprogress=e=>{ total+=e.loaded-xhr._last; xhr._last=e.loaded; };
-      const fin=()=>{ xhr._last=0; res(); };
-      xhr.onload=fin; xhr.onerror=fin; xhr.ontimeout=fin; xhr.onabort=fin;
-      xhr.send(chunk);
-    });
-  };
+  let upErr=null, total=0, stopped=false;
+  const active=[];
+  const send=()=>new Promise((res)=>{
+    if(stopped || performance.now()>=deadline){ res(); return; }
+    const xhr=new XMLHttpRequest();
+    xhr._last=0;
+    xhr.timeout=seconds*1000+2000;
+    xhr.open('POST','/speed/'+TOKEN+'/up');
+    xhr.setRequestHeader('Content-Type','application/octet-stream');
+    xhr.upload.onprogress=e=>{
+      total+=e.loaded-xhr._last; xhr._last=e.loaded;
+      if(performance.now()>=deadline){ try{xhr.abort()}catch(e){} }
+    };
+    const fin=()=>{ xhr._last=0; res(); };
+    xhr.onload=fin; xhr.onerror=fin; xhr.ontimeout=fin; xhr.onabort=fin;
+    active.push(xhr);
+    xhr.send(chunk);
+  });
   const worker=async()=>{
-    while(!done && !upErr && performance.now()<deadline){
+    while(!stopped && !upErr && performance.now()<deadline){
       try{ await send(); }catch(e){ if(!upErr)upErr=e.message||'网络错误'; }
+      if(performance.now()>=deadline) break;
     }
   };
   const meter=setInterval(()=>{
     const el=(performance.now()-t0)/1000;
     if(el>0) setGauge(total*8/el/1e6);
-  },250);
+    if(performance.now()>=deadline && !stopped){
+      stopped=true;
+      active.forEach(x=>{ try{x.abort()}catch(e){} });
+    }
+  },200);
   await worker();
-  done=true; clearInterval(meter);
-  const secs=(performance.now()-t0)/1000;
+  stopped=true;
+  active.forEach(x=>{ try{x.abort()}catch(e){} });
+  clearInterval(meter);
+  const secs=Math.min(seconds, (performance.now()-t0)/1000);
   if(total===0){
     const msg=upErr||'未发出数据';
     if(/410/.test(msg)) throw new Error('链接已失效，请重新生成测速链接');
@@ -3645,35 +3952,51 @@ $('go').addEventListener('click',async()=>{
   $('go').disabled=true; $('done').style.display='none';
   $('gauge').style.display=''; $('phase').style.display=''; $('sub').style.display='';
   $('gbar').style.stroke='var(--p)';
+  const OVERALL_MS = 28000; // 总超时：延迟+下载+上传 合计不超过 28 秒
+  let overallTimer=null, aborted=false;
+  const overallAc=new AbortController();
   try{
-    $('phase').textContent='正在测延迟…'; $('sub').textContent=''; setGauge(0);
-    const {ping,jit}=await pingTest();
-    $('phase').textContent='正在测下载…'; $('sub').textContent='单线程下载测试，约 10 秒';
-    const t0=performance.now();
-    const timer=setInterval(()=>{
-      const el=(performance.now()-t0)/1000;
-      $('sub').textContent='已进行 '+Math.min(10,el).toFixed(0)+' 秒 / 10 秒';
-    },250);
-    const {mbps}=await downTest(10);
-    clearInterval(timer);
-    setGauge(mbps);
-    $('phase').textContent='正在测上传…'; $('sub').textContent='单线程上传测试，约 8 秒';
-    const {mbps:upMbps}=await upTest(8);
-    const [gc,gt]=grade(mbps);
-    $('gbar').style.stroke=gc==='g-g'?'var(--ok)':gc==='g-m'?'#f59e0b':'var(--d)';
-    $('phase').innerHTML='测速完成 <span class="grade '+gc+'">'+gt+'</span>';
-    $('sub').textContent='';
-    try{ await fetch('/speed/'+TOKEN+'/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:ping,jitter:jit,down:mbps,up:upMbps})}); }catch(e){}
-    $('gauge').style.display='none'; $('phase').style.display='none'; $('sub').style.display='none';
-    $('dGrade').className='grade '+gc; $('dGrade').textContent=gt;
-    const fmt=v=>v>=100?Math.round(v).toString():v.toFixed(2);
-    $('sDown').textContent=fmt(mbps); $('sUp').textContent=fmt(upMbps);
-    $('sPing').textContent=Math.round(ping); $('sJit').textContent=Math.round(jit);
-    $('done').style.display='block';
+    const overallPromise=new Promise((_,rej)=>{
+      overallTimer=setTimeout(()=>{ aborted=true; overallAc.abort(); rej(new Error('测速超时（超过 28 秒），已自动停止')); }, OVERALL_MS);
+    });
+    const run=async()=>{
+      $('phase').textContent='正在测延迟…'; $('sub').textContent='最多 3 秒'; setGauge(0);
+      const {ping,jit}=await pingTest();
+      if(aborted) throw new Error('已超时');
+      $('phase').textContent='正在测下载…'; $('sub').textContent='单线程下载，最多 10 秒';
+      const t0=performance.now();
+      const timer=setInterval(()=>{
+        const el=(performance.now()-t0)/1000;
+        $('sub').textContent='已进行 '+Math.min(10,el).toFixed(0)+' 秒 / 最多 10 秒';
+      },250);
+      let mbps=0;
+      try{ const r=await downTest(10); mbps=r.mbps; }finally{ clearInterval(timer); }
+      if(aborted) throw new Error('已超时');
+      setGauge(mbps);
+      $('phase').textContent='正在测上传…'; $('sub').textContent='单线程上传，最多 8 秒';
+      const {mbps:upMbps}=await upTest(8);
+      if(aborted) throw new Error('已超时');
+      const [gc,gt]=grade(mbps);
+      $('gbar').style.stroke=gc==='g-g'?'var(--ok)':gc==='g-m'?'#f59e0b':'var(--d)';
+      $('phase').innerHTML='测速完成 <span class="grade '+gc+'">'+gt+'</span>';
+      $('sub').textContent='';
+      const rac=new AbortController();
+      const rto=setTimeout(()=>rac.abort(), 4000);
+      try{ await fetch('/speed/'+TOKEN+'/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:ping,jitter:jit,down:mbps,up:upMbps}),signal:rac.signal}); }catch(e){} finally{ clearTimeout(rto); }
+      $('gauge').style.display='none'; $('phase').style.display='none'; $('sub').style.display='none';
+      $('dGrade').className='grade '+gc; $('dGrade').textContent=gt;
+      const fmt=v=>v>=100?Math.round(v).toString():v.toFixed(2);
+      $('sDown').textContent=fmt(mbps); $('sUp').textContent=fmt(upMbps);
+      $('sPing').textContent=Math.round(ping); $('sJit').textContent=Math.round(jit);
+      $('done').style.display='block';
+    };
+    await Promise.race([run(), overallPromise]);
   }catch(e){
-    $('phase').textContent='测速失败'; $('sub').textContent=(e&&e.message)||'网络错误';
+    $('phase').textContent='测速失败'; $('sub').textContent=(e&&e.message)||'网络错误或超时';
+  }finally{
+    if(overallTimer) clearTimeout(overallTimer);
+    $('go').disabled=false; $('go').textContent='再测一次'; running=false;
   }
-  $('go').disabled=false; $('go').textContent='再测一次'; running=false;
 });
 </script></body></html>`
 
@@ -3743,6 +4066,8 @@ func pruneStatsLocked() {
 		pruneTopN(day.Hosts, 300)
 		pruneTopN(day.Countries, 200)
 		pruneTopN(day.Provinces, 50)
+		pruneTopN(day.UARaw, uaRawCap)
+		pruneTopN(day.UAClass, 50)
 	}
 	if len(stats.Audit) > maxAuditEvents {
 		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
@@ -3797,46 +4122,24 @@ func startStatsWorker() {
 				}
 				if ev.UARaw != "" {
 					d.UARaw[ev.UARaw]++
-					if len(d.UARaw) > uaRawCap {
-						minK, minV := "", int64(1<<62)
+					// 超过容量时批量裁剪，避免每次插入都全表扫描。
+					if len(d.UARaw) > uaRawCap+20 {
+						type kv struct{ k string; v int64 }
+						arr := make([]kv, 0, len(d.UARaw))
 						for k, v := range d.UARaw {
-							if v < minV {
-								minK, minV = k, v
+							arr = append(arr, kv{k, v})
+						}
+						sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+						keep := make(map[string]int64, uaRawCap)
+						for i := 0; i < uaRawCap && i < len(arr); i++ {
+							keep[arr[i].k] = arr[i].v
+						}
+						for k := range d.UARaw {
+							if _, ok := keep[k]; !ok {
+								delete(d.UARaw, k)
 							}
 						}
-						delete(d.UARaw, minK)
 					}
-				}
-			} else if false && (ev.Bytes > 0 || ev.UpBytes > 0 || ev.DownBytes > 0) {
-				// 流量已改由网卡采样计入，应用层字节事件不再累加。
-				up, down := ev.UpBytes, ev.DownBytes
-				if up == 0 && down == 0 {
-					down = ev.Bytes
-				}
-				total := up + down
-				if total == 0 {
-					total = ev.Bytes
-				}
-				stats.TotalBytes += total
-				stats.TodayBytes += total
-				stats.TotalUpBytes += up
-				stats.TotalDownBytes += down
-				stats.TodayUpBytes += up
-				stats.TodayDownBytes += down
-				d := dayOf(t)
-				d.Bytes += total
-				d.UpBytes += up
-				d.DownBytes += down
-				d.HourBytes[hour] += total
-				d.HourUpBytes[hour] += up
-				d.HourDownBytes[hour] += down
-				if ev.IP != "" {
-					stats.IPBytes[ev.IP] += total
-					stats.IPUpBytes[ev.IP] += up
-					stats.IPDownBytes[ev.IP] += down
-					d.IPBytes[ev.IP] += total
-					d.IPUpBytes[ev.IP] += up
-					d.IPDownBytes[ev.IP] += down
 				}
 			}
 			statsMu.Unlock()
@@ -5808,7 +6111,11 @@ func newTransport() *http.Transport {
 	return &http.Transport{
 		// 反代上游必须走已校验并固定的 IP，不能被 HTTP_PROXY/HTTPS_PROXY 绕过。
 		Proxy: nil, DialContext: dialPinned,
-		ForceAttemptHTTP2: true, MaxIdleConns: 1024, MaxIdleConnsPerHost: 128, IdleConnTimeout: 120 * time.Second,
+		// v4.2.1 回退：上游 HTTP/2 在高 RTT/丢包链路下所有流挤在一条 TCP 连接里，
+		// 队头阻塞会让大流量播放反而变慢；媒体转发场景 HTTP/1.1 多连接并行更快。
+		// 32K 读写缓冲保留（降低系统调用次数）。
+		ForceAttemptHTTP2: false, ReadBufferSize: 32 << 10, WriteBufferSize: 32 << 10,
+		MaxIdleConns: 1024, MaxIdleConnsPerHost: 128, IdleConnTimeout: 120 * time.Second,
 		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 180 * time.Second, ExpectContinueTimeout: 1 * time.Second,
 		MaxResponseHeaderBytes: 1 << 20,
 		DisableCompression:     true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
@@ -6083,22 +6390,33 @@ func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// htmlGzCache 按 HTML 内容缓存 gzip 结果：登录页/后台首页等是同一份静态字符串，
+// 没必要每个请求都重新压缩一遍（单次 gzip 约 1-3ms，缓存后近似为 0）。
+var htmlGzCache sync.Map
+
 func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheControl string) {
 	w.Header().Set("Content-Type", contentType)
 	if cacheControl != "" {
 		w.Header().Set("Cache-Control", cacheControl)
 	}
 	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		var buf bytes.Buffer
-		gz := gzip.NewWriter(&buf)
-		_, _ = gz.Write([]byte(html))
-		_ = gz.Close()
+		var body []byte
+		if v, ok := htmlGzCache.Load(html); ok {
+			body = v.([]byte)
+		} else {
+			var buf bytes.Buffer
+			gz := gzip.NewWriter(&buf)
+			_, _ = gz.Write([]byte(html))
+			_ = gz.Close()
+			body = buf.Bytes()
+			htmlGzCache.Store(html, body)
+		}
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Add("Vary", "Accept-Encoding")
-		_, _ = w.Write(buf.Bytes())
+		_, _ = w.Write(body)
 		return
 	}
-	_, _ = w.Write([]byte(html))
+	_, _ = io.WriteString(w, html)
 }
 
 type diskSpace struct{ free, total uint64 }
@@ -6114,7 +6432,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.1.0"
+const appVersionStr = "4.2.1"
 
 func activeSessionCount() int {
 	now := time.Now()
@@ -6262,6 +6580,7 @@ func adminHandler() http.HandlerFunc {
 				http.Error(w, "新端口 "+strconv.Itoa(newCfg.Port)+" 监听失败，可能被其他程序占用或无权限；已自动恢复为原端口 "+strconv.Itoa(oldCfg.Port), http.StatusBadRequest)
 				return
 			}
+			setupPortAcct(newCfg.Port)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(adminConfigResp{Config: *newCfg, EffectivePort: currentPort(), CurrentHost: r.Host})
@@ -7298,7 +7617,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			serveHome(w, r)
 			return
 		}
-		if !whitelistMatchPath(c.Whitelist, target.Host, target.Path) {
+		if !currentACL().matchWhitelist(target.Host, target.Path) { // v4.1.2: 用预编译白名单
 			if blockedRateLimited(ip) {
 				dropOrMinimal429(w)
 				return
@@ -7328,7 +7647,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
 		ctx = context.WithValue(ctx, targetResolutionCtxKey{}, resolution)
 		ctx = withReqBytes(ctx, rb)
-		// 纯转发：不包装 ResponseWriter / Body，不做逐块流量计数。
+		// 纯转发：不包装 ResponseWriter / Body，避免逐块计数影响播放流畅度。
 		// 实时速率由网卡采样提供；请求次数仍由 recordRequestStart 统计。
 		proxy.ServeHTTP(w, r.WithContext(ctx))
 		pushLiveEvent(ip, country, target.Host, r.URL.Path)
@@ -7453,6 +7772,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	if err := startListen(srv, port); err != nil {
 		log.Fatalf("监听失败: %v", err)
 	}
+	setupPortAcct(port)
 	log.Printf("服务启动 :%d", port)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -7463,6 +7783,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		log.Printf("优雅关闭超时，强制关闭连接: %v", err)
 		_ = srv.Close()
 	}
+	cleanupPortAcct()
 }
 
 // isStaticAsset 判断根路径下的常见静态资源（浏览器自动请求）
@@ -9080,6 +9401,12 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
 .dv{width:80px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0;white-space:nowrap}
 .dv span{color:var(--t3);font-size:12px;margin-left:4px;font-weight:normal}
+.pager{margin-top:12px;display:flex;justify-content:center;align-items:center;gap:10px;font-size:13px;color:var(--t2);user-select:none}
+.pager button{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:4px 12px;font-size:12.5px;cursor:pointer;color:var(--t);transition:all .15s}
+.pager button:hover:not(:disabled){background:var(--p);color:#fff;border-color:var(--p)}
+.pager button:disabled{opacity:.45;cursor:not-allowed}
+.pager .pg-info{min-width:60px;text-align:center;font-variant-numeric:tabular-nums}
+
 .dbt{width:74px;flex-shrink:0;text-align:right;font-size:11.5px;color:var(--t3);font-weight:normal;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--bd);-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;text-align:left;min-width:600px}
@@ -9370,11 +9697,11 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </div>
 <ul class="nav">
 <li><button class="nav-i on" data-t="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>概览</button></li>
-<li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量请求</button></li>
 <li><button class="nav-i" data-t="realtime"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>实时监控</button></li>
-<li><button class="nav-i" data-t="speedm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>测速管理</button></li>
+<li><button class="nav-i" data-t="traffic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>流量请求</button></li>
 <li><button class="nav-i" data-t="blocks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>拦截记录</button></li>
 <li><button class="nav-i" data-t="audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/></svg>操作记录</button></li>
+<li><button class="nav-i" data-t="speedm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>测速管理</button></li>
 <li><button class="nav-i" data-t="report"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5-7 5 7"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>数据上报</button></li>
 <li><button class="nav-i" data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>网关设置</button></li>
 </ul>
@@ -9477,7 +9804,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </div>
 <div class="card" style="margin-top:0">
 <div class="ch"><div><h2 class="ct" id="tfHostTitle">上游主机趋势</h2><div class="cd" id="tfHostDesc">筛选区间内访问最多的上游</div></div></div>
-<div style="position:relative;height:240px"><canvas id="hostChart"></canvas></div>
+<div style="position:relative;height:240px"><canvas id="hostChart"></canvas></div><div id="hostPager"></div>
 </div>
 <div class="g2" style="margin-top:22px">
 <div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按请求次数汇总（不再统计流量字节）</div></div></div><div id="ipDist"></div></div>
@@ -10372,8 +10699,8 @@ function buildTrafficView(trend){
       });
     }
   }
-  const hostTop=Object.entries(hostMap).sort((a,b)=>b[1]-a[1]).slice(0,12);
-  const ipTopN=30, ctryTopN=25;
+  const hostTop=Object.entries(hostMap).sort((a,b)=>b[1]-a[1]).slice(0,50);
+  const ipTopN=100, ctryTopN=50;
   const ipEntries=Object.entries(ipMap).sort((a,b)=>b[1]-a[1]);
   const ctryEntries=Object.entries(ctryMap).sort((a,b)=>b[1]-a[1]);
   const ipMapTrim={}, ctryMapTrim={};
@@ -10382,6 +10709,7 @@ function buildTrafficView(trend){
   return {isToday,gran,labels,reqs,bytes,ups,downs,ipMap:ipMapTrim,ctryMap:ctryMapTrim,provMap,hostTop,totalReq,totalBytes,totalUp,totalDown,blocked,dayCount:rawDayCount,ipTotalUnique:ipEntries.length,ctryTotalUnique:ctryEntries.length,ipTopN,ctryTopN,uaMap,uaRawMap,days:filtered};
 }
 function applyTrafficView(){
+  hostPage=1; ipPage=1; window._regionPage=1; window._uaPage=1;
   const v=buildTrafficView(trafficTrendData);
   document.getElementById('tfReq').textContent=v.totalReq.toLocaleString();
   document.getElementById('tfBytes').textContent=fmtBytes(v.totalBytes);
@@ -10495,36 +10823,74 @@ function renderByteChart(labels,ups,downs,gran){
   }}},scales:{x:{grid:{display:false},ticks:{maxRotation:45,minRotation:0,autoSkip:true,maxTicksLimit:chartTickLimit(labels.length,gran)}},y:bytesAxis(Math.max.apply(null, tot.concat([0])), 5)}}};
   byteChart=upsertChart(byteChart,cv,cfg);
 }
+let hostPage=1;
+const HOST_PAGE_SIZE=8;
 function renderHostChart(hostTop){
   const cv=document.getElementById('hostChart');if(!cv||typeof Chart==='undefined')return;
-  const labels=hostTop.map(([h])=>h.length>22?h.slice(0,20)+'…':h);
-  const data=hostTop.map(([,n])=>n);
+  const pager=document.getElementById('hostPager');
+  const total=hostTop.length;
+  const totalPages=Math.max(1,Math.ceil(total/HOST_PAGE_SIZE));
+  if(hostPage>totalPages) hostPage=totalPages;
+  if(hostPage<1) hostPage=1;
+  const start=(hostPage-1)*HOST_PAGE_SIZE;
+  const pageData=hostTop.slice(start,start+HOST_PAGE_SIZE);
+  const labels=pageData.map(([h])=>h.length>22?h.slice(0,20)+'…':h);
+  const data=pageData.map(([,n])=>n);
   if(!labels.length){labels.push('暂无数据');data.push(0)}
-  const dense=labels.length>24;
-  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.75)',hoverBackgroundColor:'#8b5cf6',borderRadius:4,maxBarThickness:22}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:14,font:{size:11}}}}}};
+  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.75)',hoverBackgroundColor:'#8b5cf6',borderRadius:4,maxBarThickness:22}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:10,font:{size:11}}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
+  if(pager){
+    if(totalPages<=1){pager.innerHTML='';return}
+    pager.innerHTML=`<div class="pager"><button type="button" data-act="prev" ${hostPage<=1?'disabled':''}>上一页</button><span class="pg-info">${hostPage} / ${totalPages}</span><button type="button" data-act="next" ${hostPage>=totalPages?'disabled':''}>下一页</button></div>`;
+    pager.querySelectorAll('button').forEach(btn=>{
+      btn.onclick=()=>{
+        if(btn.dataset.act==='prev'&&hostPage>1) hostPage--;
+        if(btn.dataset.act==='next'&&hostPage<totalPages) hostPage++;
+        renderHostChart(hostTop);
+      };
+    });
+  }
 }
+let ipPage=1;
+const IP_PAGE_SIZE=10;
 function renderIP(map,bytesMap,totalUnique,topN){
-  topN=topN||20;
-  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
+  const all=Object.entries(map).sort((a,b)=>b[1]-a[1]);
   const box=document.getElementById('ipDist');
-  if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有 IP 记录</span></div>';return}
-  const max=rows[0][1]||1;
-  const more=(totalUnique||rows.length)>rows.length;
+  if(!all.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有 IP 记录</span></div>';return}
+  const totalPages=Math.max(1,Math.ceil(all.length/IP_PAGE_SIZE));
+  if(ipPage>totalPages) ipPage=totalPages;
+  if(ipPage<1) ipPage=1;
+  const start=(ipPage-1)*IP_PAGE_SIZE;
+  const rows=all.slice(start,start+IP_PAGE_SIZE);
+  const max=all[0][1]||1;
   let html=rows.map(([ip,n])=>{
     return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`;
   }).join('');
-  if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个 IP</div>`;
-  box.innerHTML=html;
+  const moreNote=(totalUnique||all.length)>all.length?`<div style="margin-top:6px;font-size:12px;color:var(--t3);text-align:center">当前展示 Top ${all.length} · 共 ${Number(totalUnique).toLocaleString()} 个 IP</div>`:'';
+  const pager=totalPages>1?`<div class="pager"><button type="button" data-act="prev" ${ipPage<=1?'disabled':''}>上一页</button><span class="pg-info">${ipPage} / ${totalPages}</span><button type="button" data-act="next" ${ipPage>=totalPages?'disabled':''}>下一页</button></div>`:'';
+  box.innerHTML=html+moreNote+pager;
   box.querySelectorAll('.ip-row').forEach(el=>el.addEventListener('click',()=>showIPDetail(el.dataset.ip)));
+  box.querySelectorAll('.pager button').forEach(btn=>{
+    btn.onclick=()=>{
+      if(btn.dataset.act==='prev'&&ipPage>1) ipPage--;
+      if(btn.dataset.act==='next'&&ipPage<totalPages) ipPage++;
+      renderIP(map,bytesMap,totalUnique,topN);
+    };
+  });
 }
 function renderRegion(map,totalUnique,topN,provMap){
-  topN=topN||20;
-  const rows=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,topN);
+  let regionPage = window._regionPage || 1;
+  const all=Object.entries(map).sort((a,b)=>b[1]-a[1]);
   const box=document.getElementById('regionDist');
-  if(!rows.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有地区记录</span></div>';return}
-  const total=rows.reduce((s,r)=>s+r[1],0)||1,max=rows[0][1]||1;
-  const more=(totalUnique||rows.length)>rows.length;
+  if(!all.length){box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有地区记录</span></div>';return}
+  const PAGE=10;
+  const totalPages=Math.max(1,Math.ceil(all.length/PAGE));
+  if(regionPage>totalPages) regionPage=totalPages;
+  if(regionPage<1) regionPage=1;
+  window._regionPage=regionPage;
+  const start=(regionPage-1)*PAGE;
+  const rows=all.slice(start,start+PAGE);
+  const total=all.reduce((s,r)=>s+r[1],0)||1,max=all[0][1]||1;
   const hasProv=provMap&&Object.keys(provMap).length>0;
   let html=rows.map(([code,n])=>{
     const nm=countryLabel(code);
@@ -10542,8 +10908,9 @@ function renderRegion(map,totalUnique,topN,provMap){
       ${pRows.map(([name,n])=>`<div class="dr" style="padding:4px 0"><span class="dn"><span class="tx" style="font-size:13px">${esc(name)}</span></span><div class="bar t"><i style="width:${(n/pMax*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/pTotal*100).toFixed(0)}%</span></span></div>`).join('')}
     </div>`;
   }
-  if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个地区</div>`;
-  box.innerHTML=html;
+  const moreNote=(totalUnique||all.length)>all.length?`<div style="margin-top:6px;font-size:12px;color:var(--t3);text-align:center">当前展示 Top ${all.length} · 共 ${Number(totalUnique).toLocaleString()} 个地区</div>`:'';
+  const pager=totalPages>1?`<div class="pager"><button type="button" data-act="prev" ${regionPage<=1?'disabled':''}>上一页</button><span class="pg-info">${regionPage} / ${totalPages}</span><button type="button" data-act="next" ${regionPage>=totalPages?'disabled':''}>下一页</button></div>`:'';
+  box.innerHTML=html+moreNote+pager;
   const cnRow=box.querySelector('[data-cn="1"]');
   const provBox=box.querySelector('.prov-box');
   if(cnRow&&provBox){
@@ -10554,34 +10921,58 @@ function renderRegion(map,totalUnique,topN,provMap){
       if(arrow) arrow.textContent=open?'▸':'▾';
     });
   }
+  box.querySelectorAll('.pager button').forEach(btn=>{
+    btn.onclick=()=>{
+      if(btn.dataset.act==='prev'&&regionPage>1) window._regionPage=regionPage-1;
+      if(btn.dataset.act==='next'&&regionPage<totalPages) window._regionPage=regionPage+1;
+      renderRegion(map,totalUnique,topN,provMap);
+    };
+  });
 }
 
 function renderUADist(map,rawMap){
+  let uaPage = window._uaPage || 1;
   const box=document.getElementById('uaDist');
   if(!box)return;
-  const rows=Object.entries(map||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
-  if(!rows.length){
+  const all=Object.entries(map||{}).sort((a,b)=>b[1]-a[1]);
+  if(!all.length){
     box.innerHTML='<div class="emp"><b>暂无数据</b><span style="display:block;margin-top:4px;font-size:12.5px;color:var(--t3)">当前筛选条件下没有客户端记录</span></div>';
     return;
   }
+  const PAGE=8;
+  const totalPages=Math.max(1,Math.ceil(all.length/PAGE));
+  if(uaPage>totalPages) uaPage=totalPages;
+  if(uaPage<1) uaPage=1;
+  window._uaPage=uaPage;
+  const start=(uaPage-1)*PAGE;
+  const rows=all.slice(start,start+PAGE);
   const total=Object.values(map).reduce((a,b)=>a+b,0)||1;
-  const max=rows[0][1]||1;
-  const raws=Object.entries(rawMap||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  const max=all[0][1]||1;
+  const raws=Object.entries(rawMap||{}).sort((a,b)=>b[1]-a[1]).slice(0,12);
   const rawHtml=raws.length?`
     <div class="ua-raw">
       <div class="ua-raw-h">原始 UA 采样 · 当前范围 Top ${raws.length}<span style="color:var(--t3);font-weight:400">（点击行收起）</span></div>
       ${raws.map(([u,n])=>`<div class="ua-raw-i"><span class="ua-raw-n">${n.toLocaleString()}</span><span class="ua-raw-u" title="${esc(u)}">${esc(u)}</span></div>`).join('')}
     </div>`:'<div class="ua-raw"><div class="ua-raw-h">暂无原始 UA 采样（仅 v3.1.2 起的新数据）</div></div>';
+  const pager=totalPages>1?`<div class="pager"><button type="button" data-act="prev" ${uaPage<=1?'disabled':''}>上一页</button><span class="pg-info">${uaPage} / ${totalPages}</span><button type="button" data-act="next" ${uaPage>=totalPages?'disabled':''}>下一页</button></div>`:'';
   box.innerHTML=rows.map(([name,n])=>
     `<div class="dr ua-row" data-cls="${esc(name)}" style="cursor:pointer" title="点击查看原始 UA 采样"><span class="dn"><span class="tx">${esc(name)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`
-  ).join('')+'<div class="ua-raw-box" style="display:none">'+rawHtml+'</div>';
+  ).join('')+pager+'<div class="ua-raw-box" style="display:none">'+rawHtml+'</div>';
   const rawBox=box.querySelector('.ua-raw-box');
   box.querySelectorAll('.ua-row').forEach(el=>el.addEventListener('click',()=>{
     if(!rawBox)return;
     const open=rawBox.style.display!=='none';
     rawBox.style.display=open?'none':'block';
   }));
+  box.querySelectorAll('.pager button').forEach(btn=>{
+    btn.onclick=()=>{
+      if(btn.dataset.act==='prev'&&uaPage>1) window._uaPage=uaPage-1;
+      if(btn.dataset.act==='next'&&uaPage<totalPages) window._uaPage=uaPage+1;
+      renderUADist(map,rawMap);
+    };
+  });
 }
+
 
 function hmCell(v,max,title){
   const a=v?0.10+0.85*Math.pow(v/max,0.65):0;
@@ -11485,7 +11876,7 @@ loadConfig();
     if(typeof Chart!=='undefined'||n>200){ clearInterval(t); loadOverview(); }
   },50);
 })();
-let ovTimer=setInterval(()=>{if(!document.hidden)loadOverview()},5000);
+let ovTimer=setInterval(()=>{if(!document.hidden && document.getElementById('overview')?.classList.contains('on'))loadOverview()},8000);
 window.addEventListener('beforeunload',()=>clearInterval(ovTimer));
 let lastHiddenAt=0;
 const STALE_MS=60*1000;
