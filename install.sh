@@ -912,9 +912,9 @@ type Config struct {
 	HoneypotOn   bool `json:"honeypot_on"`     // 蜜罐路径：命中即断连并自动拉黑
 	ScanGuardOn  bool `json:"scan_guard_on"`   // 扫描器 UA / 空 UA：命中即断连并自动拉黑
 	RateLimitOn  bool `json:"rate_limit_on"`   // 单 IP 全局限速（令牌桶 + 并发上限）
-	RatePerSec   int  `json:"rate_per_sec"`    // 每秒请求数上限，默认 30
-	RateBurst    int  `json:"rate_burst"`      // 突发上限，默认 60
-	MaxConnPerIP int  `json:"max_conn_per_ip"` // 单 IP 并发连接上限，默认 64
+	RatePerSec   int  `json:"rate_per_sec"`    // 每秒请求数上限，默认 120（多人共用更宽松）
+	RateBurst    int  `json:"rate_burst"`      // 突发上限，默认 240
+	MaxConnPerIP int  `json:"max_conn_per_ip"` // 单 IP 并发连接上限，默认 256
 	// 昨日日报自定义格式
 	DailyTmplOn    bool   `json:"daily_tmpl_on"`    // 开启后日报以渲染文本发送，关闭则发送标准 JSON
 	DailyTmpl      string `json:"daily_tmpl"`       // 模板内容，支持 {{date}} {{requests}} 等占位符
@@ -1608,7 +1608,7 @@ type statEvent struct {
 	IsStart   bool
 }
 
-var statChan = make(chan statEvent, 10000)
+var statChan = make(chan statEvent, 50000)
 
 var concurrent atomic.Int64
 var liveClients atomic.Int32
@@ -2075,6 +2075,7 @@ type reportPayload struct {
 	IPs         map[string]int64 `json:"ips"`
 	IPRequests  map[string]int64 `json:"ip_requests"`
 	Countries   map[string]int64 `json:"countries"`
+	Provinces   map[string]int64 `json:"provinces"`
 	IPBytes     map[string]int64 `json:"ip_bytes"`
 	IPUpBytes   map[string]int64 `json:"ip_up_bytes"`
 	IPDownBytes map[string]int64 `json:"ip_down_bytes"`
@@ -2297,6 +2298,7 @@ func buildDailyReportPayload(date string) (reportPayload, bool) {
 		IPUpBytes:   copyInt64Map(d.IPUpBytes),
 		IPDownBytes: copyInt64Map(d.IPDownBytes),
 		Countries:   copyInt64Map(d.Countries),
+		Provinces:   copyInt64Map(d.Provinces),
 		StatDropped: statDropped.Load(),
 	}
 	statsMu.Unlock()
@@ -2365,7 +2367,8 @@ const defaultDailyTmpl = `【昨日统计】{{date}}
 Top IP：{{ips_top}}
 Top 流量 IP：{{ip_bytes_top}}
 Top 域名：{{hosts_top}}
-国家/地区：{{countries_top}}`
+国家/地区：{{countries_top}}
+省份：{{provinces_top}}`
 
 func humanBytes(n int64) string {
 	if n <= 0 {
@@ -2450,10 +2453,12 @@ func renderDailyTemplate(tmpl string, p reportPayload, date string, jsonSafe boo
 		"{{ip_bytes_top}}":        topListText(p.IPBytes, 5, true),
 		"{{hosts_top}}":           topListText(p.Hosts, 5, false),
 		"{{countries_top}}":       topListText(p.Countries, 8, false),
+		"{{provinces_top}}":       topListText(p.Provinces, 10, false),
 		"{{ips_top_lines}}":       topListLines(p.IPs, 5, false),
 		"{{ip_bytes_top_lines}}":  topListLines(p.IPBytes, 5, true),
 		"{{hosts_top_lines}}":     topListLines(p.Hosts, 5, false),
 		"{{countries_top_lines}}": topListLines(p.Countries, 8, false),
+		"{{provinces_top_lines}}": topListLines(p.Provinces, 10, false),
 	}
 	if jsonSafe {
 		for k, v := range repl {
@@ -3596,8 +3601,8 @@ $('go').addEventListener('click',async()=>{
 </script></body></html>`
 
 var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:    1024,
-	WriteBufferSize:   4096,
+	ReadBufferSize:    8192,
+	WriteBufferSize:   16384,
 	EnableCompression: false,
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
@@ -4817,10 +4822,10 @@ func globalRateLimited(ip string, perSec, burst int) bool {
 		return false
 	}
 	if perSec <= 0 {
-		perSec = 30
+		perSec = 120
 	}
 	if burst <= 0 {
-		burst = 60
+		burst = 240
 	}
 	now := time.Now()
 	rateMu.Lock()
@@ -5720,8 +5725,8 @@ func newTransport() *http.Transport {
 	return &http.Transport{
 		// 反代上游必须走已校验并固定的 IP，不能被 HTTP_PROXY/HTTPS_PROXY 绕过。
 		Proxy: nil, DialContext: dialPinned,
-		ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 90 * time.Second, ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2: true, MaxIdleConns: 1024, MaxIdleConnsPerHost: 128, IdleConnTimeout: 120 * time.Second,
+		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 180 * time.Second, ExpectContinueTimeout: 1 * time.Second,
 		MaxResponseHeaderBytes: 1 << 20,
 		DisableCompression:     true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
 	}
@@ -5748,7 +5753,7 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 // 支持 http/https、查询参数、WebSocket；会统计上下行流量。
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: tr, FlushInterval: 0, BufferPool: proxyBufPool,
+		Transport: tr, FlushInterval: -1, BufferPool: proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
 			if !ok || t == nil {
@@ -7282,23 +7287,9 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	adminSrv := adminHandler()
 	adminGz := gzipMiddleware(adminSrv)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 公开页面（首页 / 所有提示页）的图标走根路径，避免 HTML 里出现 /admin 前缀。
-		// 与 /admin/logo.png 指向同一资源，必须在访问域名守卫之前放行，保证 403 页也能显示。
-		if r.URL.Path == "/logo.png" {
-			redirectIcon(w, r, iconLogoURL)
-			return
-		}
-		// 根路径下的图标类内置资源都属于页面元素：与 /logo.png 同理，在访问域名守卫之前放行。
-		// 保证拦截提示页与首页的图标可正常显示，浏览器的自动请求也不会被记入拦截日志。
-		switch r.URL.Path {
-		case "/favicon.ico", "/favicon.svg":
-			redirectIcon(w, r, iconFaviconURL)
-			return
-		case "/favicon.png", "/favicon-16x16.png", "/favicon-32x32.png", "/favicon-96x96.png":
-			redirectIcon(w, r, icon192URL)
-			return
-		case "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png":
-			redirectIcon(w, r, iconLogoURL)
+		// 静态资源统一放行（图标、robots、manifest 等），必须在 Host 守卫之前
+		if isStaticAsset(r.URL.Path) {
+			handleStaticAsset(w, r)
 			return
 		}
 		if r.URL.Path == "/health" {
@@ -7424,6 +7415,53 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 	}
 }
 
+// isStaticAsset 判断根路径下的常见静态资源（浏览器自动请求）
+func isStaticAsset(p string) bool {
+	p = strings.ToLower(strings.TrimPrefix(p, "/"))
+	if p == "" {
+		return false
+	}
+	// 只处理单段路径，避免误伤反代路径
+	if strings.Contains(p, "/") {
+		return strings.HasPrefix(p, ".well-known/")
+	}
+	switch {
+	case strings.HasPrefix(p, "favicon"):
+		return true
+	case strings.HasPrefix(p, "apple-touch-icon"):
+		return true
+	case strings.HasPrefix(p, "android-chrome"):
+		return true
+	case strings.HasPrefix(p, "mstile"):
+		return true
+	case p == "robots.txt" || p == "sitemap.xml" || p == "manifest.json" ||
+		p == "site.webmanifest" || p == "browserconfig.xml" ||
+		p == "humans.txt" || p == "security.txt" ||
+		p == "crossdomain.xml" || p == "app-ads.txt" ||
+		p == "logo.png" || p == "logo.svg":
+		return true
+	case strings.HasSuffix(p, ".ico") || strings.HasSuffix(p, ".png") ||
+		strings.HasSuffix(p, ".svg") || strings.HasSuffix(p, ".webp"):
+		return true
+	}
+	return false
+}
+
+// handleStaticAsset 图标重定向到已有资源，其余返回 204
+func handleStaticAsset(w http.ResponseWriter, r *http.Request) {
+	p := strings.ToLower(r.URL.Path)
+	switch {
+	case strings.Contains(p, "apple-touch") || strings.Contains(p, "logo"):
+		redirectIcon(w, r, iconLogoURL)
+	case strings.HasSuffix(p, ".ico") || strings.Contains(p, "favicon"):
+		redirectIcon(w, r, iconFaviconURL)
+	case strings.HasSuffix(p, ".png") || strings.HasSuffix(p, ".svg") || strings.HasSuffix(p, ".webp"):
+		redirectIcon(w, r, icon192URL)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 // main 解析命令行参数。支持直接运行，或通过 "run" 子命令由 systemd 拉起。
 func main() {
 	args := os.Args[1:]
@@ -7467,6 +7505,7 @@ func uaClassOf(ua string) string {
 	}
 	l := strings.ToLower(ua)
 	switch {
+	// —— 主流第三方播放器 ——
 	case strings.Contains(l, "infuse"):
 		return "Infuse"
 	case strings.Contains(l, "fileball"):
@@ -7475,12 +7514,40 @@ func uaClassOf(ua string) string {
 		return "SenPlayer"
 	case strings.Contains(l, "vidhub"):
 		return "VidHub"
+	case strings.Contains(l, "eplayerx") || strings.Contains(l, "eplayer"):
+		return "EplayerX"
+	case strings.Contains(l, "rex-") || strings.Contains(l, "rex/"):
+		return "Rex"
+	case strings.Contains(l, "lenna"):
+		return "Lenna"
+	case strings.Contains(l, "hills"):
+		return "Hills"
+	case strings.Contains(l, "nplayer"):
+		return "nPlayer"
+	case strings.Contains(l, "mxplayer") || strings.Contains(l, "mx player"):
+		return "MX Player"
+	case strings.Contains(l, "dandanplay") || strings.Contains(l, "弹弹play"):
+		return "弹弹play"
+	case strings.Contains(l, "yamby"):
+		return "Yamby"
+	case strings.Contains(l, "evermedia"):
+		return "EverMedia"
+	case strings.Contains(l, "kodi"):
+		return "Kodi"
+	case strings.Contains(l, "vlc"):
+		return "VLC"
+	case strings.Contains(l, "potplayer"):
+		return "PotPlayer"
+	case strings.Contains(l, "mpv"):
+		return "mpv"
+	// —— 官方客户端 ——
 	case strings.Contains(l, "emby theater") || strings.Contains(l, "embytheater"):
 		return "Emby Theater"
 	case strings.Contains(l, "emby"):
 		return "Emby 客户端"
 	case strings.Contains(l, "jellyfin"):
 		return "Jellyfin 客户端"
+	// —— 平台 ——
 	case strings.Contains(l, "android tv") || strings.Contains(l, "googletv") || strings.Contains(l, "bravia"):
 		return "Android TV"
 	case strings.Contains(l, "appletv") || strings.Contains(l, "apple tv"):
@@ -7489,18 +7556,7 @@ func uaClassOf(ua string) string {
 		return "iOS"
 	case strings.Contains(l, "android"):
 		return "Android"
-	case strings.Contains(l, "vlc") || strings.Contains(l, "potplayer") || strings.Contains(l, "mpv") || strings.Contains(l, "kodi"):
-		return "播放器"
-	case strings.Contains(l, "dandanplay"):
-		return "弹弹play"
-	case strings.Contains(l, "yamby"):
-		return "Yamby"
-	case strings.Contains(l, "evermedia"):
-		return "EverMedia"
-	case strings.Contains(l, "nplayer"):
-		return "nPlayer"
-	case strings.Contains(l, "mxplayer"):
-		return "MX Player"
+	// —— 其他播放器 / 工具 ——
 	case strings.Contains(l, "ffmpeg") || strings.Contains(l, "lavf") || strings.Contains(l, "libav"):
 		return "FFmpeg"
 	case strings.Contains(l, "exoplayer") || strings.Contains(l, "okhttp") || strings.Contains(l, "dalvik"):
@@ -7551,7 +7607,7 @@ type statsView struct {
 var (
 	statsViewPtr   atomic.Pointer[statsView]
 	statsViewMu    sync.Mutex
-	statsViewEvery = 2 * time.Second
+	statsViewEvery = 5 * time.Second
 )
 
 func cloneInt64Map(src map[string]int64) map[string]int64 {
@@ -11489,7 +11545,7 @@ Type=simple
 # GOGC=100 保持默认 GC 节奏；GOMEMLIMIT 设软内存上限 256MiB，
 # 超出后 GC 加速回收，避免堆无节制增长挤占小内存 VPS
 Environment=GOGC=100
-Environment=GOMEMLIMIT=256MiB
+Environment=GOMEMLIMIT=512MiB
 ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${u} -db ${DB_FILE}
 Restart=on-failure
 RestartSec=5s
