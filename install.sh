@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.3.1"
+APP_VERSION="4.3.4"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,7 +275,7 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.3.1
+// emby-proxy v4.3.4
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
@@ -1051,7 +1051,8 @@ func dialPinned(ctx context.Context, network, addr string) (net.Conn, error) {
 type Config struct {
 	Port       int      `json:"port"`
 	ChinaOnly  bool     `json:"china_only"`
-	Whitelist  []string `json:"whitelist"`
+	Whitelist    []string `json:"whitelist"`
+	PrefixRoutes []string `json:"prefix_routes"` // 前缀路由：/xxx=目标，命中后 /xxx/** 转到该目标
 	BanList    []string `json:"ban_list"`
 	AllowedUAs []string `json:"allowed_uas"`
 	BlockedUAs []string `json:"blocked_uas"` // UA 黑名单：命中任一关键字即拒绝（优先于白名单）
@@ -1142,6 +1143,7 @@ type compiledACL struct {
 	uaBlockNeedles  []string         // 已转小写的 UA 黑名单关键字
 	uaBlockKeywords []string         // 原始黑名单关键字（展示用）
 	whitelist       []whitelistEntry // 预编译的上游白名单，避免每请求重复解析规则字符串
+	prefixRoutes    []prefixRoute    // 前缀路由，按前缀长度降序（最长优先）
 }
 
 var aclPtr atomic.Pointer[compiledACL]
@@ -1188,6 +1190,14 @@ func rebuildACL(c *Config) {
 			a.whitelist = append(a.whitelist, e)
 		}
 	}
+	for _, line := range c.PrefixRoutes {
+		if rt, ok := parsePrefixRoute(line); ok {
+			a.prefixRoutes = append(a.prefixRoutes, rt)
+		}
+	}
+	sort.Slice(a.prefixRoutes, func(i, j int) bool {
+		return len(a.prefixRoutes[i].prefix) > len(a.prefixRoutes[j].prefix)
+	})
 	aclPtr.Store(a)
 }
 
@@ -1546,6 +1556,100 @@ func whitelistMatchPath(list []string, targetHost, targetPath string) bool {
 		}
 	}
 	return false
+}
+
+// prefixRoute 一条前缀路由：/emby/** → 固定上游。
+// 写法：/emby=https://host 、/emby https://host 、/emby -> https://host。
+// 前缀按路径段匹配（/emby 不匹配 /emby2），最长前缀优先。
+type prefixRoute struct {
+	prefix string
+	target *url.URL
+}
+
+// parsePrefixRoute 解析一行前缀路由。目标可省略协议，按端口推断 http/https。
+func parsePrefixRoute(line string) (prefixRoute, bool) {
+	line = strings.TrimSpace(line)
+	if i := strings.IndexAny(line, "#;"); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if line == "" {
+		return prefixRoute{}, false
+	}
+	var prefix, raw string
+	for _, sep := range []string{"->", "=>", "="} {
+		if i := strings.Index(line, sep); i >= 0 {
+			prefix = strings.TrimSpace(line[:i])
+			raw = strings.TrimSpace(line[i+len(sep):])
+			break
+		}
+	}
+	if raw == "" {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			prefix, raw = fields[0], fields[1]
+		}
+	}
+	if prefix == "" || raw == "" {
+		return prefixRoute{}, false
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	prefix = strings.TrimSuffix(prefix, "/")
+	if prefix == "" {
+		prefix = "/"
+	}
+	if !strings.Contains(raw, "://") {
+		raw = schemeForAuthority(raw) + "://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return prefixRoute{}, false
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return prefixRoute{prefix: prefix, target: u}, true
+}
+
+// upstreamAddr 返回实际上游地址（host 或 host:port），用于统计展示。
+func upstreamAddr(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if u.Port() != "" {
+		return u.Host
+	}
+	return u.Hostname()
+}
+
+// matchPrefixRoute 用最长前缀匹配请求路径，命中则拼出上游 URL（保留查询串由调用方处理）。
+func matchPrefixRoute(path string) (*url.URL, bool) {
+	if path == "" {
+		path = "/"
+	}
+	a := currentACL()
+	for _, rt := range a.prefixRoutes {
+		if path != rt.prefix && !strings.HasPrefix(path, rt.prefix+"/") {
+			continue
+		}
+		rest := strings.TrimPrefix(path, rt.prefix)
+		if rest == "" {
+			rest = "/"
+		}
+		u := *rt.target
+		base := strings.TrimSuffix(rt.target.Path, "/")
+		if rest == "/" {
+			u.Path = rt.target.Path
+			if u.Path == "" {
+				u.Path = "/"
+			}
+		} else {
+			u.Path = base + rest
+		}
+		return &u, true
+	}
+	return nil, false
 }
 
 // ---------------- 访问域名守卫（Host 白名单）----------------
@@ -6654,7 +6758,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.3.1 管理控制台",
+		"description":      "Emby 路径反代 v4.3.4 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6858,7 +6962,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.3.1"
+const appVersionStr = "4.3.4"
 
 // activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
@@ -8052,23 +8156,31 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
-		// 判定链 ⑤ 上游域名白名单（需先解析出反代目标，故放在最后）
-		target, err := parseTarget(r)
-		if err != nil {
-			serveHome(w, r)
-			return
-		}
-		if !currentACL().matchWhitelist(target.Host, target.Path) { // v4.1.2: 用预编译白名单
-			if blockedRateLimited(ip) {
-				dropOrMinimal429(w)
+		// 前缀路由优先：/xxx/** → 管理员配置的固定目标，不再走路径解析与上游白名单。
+		var target *url.URL
+		var err error
+		if u, ok := matchPrefixRoute(r.URL.Path); ok {
+			target = u
+			target.RawQuery = r.URL.RawQuery
+		} else {
+			// 判定链 ⑤ 上游域名白名单（需先解析出反代目标，故放在最后）
+			target, err = parseTarget(r)
+			if err != nil {
+				serveHome(w, r)
 				return
 			}
-			reqB, respB := estimateBlockedBytes(r)
-			recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent(), r.Host, reqB, respB)
-			serveError(w, r, http.StatusForbidden, "目标域名未授权",
-				"请求路径中的上游域名不在「上游域名白名单」内，请求在判定链第 ⑤ 步被拒绝，未向上游转发任何数据。",
-				errPageCtx{Code: "whitelist", Label: "上游目标域名未授权"})
-			return
+			if !currentACL().matchWhitelist(target.Host, target.Path) {
+				if blockedRateLimited(ip) {
+					dropOrMinimal429(w)
+					return
+				}
+				reqB, respB := estimateBlockedBytes(r)
+				recordBlocked(ip, country, r.URL.RequestURI(), "whitelist", r.UserAgent(), r.Host, reqB, respB)
+				serveError(w, r, http.StatusForbidden, "目标域名未授权",
+					"请求路径中的上游域名不在「上游域名白名单」内，请求在判定链第 ⑤ 步被拒绝，未向上游转发任何数据。",
+					errPageCtx{Code: "whitelist", Label: "上游目标域名未授权"})
+				return
+			}
 		}
 
 		resolution, resolveErr := resolveTargetIPs(r.Context(), target)
@@ -8080,7 +8192,10 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 
-		recordRequestStart(ip, country, target.Host, r.UserAgent())
+		// 统计记实际上游地址（前缀路由记配置的目标，路径反代记解析出的目标），与入口路径无关。
+		upHost := upstreamAddr(target)
+		upPath := target.RequestURI()
+		recordRequestStart(ip, country, upHost, r.UserAgent())
 
 		concurrent.Add(1)
 		defer concurrent.Add(-1)
@@ -8091,7 +8206,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		// 纯转发：不包装 ResponseWriter / Body，避免逐块计数影响播放流畅度。
 		// 实时速率由网卡采样提供；请求次数仍由 recordRequestStart 统计。
 		proxy.ServeHTTP(w, r.WithContext(ctx))
-		pushLiveEvent(ip, country, target.Host, r.URL.Path)
+		pushLiveEvent(ip, country, upHost, upPath)
 	})
 
 	adminSrv := adminHandler()
@@ -10537,6 +10652,15 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
       <div class="hint" style="margin-top:8px">留空即使用默认值 30 / 60 / 64。播放高清视频建议并发不低于 32；填 0 或负数会被忽略</div>
     </div>
     <div style="border-top:1px dashed var(--bd);margin:16px 0 12px"></div>
+    <div class="fi"><label class="fl">专用反代（路径 key）</label><div class="hint" style="margin-bottom:8px">设一个 key 对应一个地址，走路径、不用参数。访问 <b>/key</b> 或 <b>/key/后面的路径</b> 就转到该地址。key 自己填，或点「随机 key」。例：key 填 emby、地址填 https://movie.example.com，则打开 /emby/Items 会转到 https://movie.example.com/Items</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <input id="prKey" class="inp" placeholder="key，如 emby" style="flex:1;min-width:120px">
+        <input id="prAddr" class="inp" placeholder="目标地址，如 https://movie.example.com" style="flex:2;min-width:200px">
+        <button type="button" class="btn g s" id="prAdd">添加</button>
+        <button type="button" class="btn g s" id="prRand">随机 key</button>
+      </div>
+      <textarea id="prefixRoutes" class="tarea" placeholder="/emby=https://movie.example.com&#10;/jf=http://10.0.0.5:8096"></textarea>
+    </div>
     <div class="fi"><label class="fl">上游域名白名单（可反代到的目标）</label><div class="hint" style="margin-bottom:8px">每行一条，http(s):// 前缀可省略。支持：域名（如 example.com，自动匹配根域名）、通配（*.cdn.example.com）、完整域名+路径（如 example.com/emby，仅放行该路径前缀）、IP:端口+路径（如 1.2.3.4:8096/emby，端口参与匹配）。限制路径里能反代到哪些上游主机，与上面的访问域名无关</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com&#10;example.com/emby&#10;1.2.3.4:8096/emby"></textarea></div>
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
     <div class="fi"><label class="fl">后台访问来源</label><div class="hint" style="margin-bottom:8px">留空表示不限制；填写后只有这些 IP/CIDR 能打开管理后台（不影响代理转发）。保存时会校验本机 IP 是否在列表内，避免把自己锁在门外。</div><textarea id="adminAllow" class="tarea" style="min-height:70px" placeholder="192.168.1.0/24&#10;203.0.113.8"></textarea></div>
@@ -10821,6 +10945,25 @@ async function loadConfig(){
     toggleRateFields();
     const ah=document.getElementById('allowedHosts');if(ah)ah.value=(c.allowed_hosts||[]).join('\n');
     const ch=document.getElementById('curHostHint');if(ch){const h=c.current_host||'';ch.textContent=h?('当前访问域名（请确认它已填在上方白名单）：'+h):'当前访问域名：未知';}
+    const pr=document.getElementById('prefixRoutes');if(pr)pr.value=(c.prefix_routes||[]).join('\n');
+    function prAppend(random){
+      const addr=(document.getElementById('prAddr')?.value||'').trim();
+      if(!addr){alert('请填写目标地址');return}
+      let key=(document.getElementById('prKey')?.value||'').trim().replace(/^\/+|\/+$/g,'');
+      if(random||!key){
+        const chars='abcdefghijkmnpqrstuvwxyz23456789';
+        key=Array.from({length:8},()=>chars[Math.floor(Math.random()*chars.length)]).join('');
+        const kEl=document.getElementById('prKey'); if(kEl) kEl.value=key;
+      }
+      if(!/^[A-Za-z0-9_-]+$/.test(key)){alert('key 只能用字母、数字、下划线、中划线');return}
+      const line='/'+key+'='+addr;
+      const ta=document.getElementById('prefixRoutes');
+      if(!ta)return;
+      ta.value=(ta.value.trim()?ta.value.trim()+'\n':'')+line;
+      const aEl=document.getElementById('prAddr'); if(aEl) aEl.value='';
+    }
+    document.getElementById('prAdd')?.addEventListener('click',()=>prAppend(false));
+    document.getElementById('prRand')?.addEventListener('click',()=>prAppend(true));
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');
     document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
     const bua=document.getElementById('blockedUAs');if(bua)bua.value=(c.blocked_uas||[]).join('\n');
@@ -11655,6 +11798,7 @@ function collect(){
     rate_burst:(parseInt(document.getElementById('rateBurst')?.value||'',10)||0),
     max_conn_per_ip:(parseInt(document.getElementById('maxConnPerIP')?.value||'',10)||0),
     allowed_hosts:lines('allowedHosts'),
+    prefix_routes:lines('prefixRoutes'),
     whitelist:lines('whitelist'),
     ban_list:lines('banList'),
     allowed_uas:lines('allowedUAs'),
