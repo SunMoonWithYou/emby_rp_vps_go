@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="3.9.0"
+APP_VERSION="4.1.0"
 
 SERVICE_NAME="emby-proxy"
 DEFAULT_PORT=8520
@@ -266,6 +266,34 @@ write_go_source() {
   local dir="$1"
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
+
+// emby-proxy v4.0.0
+//
+// 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
+//
+// 数据路径（v4.0 起）：
+//   - 纯转发。httputil.ReverseProxy 直接写回客户端，
+//     不再用 countingReader / countingWriter 逐块计数。
+//   - 实时网速改为读 /proc/net/dev 网卡累计字节，按秒差分。
+//
+// 访问控制（判定链，命中即拒绝）：
+//   ① IP 黑名单
+//   ② 访问域名守卫（Host）
+//   ③ UA 白名单（AllowedUAs 非空时做大小写不敏感子串匹配）
+//   ④ 地区限制（ChinaOnly）
+//   ⑤ 上游域名白名单
+//
+// 早筛层（独立开关，默认关）：
+//   - 蜜罐路径：命中断连并自动拉黑
+//   - 扫描器 UA / 空 UA：断连；仅明确扫描器特征才自动拉黑
+//   - 单 IP 全局限速：令牌桶 + 并发上限，超限断连不拉黑
+//
+// 管理后台：
+//   - 登录带验证码，失败锁定；空 UA 登录失败只记拦截，不自动进永久黑名单
+//   - 日报默认 JSON 模板，chat_id 用 {{chat_id}} 占位，不写死
+//   - 不再统计/展示每个 IP 的流量字节
+//
+// 持久化：配置与统计存 BoltDB；端口变更热切换监听。
 
 import (
 	"bufio"
@@ -732,6 +760,9 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// parseTarget 从请求路径解析上游地址。
+// 支持 /https://host/path 与 /http://host/path 两种形式。
+// 返回的 URL 仅含 scheme/host/path，查询串由调用方另行拼接。
 func parseTarget(r *http.Request) (*url.URL, error) {
 	raw := r.URL.EscapedPath()
 	if raw == "" || raw == "/" {
@@ -809,6 +840,9 @@ func isUnsafeResolvedIP(ip net.IP, allowLoopback bool) bool {
 	return false
 }
 
+// resolveTargetIPs 解析上游域名并做安全校验。
+// 拒绝环回、链路本地、未指定地址；私网地址允许（用于内网 Emby）。
+// 结果写入 targetResolution，供 dialPinned 使用，避免 DNS rebinding。
 func resolveTargetIPs(ctx context.Context, target *url.URL) (*targetResolution, error) {
 	if target == nil || target.User != nil {
 		return nil, fmt.Errorf("上游地址格式不合法")
@@ -864,6 +898,8 @@ func resolveTargetIPs(ctx context.Context, target *url.URL) (*targetResolution, 
 
 // dialPinned 只拨号到本次请求预先校验过的 DNS 结果，避免解析校验与实际连接之间
 // 再次查询 DNS 所产生的 rebinding 窗口。TLS 仍使用 URL 中的原始主机名校验证书。
+// dialPinned 只拨号到本次请求已校验的 IP，不再二次 DNS 查询。
+// TLS 仍用原始主机名校验证书。多 IP 时按顺序尝试，直到成功或上下文取消。
 func dialPinned(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -893,6 +929,13 @@ func dialPinned(ctx context.Context, network, addr string) (net.Conn, error) {
 
 // Config 是网关运行时配置，序列化后存入 BoltDB 的 config 桶。
 // 后台保存时整份覆盖；端口变更会触发热切换监听。
+//
+// 主要字段：
+//   - Whitelist / BanList / AllowedUAs：上游白名单、IP 黑名单、UA 白名单
+//   - HostGuardOn / AllowedHosts：访问域名守卫
+//   - ScanGuardOn / HoneypotOn / RateLimitOn：早筛层开关
+//   - DailyTmpl* / DailyChatID：日报模板与目标 chat_id（{{chat_id}}）
+//   - AdminAllow：管理后台 IP 白名单
 type Config struct {
 	Port       int      `json:"port"`
 	ChinaOnly  bool     `json:"china_only"`
@@ -921,6 +964,7 @@ type Config struct {
 	DailyTmplURL   string `json:"daily_tmpl_url"`   // 日报发送地址，留空使用 report_url
 	DailyTmplToken string `json:"daily_tmpl_token"` // 日报 Bearer Token，留空使用 report_token
 	DailyTmplType  string `json:"daily_tmpl_type"`  // Content-Type，默认 text/plain
+	DailyChatID    string `json:"daily_chat_id"`    // 日报目标 ID（如 Telegram chat_id），模板用 {{chat_id}}
 }
 
 var startedAt = time.Now()
@@ -978,6 +1022,8 @@ type compiledACL struct {
 
 var aclPtr atomic.Pointer[compiledACL]
 
+// rebuildACL 把配置编译成运行时 ACL（黑名单网段、UA 关键字等）并原子替换。
+// 配置保存后调用，热更新无需重启。
 func rebuildACL(c *Config) {
 	a := &compiledACL{exactBan: map[string]struct{}{}}
 	if c == nil {
@@ -1034,6 +1080,8 @@ func pageParams(r *http.Request, defLimit int) (int, int) {
 
 // isBannedIP 判断来源 IP 是否命中黑名单（精确 IP 或 CIDR）。
 // 命中后请求在判定链早期被拒绝，不进入反代。
+// isBannedIP 判断来源 IP 是否在黑名单。
+// 支持单 IP 与 CIDR；解析失败的条目跳过。
 func isBannedIP(ipStr string, clientIP net.IP) bool {
 	a := currentACL()
 	if _, ok := a.exactBan[ipStr]; ok {
@@ -1075,6 +1123,8 @@ func uaClassOfEx(ua string) string {
 
 // uaAllowed 检查 User-Agent 是否命中白名单关键字。
 // 白名单为空时全部放行；非空时必须包含任一关键字才放行。
+// uaAllowed 检查 User-Agent 是否放行。
+// AllowedUAs 为空时全部放行；非空时做大小写不敏感的子串匹配，命中任一关键字即通过。
 func uaAllowed(ua string) bool {
 	a := currentACL()
 	if len(a.uaNeedles) == 0 {
@@ -1093,6 +1143,8 @@ func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPor
 
 // startListen 在指定端口启动（或热切换）HTTP 监听。
 // 成功后关闭旧 Listener；失败时由调用方负责回滚配置。
+// startListen 在指定端口启动 HTTP 服务。
+// 若已有监听，先关闭旧的再切换，用于端口热变更。
 func startListen(srv *http.Server, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -1116,6 +1168,8 @@ func startListen(srv *http.Server, port int) error {
 
 // loadConfig 从 BoltDB 读取配置到内存，并重建 ACL 缓存。
 // 首次启动或数据库为空时使用零值配置。
+// loadConfig 从 BoltDB 读取配置到内存。
+// 库不存在或为空时使用默认配置，不报错退出。
 func loadConfig() {
 	c := &Config{}
 	if db != nil {
@@ -1134,6 +1188,7 @@ func loadConfig() {
 }
 
 // saveConfig 将配置整份写入 BoltDB。后台保存、导入配置时调用。
+// saveConfig 把配置整份写入 BoltDB config 桶，并更新内存指针。
 func saveConfig(c *Config) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -1402,6 +1457,10 @@ func hostAllowed(list []string, host string) bool {
 //   - 开关关闭：不限制（完全兼容旧配置）
 //   - 开关开启 + 白名单非空：只放行白名单域名
 //   - 开关开启 + 白名单为空：仅拒绝 IP/localhost 直连，任何域名都放行
+//
+// accessHostAllowed 访问域名守卫。
+// HostGuardOn 关闭时直接放行。
+// 开启后：禁止用 IP / localhost 直连；AllowedHosts 非空时还必须命中白名单。
 func accessHostAllowed(c *Config, r *http.Request) (bool, string) {
 	if c == nil || !c.HostGuardOn {
 		return true, ""
@@ -1820,16 +1879,82 @@ var (
 	curNetSpeed netSpeed
 )
 
+// readNetDevBytes 直接读 /proc/net/dev，汇总非 lo / docker / veth / br- 网卡的累计收发字节。
+// 用于实时网速采样，替代应用层逐块计数，避免影响纯转发性能。
+func readNetDevBytes() (rx, tx int64) {
+	b, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, ":") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		iface := strings.TrimSpace(parts[0])
+		if iface == "lo" || strings.HasPrefix(iface, "docker") || strings.HasPrefix(iface, "veth") || strings.HasPrefix(iface, "br-") {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) < 9 {
+			continue
+		}
+		r, _ := strconv.ParseInt(fields[0], 10, 64)
+		t, _ := strconv.ParseInt(fields[8], 10, 64)
+		rx += r
+		tx += t
+	}
+	return rx, tx
+}
+
+// accumulateNIC 把网卡增量写入今日/总计/分时统计。
+// 下行=网卡接收(rx)，上行=网卡发送(tx)。不再使用应用层逐块计数。
+func accumulateNIC(dRx, dTx int64) {
+	if dRx <= 0 && dTx <= 0 {
+		return
+	}
+	now := nowBeijing()
+	date := beijingDate(now)
+	hour := beijingHour(now)
+	total := dRx + dTx
+	statsMu.Lock()
+	stats.TotalBytes += total
+	stats.TodayBytes += total
+	stats.TotalDownBytes += dRx
+	stats.TotalUpBytes += dTx
+	stats.TodayDownBytes += dRx
+	stats.TodayUpBytes += dTx
+	d := dayOf(date)
+	d.Bytes += total
+	d.DownBytes += dRx
+	d.UpBytes += dTx
+	if d.HourBytes == nil {
+		d.HourBytes = map[string]int64{}
+	}
+	if d.HourDownBytes == nil {
+		d.HourDownBytes = map[string]int64{}
+	}
+	if d.HourUpBytes == nil {
+		d.HourUpBytes = map[string]int64{}
+	}
+	d.HourBytes[hour] += total
+	d.HourDownBytes[hour] += dRx
+	d.HourUpBytes[hour] += dTx
+	statsMu.Unlock()
+}
+
 func startNetSpeedSampler() {
 	go func() {
 		var lastRx, lastTx int64
 		var lastT time.Time
+		// 始终按秒采样：既更新实时速率，也把增量计入分时/今日/总计。
 		for {
-			rx, tx := traffic.down.Load(), traffic.up.Load()
+			rx, tx := readNetDevBytes()
 			now := time.Now()
 			if !lastT.IsZero() {
 				dt := now.Sub(lastT).Seconds()
-				if dt > 0.1 {
+				if dt > 0.1 && dt <= 30 {
 					dRx := rx - lastRx
 					dTx := tx - lastTx
 					if dRx < 0 {
@@ -1838,33 +1963,16 @@ func startNetSpeedSampler() {
 					if dTx < 0 {
 						dTx = 0
 					}
-					if liveClients.Load() > 0 && dt <= 10 {
-						rxBps := int64(float64(dRx) / dt)
-						txBps := int64(float64(dTx) / dt)
-						netSpeedMu.Lock()
-						curNetSpeed = netSpeed{RxBps: rxBps, TxBps: txBps}
-						netSpeedMu.Unlock()
-					}
+					rxBps := int64(float64(dRx) / dt)
+					txBps := int64(float64(dTx) / dt)
+					netSpeedMu.Lock()
+					curNetSpeed = netSpeed{RxBps: rxBps, TxBps: txBps}
+					netSpeedMu.Unlock()
+					accumulateNIC(dRx, dTx)
 				}
 			}
 			lastRx, lastTx, lastT = rx, tx, now
-
-			var nap time.Duration
-			if liveClients.Load() > 0 {
-				nap = time.Second
-			} else {
-				nap = 5 * time.Minute
-			}
-			if nap == time.Second {
-				time.Sleep(nap)
-				continue
-			}
-			timer := time.NewTimer(nap)
-			select {
-			case <-timer.C:
-			case <-netSpeedWake:
-				timer.Stop()
-			}
+			time.Sleep(time.Second)
 		}
 	}()
 }
@@ -2018,21 +2126,18 @@ func appendSpeedResult(r speedResult) {
 }
 
 type reportSnap struct {
-	Date        string           `json:"date"`
-	At          string           `json:"at"`
-	Requests    int64            `json:"requests"`
-	Up          int64            `json:"up"`
-	Down        int64            `json:"down"`
-	BlockedCN   int64            `json:"blocked_cn"`
-	BlockedWL   int64            `json:"blocked_wl"`
-	BlockedBan  int64            `json:"blocked_ban"`
-	BlockedUA   int64            `json:"blocked_ua"`
-	Hosts       map[string]int64 `json:"hosts,omitempty"`
-	IPs         map[string]int64 `json:"ips,omitempty"`
-	Countries   map[string]int64 `json:"countries,omitempty"`
-	IPBytes     map[string]int64 `json:"ip_bytes,omitempty"`
-	IPUpBytes   map[string]int64 `json:"ip_up_bytes,omitempty"`
-	IPDownBytes map[string]int64 `json:"ip_down_bytes,omitempty"`
+	Date       string           `json:"date"`
+	At         string           `json:"at"`
+	Requests   int64            `json:"requests"`
+	Up         int64            `json:"up"`
+	Down       int64            `json:"down"`
+	BlockedCN  int64            `json:"blocked_cn"`
+	BlockedWL  int64            `json:"blocked_wl"`
+	BlockedBan int64            `json:"blocked_ban"`
+	BlockedUA  int64            `json:"blocked_ua"`
+	Hosts      map[string]int64 `json:"hosts,omitempty"`
+	IPs        map[string]int64 `json:"ips,omitempty"`
+	Countries  map[string]int64 `json:"countries,omitempty"`
 }
 
 func satSub(a, b int64) int64 {
@@ -2076,10 +2181,6 @@ type reportPayload struct {
 	IPRequests  map[string]int64 `json:"ip_requests"`
 	Countries   map[string]int64 `json:"countries"`
 	Provinces   map[string]int64 `json:"provinces"`
-	IPBytes     map[string]int64 `json:"ip_bytes"`
-	IPUpBytes   map[string]int64 `json:"ip_up_bytes"`
-	IPDownBytes map[string]int64 `json:"ip_down_bytes"`
-	IPStatsOK   bool             `json:"ip_stats_ok"`
 	StatDropped int64            `json:"stats_dropped"`
 	QueueDepth  int              `json:"queue_depth"`
 }
@@ -2100,9 +2201,6 @@ func buildCurrentSnap() reportSnap {
 		sn.Hosts = copyInt64Map(d.Hosts)
 		sn.IPs = copyInt64Map(d.IPs)
 		sn.Countries = copyInt64Map(d.Countries)
-		sn.IPBytes = copyInt64Map(d.IPBytes)
-		sn.IPUpBytes = copyInt64Map(d.IPUpBytes)
-		sn.IPDownBytes = copyInt64Map(d.IPDownBytes)
 	}
 	return sn
 }
@@ -2182,16 +2280,6 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 		name := countryName(code)
 		p.Countries[name] += v
 	}
-	p.IPBytes = mapDelta(cur.IPBytes, base.IPBytes)
-	p.IPUpBytes = mapDelta(cur.IPUpBytes, base.IPUpBytes)
-	p.IPDownBytes = mapDelta(cur.IPDownBytes, base.IPDownBytes)
-
-	keepIPs := topIPsByTotal(p.IPBytes, p.IPUpBytes, p.IPDownBytes, 100)
-	p.IPBytes = alignIPStats(p.IPBytes, keepIPs)
-	p.IPUpBytes = alignIPStats(p.IPUpBytes, keepIPs)
-	p.IPDownBytes = alignIPStats(p.IPDownBytes, keepIPs)
-
-	p.IPStatsOK = len(p.IPBytes) > 0
 	p.StatDropped = statDropped.Load()
 	p.BatchID = p.NodeKey + "-" + p.PeriodDate + "-" + p.PeriodHour
 	return p
@@ -2294,9 +2382,6 @@ func buildDailyReportPayload(date string) (reportPayload, bool) {
 		BlockedUA:   d.BlockedUA,
 		Hosts:       copyInt64Map(d.Hosts),
 		IPs:         copyInt64Map(d.IPs),
-		IPBytes:     copyInt64Map(d.IPBytes),
-		IPUpBytes:   copyInt64Map(d.IPUpBytes),
-		IPDownBytes: copyInt64Map(d.IPDownBytes),
 		Countries:   copyInt64Map(d.Countries),
 		Provinces:   copyInt64Map(d.Provinces),
 		StatDropped: statDropped.Load(),
@@ -2321,11 +2406,6 @@ func buildDailyReportPayload(date string) (reportPayload, bool) {
 		}
 		p.Countries = named
 	}
-	keepIPs := topIPsByTotal(p.IPBytes, p.IPUpBytes, p.IPDownBytes, 100)
-	p.IPBytes = alignIPStats(p.IPBytes, keepIPs)
-	p.IPUpBytes = alignIPStats(p.IPUpBytes, keepIPs)
-	p.IPDownBytes = alignIPStats(p.IPDownBytes, keepIPs)
-	p.IPStatsOK = len(p.IPBytes) > 0
 	p.BatchID = p.NodeKey + "-" + date + "-daily"
 	return p, true
 }
@@ -2359,16 +2439,14 @@ func markDailyReportSent(date string) {
 
 // ---------- 昨日日报自定义发送格式 ----------
 
-const defaultDailyTmpl = `【昨日统计】{{date}}
-节点：{{node}}
-请求：{{requests}} 次
-流量：↓ {{down}} / ↑ {{up}}（共 {{total}}）
-拦截：{{blocked}} 次（CN {{blocked_cn}} / BAN {{blocked_ban}} / UA {{blocked_ua}} / 白名单 {{blocked_wl}}）
-Top IP：{{ips_top}}
-Top 流量 IP：{{ip_bytes_top}}
-Top 域名：{{hosts_top}}
-国家/地区：{{countries_top}}
-省份：{{provinces_top}}`
+// defaultDailyTmpl 默认日报模板（Telegram sendMessage JSON）。
+// chat_id 使用 {{chat_id}} 占位，实际值来自配置 DailyChatID，不写死。
+// 内容以请求数和拦截统计为主，不再包含流量字节。
+const defaultDailyTmpl = `{
+  "chat_id": "{{chat_id}}",
+  "parse_mode": "HTML",
+  "text": "📊 <b>昨日请求统计报告</b>\n\n📅 日期：<code>{{date}}</code>\n🖥 节点：<code>{{node}}</code>\n📝 备注：{{note}}\n\n📈 <b>请求概览</b>\n\n🔢 总请求数：<b><code>{{requests}}</code></b> 次\n\n🛡 <b>安全拦截统计</b>\n\n🚫 总拦截：<b>{{blocked}}</b>\n🇨🇳 国内拦截：{{blocked_cn}}\n🌐 白名单拦截：{{blocked_wl}}\n⛔ 黑名单拦截：{{blocked_ban}}\n🤖 UA 拦截：{{blocked_ua}}\n\n📍 <b>访问排行榜</b>\n\n🌐 <b>IP 访问 TOP</b>\n<pre>{{ips_top_lines}}</pre>\n\n🔗 <b>域名访问 TOP</b>\n<pre>{{hosts_top_lines}}</pre>\n\n🌍 <b>国家 / 地区 TOP</b>\n<pre>{{countries_top_lines}}</pre>\n\n🏙 <b>省份 TOP</b>\n<pre>{{provinces_top}}</pre>\n\n🤖 <i>自动统计 · 每日运行</i>"
+}`
 
 func humanBytes(n int64) string {
 	if n <= 0 {
@@ -2436,6 +2514,7 @@ func renderDailyTemplate(tmpl string, p reportPayload, date string, jsonSafe boo
 		"{{period_end}}":          p.PeriodEnd,
 		"{{node}}":                p.Node,
 		"{{note}}":                p.Note,
+		"{{chat_id}}":             cfgPtr.Load().DailyChatID,
 		"{{version}}":             p.Version,
 		"{{requests}}":            fmt.Sprintf("%d", p.Requests),
 		"{{requests_raw}}":        strconv.FormatInt(p.Requests, 10),
@@ -2450,12 +2529,10 @@ func renderDailyTemplate(tmpl string, p reportPayload, date string, jsonSafe boo
 		"{{blocked_ban}}":         fmt.Sprintf("%d", p.BlockedBan),
 		"{{blocked_ua}}":          fmt.Sprintf("%d", p.BlockedUA),
 		"{{ips_top}}":             topListText(p.IPs, 5, false),
-		"{{ip_bytes_top}}":        topListText(p.IPBytes, 5, true),
 		"{{hosts_top}}":           topListText(p.Hosts, 5, false),
 		"{{countries_top}}":       topListText(p.Countries, 8, false),
 		"{{provinces_top}}":       topListText(p.Provinces, 10, false),
 		"{{ips_top_lines}}":       topListLines(p.IPs, 5, false),
-		"{{ip_bytes_top_lines}}":  topListLines(p.IPBytes, 5, true),
 		"{{hosts_top_lines}}":     topListLines(p.Hosts, 5, false),
 		"{{countries_top_lines}}": topListLines(p.Countries, 8, false),
 		"{{provinces_top_lines}}": topListLines(p.Provinces, 10, false),
@@ -3730,7 +3807,8 @@ func startStatsWorker() {
 						delete(d.UARaw, minK)
 					}
 				}
-			} else if ev.Bytes > 0 || ev.UpBytes > 0 || ev.DownBytes > 0 {
+			} else if false && (ev.Bytes > 0 || ev.UpBytes > 0 || ev.DownBytes > 0) {
+				// 流量已改由网卡采样计入，应用层字节事件不再累加。
 				up, down := ev.UpBytes, ev.DownBytes
 				if up == 0 && down == 0 {
 					down = ev.Bytes
@@ -4742,6 +4820,8 @@ var softScannerUA = []string{
 	"curl/", "wget/",
 }
 
+// isScannerUA 判断是否为扫描器 UA。空 UA 视为扫描器（断连），
+// 但不自动永久拉黑（见 shouldAutoBanUA）。明确特征（sqlmap/nuclei 等）才会自动拉黑。
 func isScannerUA(ua string) bool {
 	ua = strings.ToLower(strings.TrimSpace(ua))
 	if ua == "" {
@@ -5603,6 +5683,9 @@ func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
 	return true, 0
 }
 
+// recordLoginFail 记录管理后台登录失败。
+// 10 分钟内失败达上限则临时锁定（指数退避，最长 2 小时）。
+// 只做临时锁定和拦截记录，不写入永久黑名单。
 func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails int64) {
 	now := time.Now().UnixNano()
 	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
@@ -5779,15 +5862,8 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			rewriteOriginHeaders(pr.Out, t.Scheme, t.Host)
 		},
 		ModifyResponse: func(resp *http.Response) error {
-
-			if resp.Body != nil {
-				rb := reqBytesFrom(resp.Request.Context())
-				resp.Body = struct {
-					io.Reader
-					io.Closer
-				}{&countingReader{r: resp.Body, rb: rb}, resp.Body}
-			}
-			// 下行流量已在 countingWriter 中统计，不再包装 resp.Body，避免双计
+			// 纯转发：不包装 resp.Body。
+			// 仅改写 Location / Set-Cookie 中的上游域名，避免客户端跳回直连。
 			upHost := ""
 			if resp.Request != nil && resp.Request.URL != nil {
 				upHost = resp.Request.URL.Host
@@ -5855,7 +5931,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v2.2.0管理控制台",
+		"description":      "Emby 路径反代 v4.0.0 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6038,7 +6114,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "2.2.0"
+const appVersionStr = "4.1.0"
 
 func activeSessionCount() int {
 	now := time.Now()
@@ -6305,29 +6381,12 @@ func adminHandler() http.HandlerFunc {
 				if len(delta) > 0 {
 					lastSeq = delta[0].Seq
 				}
-				ipRates := snapshotIPRates()
-				type ipSpeed struct {
-					IP string `json:"ip"`
-					Rx int64  `json:"rx_bps"`
-					Tx int64  `json:"tx_bps"`
-				}
-				var speeds []ipSpeed
-				for ip, b := range ipRates {
-					speeds = append(speeds, ipSpeed{IP: ip, Rx: b[1], Tx: b[0]})
-				}
-				sort.Slice(speeds, func(i, j int) bool {
-					return speeds[i].Rx+speeds[i].Tx > speeds[j].Rx+speeds[j].Tx
-				})
-				if len(speeds) > 20 {
-					speeds = speeds[:20]
-				}
 				msg := map[string]any{
 					"concurrent": conc,
 					"rps":        rps,
 					"rx_bps":     ns.RxBps,
 					"tx_bps":     ns.TxBps,
 					"events":     delta,
-					"ip_speeds":  speeds,
 				}
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := conn.WriteJSON(msg); err != nil {
@@ -6613,8 +6672,6 @@ func adminHandler() http.HandlerFunc {
 		}
 		sv := currentStatsView()
 		reqs := sv.ipCounts[ip]
-		upBytes := sv.ipUpBytes[ip]
-		downBytes := sv.ipDownBytes[ip]
 		blocked := 0
 		for _, ev := range sv.blocks {
 			if ev.IP == ip {
@@ -6628,7 +6685,6 @@ func adminHandler() http.HandlerFunc {
 			"isp": geo.ISP, "org": geo.Org, "as": geo.AS,
 			"location": strings.Join(locParts, " · "),
 			"requests": reqs, "blocked": blocked,
-			"up_bytes": upBytes, "down_bytes": downBytes,
 		})
 	})
 	mux.HandleFunc("/admin/api/change-password", func(w http.ResponseWriter, r *http.Request) {
@@ -7272,15 +7328,9 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
 		ctx = context.WithValue(ctx, targetResolutionCtxKey{}, resolution)
 		ctx = withReqBytes(ctx, rb)
-		proxy.ServeHTTP(&countingWriter{ResponseWriter: w, rb: rb}, r.WithContext(ctx))
-		up, down := rb.up.Load(), rb.down.Load()
-		if up > 0 || down > 0 {
-			select {
-			case statChan <- statEvent{IP: ip, UpBytes: up, DownBytes: down, Bytes: up + down}:
-			default:
-				statDropped.Add(1)
-			}
-		}
+		// 纯转发：不包装 ResponseWriter / Body，不做逐块流量计数。
+		// 实时速率由网卡采样提供；请求次数仍由 recordRequestStart 统计。
+		proxy.ServeHTTP(w, r.WithContext(ctx))
 		pushLiveEvent(ip, country, target.Host, r.URL.Path)
 	})
 
@@ -9417,7 +9467,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </div>
 
 <div class="card">
-<div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">仅统计经本服务转发的内容流量（不含系统与其他进程）</div></div></div>
+<div class="ch"><div><h2 class="ct" id="tfByteTitle">流量消耗趋势</h2><div class="cd" id="tfByteDesc">网卡收发累计（下行=接收 rx，上行=发送 tx；含本机其他流量）</div></div></div>
 <div style="position:relative;height:260px"><canvas id="byteChart"></canvas></div>
 </div>
 
@@ -9430,7 +9480,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 <div style="position:relative;height:240px"><canvas id="hostChart"></canvas></div>
 </div>
 <div class="g2" style="margin-top:22px">
-<div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="ipDist"></div></div>
+<div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按请求次数汇总（不再统计流量字节）</div></div></div><div id="ipDist"></div></div>
 <div class="card"><div class="ch"><div><h2 class="ct">地区来源分布</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="regionDist"></div></div>
 </div>
 <div class="g2" style="margin-top:22px">
@@ -9444,10 +9494,6 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <div class="stc g"><div class="sl">每秒请求</div><div class="sv" id="rtRps">-</div><div class="ss">最近 1 秒</div></div>
   <div class="stc" style="box-shadow: inset 4px 0 0 #f59e0b"><div class="sl" style="color:#f59e0b">↓ 下行</div><div class="sv" id="rtRx">-</div><div class="ss">从上游接收的速率</div></div>
   <div class="stc" style="box-shadow: inset 4px 0 0 #8b5cf6"><div class="sl" style="color:#8b5cf6">↑ 上行</div><div class="sv" id="rtTx">-</div><div class="ss">发送给用户的速率</div></div>
-</div>
-<div class="card">
-<div class="ch"><div><h2 class="ct">各 IP 实时网速</h2><div class="cd">最近 1 秒内有流量的 IP（按总速率排序，最多 20 个）</div></div></div>
-<div id="rtIPSpeeds" style="display:grid;gap:8px;margin-bottom:8px"><div style="color:var(--t3);font-size:13px;padding:8px 0">等待数据…</div></div>
 </div>
 <div class="card">
 <div class="ch"><div><h2 class="ct">实时请求流</h2><div class="cd" id="rtStatus">进入页面才开始收集，退出即清空</div></div></div>
@@ -9612,6 +9658,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 <div class="card">
   <div class="ch"><div><h2 class="ct">通知推送（昨日日报）</h2><div class="cd">每日 00:10 把昨日统计推送到 Telegram / 微信 / 钉钉 / Bark 等 Webhook · 开关在页面顶部「定时任务总览」中控制，与接口上报互不影响</div></div></div>
   <div class="fi"><label class="fl">日报发送地址</label><div class="hint" style="margin-bottom:8px">通知 Webhook 地址，如 Telegram Bot：https://api.telegram.org/bot&lt;Token&gt;/sendMessage</div><input id="dailyTmplUrl" class="inp m" type="url" placeholder="https://api.telegram.org/bot123:ABC/sendMessage"></div>
+  <div class="fi"><label class="fl">目标 Chat ID</label><div class="hint" style="margin-bottom:8px">Telegram chat_id 等，模板里用 {{chat_id}} 引用，不写死在模板中</div><input id="dailyChatId" class="inp m" type="text" placeholder="例如 7602361274 或 @channel"></div>
   <div class="fi"><label class="fl">日报 Token</label><div class="hint" style="margin-bottom:8px">以 Bearer Authorization 头随请求发送；Telegram 不需要，留空即可</div><input id="dailyTmplToken" class="inp m" type="text" placeholder="可选"></div>
   <div class="fi"><label class="fl">日报 Content-Type</label><div class="hint" style="margin-bottom:8px">请求体类型：Telegram 用 application/json；Bark 用 text/plain；钉钉/企微机器人用 application/json</div><select id="dailyTmplType" class="inp m" style="width:auto"><option value="text/plain">text/plain</option><option value="text/markdown">text/markdown</option><option value="application/json">application/json</option><option value="application/x-www-form-urlencoded">application/x-www-form-urlencoded</option></select></div>
   <div class="fi"><label class="fl">消息模板（自定义格式）</label><div class="hint" style="margin-bottom:8px">占位符：{{date}}、{{node}}、{{note}}、{{requests}}、{{up}}、{{down}}、{{total}}、{{blocked}}、{{blocked_cn}}、{{blocked_wl}}、{{blocked_ban}}、{{blocked_ua}}、{{ips_top}}、{{ip_bytes_top}}、{{hosts_top}}、{{countries_top}}（*_top 挤在一行）；{{ips_top_lines}}、{{ip_bytes_top_lines}}、{{hosts_top_lines}}、{{countries_top_lines}}（每项一行，更适合 IM 展示）。模板为 JSON 时（如 Telegram）值会自动转义，可放心使用多行占位符；配合 "parse_mode":"HTML" 可用 &lt;b&gt;、&lt;code&gt; 标签美化</div>
@@ -9917,18 +9964,6 @@ function connectRealtime(){
       document.getElementById('rtRps').textContent=(d.rps||0).toLocaleString();
       document.getElementById('rtRx').textContent=fmtBytes(d.rx_bps||0)+'/s';
       document.getElementById('rtTx').textContent=fmtBytes(d.tx_bps||0)+'/s';
-      const spdBox=document.getElementById('rtIPSpeeds');
-      if(spdBox){
-        const speeds=d.ip_speeds||[];
-        if(!speeds.length){
-          spdBox.innerHTML='<div style="color:var(--t3);font-size:13px;padding:8px 0">当前无活跃流量</div>';
-        }else{
-          spdBox.innerHTML=speeds.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:#f8fafc;border-radius:8px;font-size:13px">
-            <span class="mono" style="color:var(--pd);font-weight:600;cursor:pointer" onclick="showIPDetail('${esc(s.ip)}')">${esc(s.ip)}</span>
-            <span style="color:var(--t2)">↓ ${fmtBytes(s.rx_bps||0)}/s　↑ ${fmtBytes(s.tx_bps||0)}/s</span>
-          </div>`).join('');
-        }
-      }
       const evs=d.events||[];
       const tb=document.getElementById('rtTable');
       if(!evs.length) return;
@@ -9994,6 +10029,7 @@ async function loadConfig(){
     const dtOn=document.getElementById('dailyTmplOn');if(dtOn)dtOn.checked=!!c.daily_tmpl_on;
     const dt=document.getElementById('dailyTmpl');if(dt)dt.value=c.daily_tmpl||'';
     const dtUrl=document.getElementById('dailyTmplUrl');if(dtUrl)dtUrl.value=c.daily_tmpl_url||'';
+    const dtCid=document.getElementById('dailyChatId');if(dtCid)dtCid.value=c.daily_chat_id||'';
     const dtTok=document.getElementById('dailyTmplToken');if(dtTok)dtTok.value=c.daily_tmpl_token||'';
     const dtType=document.getElementById('dailyTmplType');if(dtType)dtType.value=c.daily_tmpl_type||'text/plain';
     const aa=document.getElementById('adminAllow');if(aa)aa.value=(c.admin_allow||[]).join('\n');
@@ -10359,7 +10395,7 @@ function applyTrafficView(){
   document.getElementById('tfReqHint').textContent=granHint[v.gran]||('共 '+v.dayCount+' 天');
   document.getElementById('tfBytesHint').textContent=v.isToday?(dayName+'真实分时流量 · 上行+下行合计'):('日均 '+fmtBytes(Math.round(v.totalBytes/(v.dayCount||1)))+' · 上行+下行合计');
   const titleMap={hour:['请求量趋势（分时）','流量消耗趋势（分时）'],day:['请求量趋势','流量消耗趋势'],week:['请求量趋势（按周）','流量消耗趋势（按周）'],month:['请求量趋势（按月）','流量消耗趋势（按月）']};
-  const descMap={hour:[dayName+' 00:00–23:00 各时段请求数（北京时间）',dayName+' 00:00–23:00 各时段上下行流量（上行=本机→客户端，下行=上游→本机）'],day:['筛选区间内每日请求次数（北京时间）','筛选区间内每日上下行流量（下行=上游→本机，上行=本机→客户端）'],week:['区间超过 60 天，已按周汇总','区间超过 60 天，已按周汇总流量'],month:['区间超过 180 天，已按月汇总','区间超过 180 天，已按月汇总流量']};
+  const descMap={hour:[dayName+' 00:00–23:00 各时段请求数（北京时间）',dayName+' 00:00–23:00 各时段网卡流量（下行=接收 rx，上行=发送 tx）'],day:['筛选区间内每日请求次数（北京时间）','筛选区间内每日网卡流量（下行=接收 rx，上行=发送 tx）'],week:['区间超过 60 天，已按周汇总','区间超过 60 天，已按周汇总流量'],month:['区间超过 180 天，已按月汇总','区间超过 180 天，已按月汇总流量']};
   const tt=titleMap[v.gran]||titleMap.day, dd=descMap[v.gran]||descMap.day;
   document.getElementById('tfReqTitle').textContent=tt[0];
   document.getElementById('tfReqDesc').textContent=dd[0];
@@ -10476,9 +10512,7 @@ function renderIP(map,bytesMap,totalUnique,topN){
   const max=rows[0][1]||1;
   const more=(totalUnique||rows.length)>rows.length;
   let html=rows.map(([ip,n])=>{
-    const b=bytesMap&&bytesMap[ip]||0;
-    const btxt='<span class="dbt">'+(b>0?fmtBytes(b):'')+'</span>';
-    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span>${btxt}</div>`;
+    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`;
   }).join('');
   if(more) html+=`<div style="margin-top:10px;font-size:12px;color:var(--t3);text-align:center">仅展示 Top ${rows.length} · 共 ${Number(totalUnique).toLocaleString()} 个 IP</div>`;
   box.innerHTML=html;
@@ -10635,10 +10669,7 @@ async function showIPDetail(ip){
     }else{
       cntRow=['拦截次数',(d.blocked||0).toLocaleString()+' 次',false];
     }
-    const rows=[['IP',d.ip,true],['位置',loc,false],cntRow,
-      ['下行流量',fmtBytes(d.down_bytes||0),false],
-      ['上行流量',fmtBytes(d.up_bytes||0),false],
-      ['合计',fmtBytes((d.up_bytes||0)+(d.down_bytes||0)),false]];
+    const rows=[['IP',d.ip,true],['位置',loc,false],cntRow];
     document.getElementById('modalBody').innerHTML=rows.map(([k,v,m])=>'<div class="kv"><div class="kk">'+esc(k)+'</div><div class="kvv'+(m?' m':'')+'">'+esc(v)+'</div></div>').join('');
   }catch(e){
     document.getElementById('modalBody').innerHTML='<div style="color:var(--d);font-size:13px">加载失败：'+esc(e.message||'未知错误')+'</div>';
@@ -10769,6 +10800,7 @@ function collect(){
     daily_tmpl_on:!!document.getElementById('dailyTmplOn')?.checked,
     daily_tmpl:(document.getElementById('dailyTmpl')?.value||''),
     daily_tmpl_url:(document.getElementById('dailyTmplUrl')?.value||'').trim(),
+    daily_chat_id:(document.getElementById('dailyChatId')?.value||'').trim(),
     daily_tmpl_token:(document.getElementById('dailyTmplToken')?.value||'').trim(),
     daily_tmpl_type:(document.getElementById('dailyTmplType')?.value||'text/plain'),
     }
