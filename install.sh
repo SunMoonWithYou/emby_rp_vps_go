@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.3.5"
+APP_VERSION="4.3.6"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,7 +275,7 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.3.5
+// emby-proxy v4.3.6
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
@@ -1360,20 +1360,43 @@ func startListen(srv *http.Server, port int) error {
 
 // defaultBlockedUAs 默认 UA 黑名单：常见浏览器与爬虫。
 // 仅在配置里从未设置过黑名单（nil）时填入；用户清空保存后不再自动加回。
+// defaultBlockedUAs 只放明确的爬虫/扫描器全名。
+// 不要用 Mozilla、Safari、Chrome、bot 这类宽关键字：Infuse、Emby 等正常客户端
+// 的 User-Agent 里也会带这些字，会被误伤。
 func defaultBlockedUAs() []string {
 	return []string{
-		// 浏览器
+		"Googlebot", "bingbot", "Baiduspider", "YandexBot", "DuckDuckBot",
+		"facebookexternalhit", "Twitterbot", "LinkedInBot", "Slackbot",
+		"Discordbot", "TelegramBot", "SemrushBot", "AhrefsBot", "MJ12bot",
+		"DotBot", "PetalBot", "Bytespider", "python-requests", "Scrapy",
+		"Go-http-client", "curl/", "wget/",
+	}
+}
+
+// oldBadBlockedUAs 是上一版过宽的默认黑名单，升级时若仍是这份就换掉。
+func oldBadBlockedUAs() []string {
+	return []string{
 		"Mozilla/5.0", "Chrome/", "Safari/", "Firefox/", "Edg/", "OPR/", "Opera/",
 		"MSIE", "Trident/",
-		// 爬虫 / 机器人
 		"bot", "spider", "crawl", "Googlebot", "bingbot", "Baiduspider", "YandexBot",
 		"DuckDuckBot", "facebookexternalhit", "Twitterbot", "LinkedInBot", "Slackbot",
 		"Discordbot", "TelegramBot", "WhatsApp", "Semrush", "Ahrefs", "MJ12bot", "DotBot",
 		"PetalBot", "Bytespider",
-		// 脚本 / 扫描工具
 		"curl/", "wget/", "python-requests", "Scrapy", "Go-http-client", "Java/",
 		"Apache-HttpClient", "axios", "node-fetch", "libwww", "Nutch",
 	}
+}
+
+func sameStringList(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // 从 BoltDB 加载配置到内存，必要时填入默认 UA 黑名单，并重建 ACL。
@@ -1390,8 +1413,8 @@ func loadConfig() {
 			return nil
 		})
 	}
-	// 从未配置过 UA 黑名单时填入默认浏览器/爬虫列表
-	if c.BlockedUAs == nil {
+	// 从未配置过则填入精简默认；若仍是上一版过宽默认，升级时自动换成精简版。
+	if c.BlockedUAs == nil || sameStringList(c.BlockedUAs, oldBadBlockedUAs()) {
 		c.BlockedUAs = defaultBlockedUAs()
 	}
 	cfgPtr.Store(c)
@@ -6758,7 +6781,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.3.5 管理控制台",
+		"description":      "Emby 路径反代 v4.3.6 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6962,7 +6985,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.3.5"
+const appVersionStr = "4.3.6"
 
 // activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
