@@ -6,50 +6,58 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.2.1"
+APP_VERSION="4.3.0"
 
-SERVICE_NAME="emby-proxy"
-DEFAULT_PORT=8520
-DEFAULT_BIN="/usr/local/bin/emby-proxy"
-CONFIG_DIR="/etc/emby-proxy"
-DB_FILE="${CONFIG_DIR}/emby.db"
-BUILD_HASH_FILE="${CONFIG_DIR}/build.sha256"
-UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-GO_MIN_MAJOR=1
-GO_MIN_MINOR=23
-GO_FALLBACK_VERSION="1.27.4"
+# ---------- 安装路径与服务 ----------
+SERVICE_NAME="emby-proxy"                              # systemd 服务名
+DEFAULT_PORT=8520                                      # 默认监听端口
+DEFAULT_BIN="/usr/local/bin/emby-proxy"                # 默认二进制安装路径
+CONFIG_DIR="/etc/emby-proxy"                           # 配置与数据库目录
+DB_FILE="${CONFIG_DIR}/emby.db"                        # BoltDB 数据文件
+BUILD_HASH_FILE="${CONFIG_DIR}/build.sha256"           # 源码指纹，用于判断是否需要重编译
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service" # systemd unit 路径
+
+# ---------- Go 工具链 ----------
+GO_MIN_MAJOR=1                                         # 要求的最低 Go 主版本
+GO_MIN_MINOR=23                                        # 要求的最低 Go 次版本
+GO_FALLBACK_VERSION="1.27.4"                           # 包管理器装不到时，改下官方二进制的版本
 # 固定直接依赖版本，避免同一脚本在不同日期解析出不同依赖。
-IPLOC_VERSION="v1.0.20260701"
-BOLT_VERSION="v1.4.3"
-SYNC_VERSION="v0.10.0"
-CRYPTO_VERSION="v0.31.0"
-WEBSOCKET_VERSION="v1.5.3"
+IPLOC_VERSION="v1.0.20260701"                          # IP 归属库
+BOLT_VERSION="v1.4.3"                                  # BoltDB
+SYNC_VERSION="v0.10.0"                                 # singleflight 等同步原语
+CRYPTO_VERSION="v0.31.0"                               # bcrypt
+WEBSOCKET_VERSION="v1.5.3"                             # 后台实时 WebSocket
 
-BUILD_TMPDIR=""
-STAGE_TMPDIR=""
-GENERATED_PASS=0
-PORT=$DEFAULT_PORT
-BIN_PATH=$DEFAULT_BIN
-ADMIN_USER="admin"
-ADMIN_PASS=""
-PREBUILT=""
-FORCE=0
-BINARY_ONLY=0
-PORT_GIVEN=0
-PASS_GIVEN=0
+# ---------- 本次运行的临时状态 ----------
+BUILD_TMPDIR=""                                        # 编译临时目录（退出时清理）
+STAGE_TMPDIR=""                                        # 二进制暂存目录（退出时清理）
+GENERATED_PASS=0                                       # 1=本次自动生成了管理员密码
+PORT=$DEFAULT_PORT                                     # 实际使用的监听端口
+BIN_PATH=$DEFAULT_BIN                                  # 实际使用的二进制路径
+ADMIN_USER="admin"                                     # 管理后台用户名
+ADMIN_PASS=""                                          # 管理后台密码（空=沿用或自动生成）
+PREBUILT=""                                            # 非空则跳过编译，直接用该二进制
+FORCE=0                                                # 1=强制重编译
+BINARY_ONLY=0                                          # 1=只更新二进制，不改 unit
+PORT_GIVEN=0                                           # 1=命令行显式指定了端口
+PASS_GIVEN=0                                           # 1=命令行显式指定了密码
 
-info() { printf '\033[1;32m[OK] %s\033[0m\n' "$*"; }
-warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
-err()  { printf '\033[1;31m[ERR] %s\033[0m\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
+# ---------- 日志与退出 ----------
+info() { printf '\033[1;32m[OK] %s\033[0m\n' "$*"; }   # 绿色成功信息
+warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; } # 黄色警告
+err()  { printf '\033[1;31m[ERR] %s\033[0m\n' "$*" >&2; } # 红色错误（写到 stderr）
+die()  { err "$*"; exit 1; }                             # 打印错误并退出
 
+# 退出时清理编译/暂存临时目录。
 cleanup() {
   if [[ -n "$BUILD_TMPDIR" && -d "$BUILD_TMPDIR" ]]; then rm -rf "$BUILD_TMPDIR"; fi
   if [[ -n "$STAGE_TMPDIR" && -d "$STAGE_TMPDIR" ]]; then rm -rf "$STAGE_TMPDIR"; fi
 }
 trap cleanup EXIT
 
+# 要求以 root 运行，否则直接退出。
 require_root() { [[ $EUID -eq 0 ]] || die "请使用 root 权限: sudo $0 $*"; }
+# 要求系统有 systemd 且正在运行。
 require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "未检测到 systemctl"
   [[ -d /run/systemd/system ]] || die "systemd 未运行"
@@ -267,22 +275,24 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.0.0
+// emby-proxy v4.3.0
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
 // 数据路径（v4.0 起）：
 //   - 纯转发。httputil.ReverseProxy 直接写回客户端，
 //     不再用 countingReader / countingWriter 逐块计数。
-//   - 实时网速优先用 iptables 对监听端口做内核级计数（只统计本服务端口，
-//     不进转发路径）；无 iptables 时回退 /proc/net/dev 整机网卡，按秒差分。
+//   - 实时网速优先用 iptables owner + connmark 只统计本进程流量
+//     （客户端侧 + 源站侧，不含其他软件）；无 iptables 或非专用用户时
+//     回退监听端口计数，再不行回退 /proc/net/dev 整机网卡。
 //
 // 访问控制（判定链，命中即拒绝）：
 //   ① IP 黑名单
 //   ② 访问域名守卫（Host）
-//   ③ UA 白名单（AllowedUAs 非空时做大小写不敏感子串匹配）
-//   ④ 地区限制（ChinaOnly）
-//   ⑤ 上游域名白名单
+//   ③ UA 黑名单（BlockedUAs 非空时命中即拒绝）
+//   ④ UA 白名单（AllowedUAs 非空时做大小写不敏感子串匹配）
+//   ⑤ 地区限制（ChinaOnly）
+//   ⑥ 上游域名白名单
 //
 // 早筛层（独立开关，默认关）：
 //   - 蜜罐路径：命中断连并自动拉黑
@@ -339,22 +349,29 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// adminHTML 管理后台页面（编译期嵌入）。
 //go:embed admin.html
 var adminHTML []byte
 
+// chartJS 后台图表库 Chart.js（编译期嵌入）。
 //go:embed chart.umd.min.js
 var chartJS []byte
 
+// context 键：存放本次请求解析出的上游 URL。
 type targetCtxKey struct{}
+// context 键：存放已校验的上游 DNS 结果，供 dialPinned 使用。
 type targetResolutionCtxKey struct{}
 
+// 一次上游解析结果：规范化主机名与可用 IP 列表。
 type targetResolution struct {
 	host string
 	ips  []net.IP
 }
 
+// httpPorts 视为明文 HTTP 的常见端口；未列出的端口默认按 https 处理。
 var httpPorts = map[string]bool{"80": true, "8080": true, "8000": true, "8008": true, "8081": true, "8088": true, "8888": true, "3000": true, "5000": true, "7001": true, "8090": true, "8096": true, "9000": true, "9090": true, "9200": true, "10000": true, "15672": true}
 
+// 根据端口选择上游协议：常见明文端口走 http，其余默认 https。
 func schemeForPort(port string) string {
 	if port == "" || port == "443" || port == "8443" || port == "8920" || port == "9443" {
 		return "https"
@@ -365,6 +382,7 @@ func schemeForPort(port string) string {
 	return "https"
 }
 
+// 从 authority（可含 userinfo）里抽出端口并决定 http/https。
 func schemeForAuthority(authority string) string {
 	host := authority
 	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
@@ -381,6 +399,7 @@ func schemeForAuthority(authority string) string {
 	return schemeForPort(port)
 }
 
+// 把「主机[:端口]/路径」拆成 authority 与 path。
 func splitAuthority(s string) (authority, path string) {
 	if i := strings.IndexByte(s, '/'); i >= 0 {
 		return s[:i], s[i:]
@@ -390,6 +409,7 @@ func splitAuthority(s string) (authority, path string) {
 
 var builtinAssets = map[string]bool{"favicon.ico": true, "favicon.png": true, "favicon.svg": true, "favicon-16x16.png": true, "favicon-32x32.png": true, "favicon-96x96.png": true, "apple-touch-icon.png": true, "apple-touch-icon-precomposed.png": true, "robots.txt": true, "sitemap.xml": true, "browserconfig.xml": true, "manifest.json": true, "site.webmanifest": true, "humans.txt": true, "security.txt": true, "crossdomain.xml": true, "app-ads.txt": true}
 
+// 判断是否为浏览器自动请求的内置资源（favicon、robots.txt、.well-known 等）。
 func isBuiltinAssetPath(p string) bool {
 	p = strings.TrimPrefix(p, "/")
 	if p == "" {
@@ -404,6 +424,7 @@ func isBuiltinAssetPath(p string) bool {
 	return strings.HasPrefix(p, ".well-known/")
 }
 
+// pageCSS 首页与错误页共用的样式（含浅色/深色主题变量）。
 const pageCSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#f4f7fb;--card:#fff;--bd:#e6ebf2;--t:#0f172a;--t2:#475569;--t3:#94a3b8;--p:#3b82f6;--pd:#2563eb;--ps:#eff6ff;--pb:#bfdbfe;--d:#ef4444;--ds:#fef2f2;--db:#fecaca;--w:#f59e0b;--ws:#fffbeb;--wb:#fde68a;--ok:#10b981;--oks:#ecfdf5;--ob:#a7f3d0;--panel:#f8fafc;--r:18px;--mono:Consolas,"SFMono-Regular",Menlo,monospace}
@@ -462,10 +483,12 @@ html[data-theme="dark"] .tips{color:var(--t2)}
 // 所有动态内容统一经 pageEsc 转义，避免 Host、路径、UA、上游错误等用户输入造成 XSS。
 
 type pageKV struct{ K, V string }
+// 错误页/首页上的一个操作按钮（跳转、复制或刷新）。
 type pageAction struct {
 	Label, Href, Kind, Copy string
 	Reload                  bool
 }
+// 统一页面渲染所需的全部字段。
 type pageData struct {
 	Status    int
 	Kind      string // red / amber / blue / green
@@ -494,8 +517,10 @@ var pageIconSVG = map[string]string{
 	"green": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.8 2.8L16 9.6"/></svg>`,
 }
 
+// HTML 转义，防止 Host、路径、UA 等用户输入造成 XSS。
 func pageEsc(s string) string { return html.EscapeString(s) }
 
+// 把 HTTP 状态码格式化成「码 · 中文说明」。
 func pageStatusLabel(status int) string {
 	zh := statusZh[status]
 	if zh == "" {
@@ -504,6 +529,7 @@ func pageStatusLabel(status int) string {
 	return fmt.Sprintf("%d · %s", status, zh)
 }
 
+// 按页面类型（red/amber/blue/green）返回对应 SVG 图标。
 func pageIcon(kind string) string {
 	if s, ok := pageIconSVG[kind]; ok {
 		return s
@@ -511,6 +537,7 @@ func pageIcon(kind string) string {
 	return pageIconSVG["red"]
 }
 
+// 把运行时长格式化成「X 天 X 小时」等人可读字符串。
 func pageDuration(d time.Duration) string {
 	sec := int64(d.Seconds())
 	if sec < 0 {
@@ -529,6 +556,7 @@ func pageDuration(d time.Duration) string {
 	}
 }
 
+// 渲染统一风格的 HTML 页（首页与各类错误页共用）。
 func renderPage(w http.ResponseWriter, p pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -644,6 +672,11 @@ func autoPageTips(status int, code string) []string {
 			"换用已授权的客户端（如 Infuse、Emby 官方 App）再试。",
 			"如需使用当前客户端，请联系服务提供者为其授权。",
 		}
+	case "ua_block":
+		return []string{
+			"当前客户端的 User-Agent 已被管理员加入黑名单。",
+			"如为误封，请联系服务提供者将其从 UA 黑名单中移除。",
+		}
 	case "cn":
 		return []string{
 			"当前出口 IP 的归属地不在放行范围内，切换网络后重试。",
@@ -671,6 +704,7 @@ func autoPageTips(status int, code string) []string {
 	return []string{"请核对访问地址与请求参数后重试。"}
 }
 
+// 错误页附加信息：原因码、中文说明、额外建议与技术详情。
 type errPageCtx struct {
 	Code  string   // 原因码，用于匹配建议库；留空则按状态码给建议
 	Label string   // 原因中文说明
@@ -716,6 +750,7 @@ func serveError(w http.ResponseWriter, r *http.Request, status int, title, messa
 	})
 }
 
+// 渲染网关首页：展示运行状态、用法示例，不暴露媒体内容。
 func serveHome(w http.ResponseWriter, r *http.Request) {
 	ip := getClientIP(r)
 	host := r.Host
@@ -918,6 +953,7 @@ func resolveTargetIPs(ctx context.Context, target *url.URL) (*targetResolution, 
 	return &targetResolution{host: cacheKey, ips: ips}, nil
 }
 
+// DNS 缓存条目：IP 列表与过期时间。
 type dnsCacheEntry struct {
 	ips []net.IP
 	exp time.Time
@@ -929,6 +965,7 @@ var (
 	dnsGroup   singleflight.Group
 )
 
+// 读取未过期的 DNS 缓存；命中则直接返回，避免重复解析。
 func lookupDNSCache(host string) ([]net.IP, bool) {
 	dnsCacheMu.Lock()
 	defer dnsCacheMu.Unlock()
@@ -952,6 +989,7 @@ func lookupDNSCacheStale(host string) ([]net.IP, bool) {
 	return e.ips, true
 }
 
+// 写入 DNS 缓存（TTL 300s），并在条目过多时清理过期项。
 func storeDNSCache(host string, ips []net.IP) {
 	cp := make([]net.IP, len(ips))
 	for i, ip := range ips {
@@ -1016,6 +1054,7 @@ type Config struct {
 	Whitelist  []string `json:"whitelist"`
 	BanList    []string `json:"ban_list"`
 	AllowedUAs []string `json:"allowed_uas"`
+	BlockedUAs []string `json:"blocked_uas"` // UA 黑名单：命中任一关键字即拒绝（优先于白名单）
 	// 访问域名守卫：校验浏览器地址栏里的 Host，禁止用服务器 IP 直连反代。
 	// 与上面的 Whitelist（路径里允许反代到的上游域名）是两个不同维度，互不影响。
 	HostGuardOn  bool     `json:"host_guard_on"` // 总开关，默认 false 以兼容旧配置
@@ -1051,12 +1090,16 @@ var beijingLoc = func() *time.Location {
 	return loc
 }()
 
+// 返回当前北京时间。
 func nowBeijing() time.Time { return time.Now().In(beijingLoc) }
 
+// 把时间格式化成北京时间日期（YYYY-MM-DD）。
 func beijingDate(t time.Time) string { return t.In(beijingLoc).Format("2006-01-02") }
 
+// 把时间格式化成北京时间小时（00-23）。
 func beijingHour(t time.Time) string { return t.In(beijingLoc).Format("15") }
 
+// 把时间格式化成北京时间的 RFC3339 字符串。
 func beijingRFC3339(t time.Time) string { return t.In(beijingLoc).Format(time.RFC3339) }
 
 var (
@@ -1077,10 +1120,12 @@ const (
 	icon512URL     = "https://raw.githubusercontent.com/SunMoonWithYou/emby_rp_vps_go/main/img/emby_rp_vps_go_512.png"
 )
 
+// 图标请求重定向到仓库内的静态资源。
 func redirectIcon(w http.ResponseWriter, r *http.Request, src string) {
 	http.Redirect(w, r, src, http.StatusFound)
 }
 
+// 读取当前生效配置；未加载时返回零值配置。
 func currentCfg() *Config {
 	if p := cfgPtr.Load(); p != nil {
 		return p
@@ -1088,12 +1133,15 @@ func currentCfg() *Config {
 	return &Config{}
 }
 
+// 配置编译后的运行时 ACL，避免每请求重复解析规则。
 type compiledACL struct {
 	exactBan   map[string]struct{}
 	cidrs      []*net.IPNet
-	uaNeedles  []string // 已转小写的 UA 关键字
-	uaKeywords []string // 原始关键字（展示用），与 uaNeedles 一一对应
-	whitelist  []whitelistEntry // 预编译的上游白名单，避免每请求重复解析规则字符串
+	uaNeedles       []string         // 已转小写的 UA 白名单关键字
+	uaKeywords      []string         // 原始白名单关键字（展示用）
+	uaBlockNeedles  []string         // 已转小写的 UA 黑名单关键字
+	uaBlockKeywords []string         // 原始黑名单关键字（展示用）
+	whitelist       []whitelistEntry // 预编译的上游白名单，避免每请求重复解析规则字符串
 }
 
 var aclPtr atomic.Pointer[compiledACL]
@@ -1127,6 +1175,14 @@ func rebuildACL(c *Config) {
 		a.uaKeywords = append(a.uaKeywords, k)
 		a.uaNeedles = append(a.uaNeedles, strings.ToLower(k))
 	}
+	for _, u := range c.BlockedUAs {
+		k := strings.TrimSpace(u)
+		if k == "" {
+			continue
+		}
+		a.uaBlockKeywords = append(a.uaBlockKeywords, k)
+		a.uaBlockNeedles = append(a.uaBlockNeedles, strings.ToLower(k))
+	}
 	for _, wl := range c.Whitelist {
 		if e, ok := parseWhitelistEntry(wl); ok {
 			a.whitelist = append(a.whitelist, e)
@@ -1135,6 +1191,7 @@ func rebuildACL(c *Config) {
 	aclPtr.Store(a)
 }
 
+// 读取当前预编译 ACL；未构建时返回空 ACL。
 func currentACL() *compiledACL {
 	if p := aclPtr.Load(); p != nil {
 		return p
@@ -1142,6 +1199,7 @@ func currentACL() *compiledACL {
 	return &compiledACL{exactBan: map[string]struct{}{}}
 }
 
+// 从查询参数解析分页 limit/offset，并限制上限。
 func pageParams(r *http.Request, defLimit int) (int, int) {
 	limit := defLimit
 	if s := r.URL.Query().Get("limit"); s != "" {
@@ -1181,6 +1239,7 @@ func isBannedIP(ipStr string, clientIP net.IP) bool {
 	return false
 }
 
+// 返回 UA 命中的白名单关键字（用于展示归类）；未命中返回空。
 func uaWhitelistKeyword(ua string) string {
 	a := currentACL()
 	if len(a.uaNeedles) == 0 {
@@ -1210,6 +1269,7 @@ func (a *compiledACL) matchWhitelist(targetHost, targetPath string) bool {
 	return false
 }
 
+// 客户端归类：优先识别已知播放器，否则回退到白名单关键字。
 func uaClassOfEx(ua string) string {
 	cls := uaClassOf(ua)
 	if cls == "其他" || cls == "未知" {
@@ -1238,6 +1298,24 @@ func uaAllowed(ua string) bool {
 	return false
 }
 
+// uaBlocked 检查 User-Agent 是否命中黑名单关键字。
+// 黑名单为空时不拦截；非空时做大小写不敏感子串匹配，命中任一即拒绝。
+// 判定顺序上优先于白名单。
+func uaBlocked(ua string) bool {
+	a := currentACL()
+	if len(a.uaBlockNeedles) == 0 {
+		return false
+	}
+	low := strings.ToLower(ua)
+	for _, n := range a.uaBlockNeedles {
+		if strings.Contains(low, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// 返回当前实际监听端口（加锁读取）。
 func currentPort() int { listenMu.Lock(); defer listenMu.Unlock(); return curPort }
 
 // startListen 在指定端口启动（或热切换）HTTP 监听。
@@ -1269,6 +1347,26 @@ func startListen(srv *http.Server, port int) error {
 // 首次启动或数据库为空时使用零值配置。
 // loadConfig 从 BoltDB 读取配置到内存。
 // 库不存在或为空时使用默认配置，不报错退出。
+
+// defaultBlockedUAs 默认 UA 黑名单：常见浏览器与爬虫。
+// 仅在配置里从未设置过黑名单（nil）时填入；用户清空保存后不再自动加回。
+func defaultBlockedUAs() []string {
+	return []string{
+		// 浏览器
+		"Mozilla/5.0", "Chrome/", "Safari/", "Firefox/", "Edg/", "OPR/", "Opera/",
+		"MSIE", "Trident/",
+		// 爬虫 / 机器人
+		"bot", "spider", "crawl", "Googlebot", "bingbot", "Baiduspider", "YandexBot",
+		"DuckDuckBot", "facebookexternalhit", "Twitterbot", "LinkedInBot", "Slackbot",
+		"Discordbot", "TelegramBot", "WhatsApp", "Semrush", "Ahrefs", "MJ12bot", "DotBot",
+		"PetalBot", "Bytespider",
+		// 脚本 / 扫描工具
+		"curl/", "wget/", "python-requests", "Scrapy", "Go-http-client", "Java/",
+		"Apache-HttpClient", "axios", "node-fetch", "libwww", "Nutch",
+	}
+}
+
+// 从 BoltDB 加载配置到内存，必要时填入默认 UA 黑名单，并重建 ACL。
 func loadConfig() {
 	c := &Config{}
 	if db != nil {
@@ -1281,6 +1379,10 @@ func loadConfig() {
 			}
 			return nil
 		})
+	}
+	// 从未配置过 UA 黑名单时填入默认浏览器/爬虫列表
+	if c.BlockedUAs == nil {
+		c.BlockedUAs = defaultBlockedUAs()
 	}
 	cfgPtr.Store(c)
 	rebuildACL(c)
@@ -1306,6 +1408,7 @@ func saveConfig(c *Config) error {
 	return err
 }
 
+// 把 host:port 规范化成小写纯主机名。
 func normalizeHost(hostport string) string {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
@@ -1316,6 +1419,7 @@ func normalizeHost(hostport string) string {
 
 var multiSuffix = map[string]bool{"co.uk": true, "org.uk": true, "me.uk": true, "ac.uk": true, "gov.uk": true, "ltd.uk": true, "plc.uk": true, "net.uk": true, "sch.uk": true, "com.cn": true, "net.cn": true, "org.cn": true, "gov.cn": true, "edu.cn": true, "ac.cn": true, "com.tw": true, "org.tw": true, "net.tw": true, "idv.tw": true, "com.hk": true, "org.hk": true, "net.hk": true, "edu.hk": true, "gov.hk": true, "co.jp": true, "or.jp": true, "ne.jp": true, "ac.jp": true, "go.jp": true, "co.kr": true, "or.kr": true, "com.au": true, "net.au": true, "org.au": true, "com.br": true, "com.sg": true, "com.my": true, "co.in": true, "com.tr": true, "com.ru": true, "com.mx": true, "com.ar": true, "co.nz": true, "co.za": true, "com.ua": true, "com.pl": true, "co.id": true, "com.sa": true, "com.eg": true}
 
+// 提取根域名；对 co.uk、com.cn 等多级后缀做特殊处理。
 func rootDomain(hostport string) string {
 	host := normalizeHost(hostport)
 	if net.ParseIP(host) != nil {
@@ -1348,6 +1452,7 @@ type whitelistEntry struct {
 	wild bool   // 是否 *. 通配
 }
 
+// 解析一条上游白名单规则（支持域名、通配、IP、端口、路径前缀）。
 func parseWhitelistEntry(w string) (whitelistEntry, bool) {
 	w = strings.TrimSpace(w)
 	if i := strings.IndexAny(w, "#;"); i >= 0 {
@@ -1580,6 +1685,7 @@ func accessHostAllowed(c *Config, r *http.Request) (bool, string) {
 	return true, ""
 }
 
+// 一次拦截事件，供后台拦截记录展示。
 type BlockEvent struct {
 	Time       string `json:"time"`
 	IP         string `json:"ip"`
@@ -1593,6 +1699,7 @@ type BlockEvent struct {
 	RespBytes  int64  `json:"resp_bytes"` // 估算响应消耗（错误页）
 }
 
+// 某一天的聚合统计（请求、流量、地区、IP、UA 等）。
 type DayStat struct {
 	Requests      int64            `json:"requests"`
 	Bytes         int64            `json:"bytes"`
@@ -1619,6 +1726,7 @@ type DayStat struct {
 
 const uaRawCap = 100
 
+// 把 UA 压成用于统计的短键（去多余空白并截断）。
 func uaRawKey(ua string) string {
 	k := strings.Join(strings.Fields(ua), " ")
 	if len(k) > 96 {
@@ -1627,6 +1735,7 @@ func uaRawKey(ua string) string {
 	return k
 }
 
+// 创建一份空的按日统计结构。
 func newDayStat() *DayStat {
 	return &DayStat{
 		Countries:     map[string]int64{},
@@ -1645,6 +1754,7 @@ func newDayStat() *DayStat {
 	}
 }
 
+// 保证按日统计里的各个 map 已初始化，避免空指针。
 func ensureDayMaps(d *DayStat) {
 	if d.Countries == nil {
 		d.Countries = map[string]int64{}
@@ -1687,6 +1797,7 @@ func ensureDayMaps(d *DayStat) {
 	}
 }
 
+// 浅拷贝 int64 map；空则返回 nil。
 func copyInt64Map(src map[string]int64) map[string]int64 {
 	if len(src) == 0 {
 		return nil
@@ -1694,6 +1805,7 @@ func copyInt64Map(src map[string]int64) map[string]int64 {
 	return cloneInt64Map(src)
 }
 
+// 把小时计数补全为 00-23 共 24 档，便于前端绘图。
 func hour24(src map[string]int64) map[string]int64 {
 	out := make(map[string]int64, 24)
 	for h := 0; h < 24; h++ {
@@ -1703,6 +1815,7 @@ func hour24(src map[string]int64) map[string]int64 {
 	return out
 }
 
+// 取或创建指定日期的按日统计。
 func dayOf(date string) *DayStat {
 	if stats.Daily == nil {
 		stats.Daily = map[string]*DayStat{}
@@ -1716,6 +1829,7 @@ func dayOf(date string) *DayStat {
 	return d
 }
 
+// 全局统计快照，定时落盘到 BoltDB。
 type Stats struct {
 	SchemaVersion    int                 `json:"schema_version"`
 	TodayDate        string              `json:"today_date"`
@@ -1742,6 +1856,7 @@ type Stats struct {
 	Audit            []AuditEvent        `json:"audit,omitempty"`
 }
 
+// 一条后台操作审计记录。
 type AuditEvent struct {
 	Time   string `json:"time"`
 	IP     string `json:"ip"`
@@ -1754,6 +1869,7 @@ var (
 	statsMu sync.Mutex
 )
 
+// 投递给统计协程的单条事件。
 type statEvent struct {
 	IP        string
 	Country   string
@@ -1771,6 +1887,7 @@ var statChan = make(chan statEvent, 50000)
 var concurrent atomic.Int64
 var liveClients atomic.Int32
 
+// 端口级上下行累计（原子计数）。
 type portTraffic struct {
 	down atomic.Int64
 	up   atomic.Int64
@@ -1778,23 +1895,28 @@ type portTraffic struct {
 
 var traffic portTraffic
 
+// 单个请求的上下行字节计数。
 type reqBytes struct {
 	up   atomic.Int64
 	down atomic.Int64
 	ip   string
 }
 
+// context 键：关联本请求的 reqBytes。
 type reqBytesKey struct{}
 
+// 把本请求的字节计数器放进 context。
 func withReqBytes(ctx context.Context, rb *reqBytes) context.Context {
 	return context.WithValue(ctx, reqBytesKey{}, rb)
 }
 
+// 从 context 取出本请求的字节计数器。
 func reqBytesFrom(ctx context.Context) *reqBytes {
 	rb, _ := ctx.Value(reqBytesKey{}).(*reqBytes)
 	return rb
 }
 
+// 单个 IP 的瞬时上下行计数。
 type ipLiveRate struct {
 	up   atomic.Int64
 	down atomic.Int64
@@ -1802,6 +1924,7 @@ type ipLiveRate struct {
 
 var ipLiveRates sync.Map
 
+// 累加某个 IP 的实时上下行字节（供后台瞬时速率）。
 func addIPLive(ip string, up, down int64) {
 	if ip == "" || (up == 0 && down == 0) {
 		return
@@ -1816,6 +1939,7 @@ func addIPLive(ip string, up, down int64) {
 	}
 }
 
+// 拍一份各 IP 的瞬时速率并清零计数器。
 func snapshotIPRates() map[string][2]int64 {
 	out := make(map[string][2]int64)
 	ipLiveRates.Range(func(k, v any) bool {
@@ -1836,6 +1960,7 @@ type countingReader struct {
 	rb *reqBytes
 }
 
+// Read：方法实现。
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
@@ -1854,7 +1979,9 @@ type countingReadCloser struct {
 	c io.Closer
 }
 
+// Read：方法实现。
 func (c *countingReadCloser) Read(p []byte) (int, error) { return c.r.Read(p) }
+// Close：方法实现。
 func (c *countingReadCloser) Close() error {
 	if c.c != nil {
 		return c.c.Close()
@@ -1870,6 +1997,7 @@ type countingWriter struct {
 	rb *reqBytes
 }
 
+// Write：方法实现。
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.ResponseWriter.Write(p)
 	if n > 0 {
@@ -1882,12 +2010,14 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Flush：方法实现。
 func (c *countingWriter) Flush() {
 	if f, ok := c.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
+// Hijack：方法实现。
 func (c *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	h, ok := c.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -1896,10 +2026,12 @@ func (c *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return h.Hijack()
 }
 
+// Unwrap：方法实现。
 func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 
 var netSpeedWake = make(chan struct{}, 1)
 
+// 唤醒网速采样协程（非阻塞）。
 func wakeNetSpeedSampler() {
 	select {
 	case netSpeedWake <- struct{}{}:
@@ -1907,6 +2039,7 @@ func wakeNetSpeedSampler() {
 	}
 }
 
+// 实时面板上的一条访问事件。
 type liveEvent struct {
 	Time    string `json:"time"`
 	IP      string `json:"ip"`
@@ -1927,6 +2060,7 @@ var (
 	liveSeq  atomic.Int64
 )
 
+// 向实时面板推一条访问事件；无订阅者时直接跳过。
 func pushLiveEvent(ip, country, host, path string) {
 	if liveClients.Load() == 0 {
 		return
@@ -1957,6 +2091,7 @@ func pushLiveEvent(ip, country, host, path string) {
 	liveMu.Unlock()
 }
 
+// 清空实时事件缓冲。
 func clearLive() {
 	liveMu.Lock()
 	liveBuf = nil
@@ -1965,6 +2100,7 @@ func clearLive() {
 	rpsCount.Store(0)
 }
 
+// 拍一份实时事件、并发数与当前 RPS。
 func snapshotLive() (events []liveEvent, conc int64, rps int64) {
 	liveMu.Lock()
 	n := len(liveBuf)
@@ -1982,6 +2118,7 @@ func snapshotLive() (events []liveEvent, conc int64, rps int64) {
 	return events, concurrent.Load(), rpsCount.Load()
 }
 
+// 当前采样到的收发速率（字节/秒）。
 type netSpeed struct {
 	RxBps int64 `json:"rx_bps"`
 	TxBps int64 `json:"tx_bps"`
@@ -2057,14 +2194,17 @@ func accumulateNIC(dRx, dTx int64) {
 	statsMu.Unlock()
 }
 
-// portAcct 用 iptables/ip6tables 对监听端口做内核级字节计数。
-// 不进入 Go 转发路径，不影响播放流畅度。仅统计进出该端口的 TCP 流量。
+// portAcct 用 iptables owner + connmark 只统计本进程的进出流量
+// （客户端侧 + 源站侧），不把机器上其他软件算进去。
+// 要求服务以非 root 专用用户运行；以 root 运行时回退为监听端口计数。
 var (
 	portAcctMu   sync.Mutex
 	portAcctPort int
 	portAcctOK   atomic.Bool
+	portAcctMode string // "owner" | "port" | ""
 )
 
+// iptablesCmd：相关逻辑处理。
 func iptablesCmd(bin string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -2072,6 +2212,7 @@ func iptablesCmd(bin string, args ...string) error {
 	return cmd.Run()
 }
 
+// iptablesOut：相关逻辑处理。
 func iptablesOut(bin string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -2080,59 +2221,94 @@ func iptablesOut(bin string, args ...string) (string, error) {
 	return string(b), err
 }
 
-func ensureAcctChain(bin, chain, match string) {
-	_ = iptablesCmd(bin, "-N", chain)
-	_ = iptablesCmd(bin, "-F", chain)
-	_ = iptablesCmd(bin, "-A", chain, "-p", "tcp", match)
-	// 跳转规则：先删旧的再插，避免重复。
-	_ = iptablesCmd(bin, "-D", chainParent(chain), "-p", "tcp", match, "-j", chain)
-	_ = iptablesCmd(bin, "-I", chainParent(chain), "-p", "tcp", match, "-j", chain)
-}
-
-func chainParent(chain string) string {
-	if strings.HasSuffix(chain, "_OUT") {
-		return "OUTPUT"
-	}
-	return "INPUT"
-}
-
-func removePortJump(bin string, port int) {
-	if port <= 0 {
-		return
-	}
-	dport := fmt.Sprintf("--dport=%d", port)
-	sport := fmt.Sprintf("--sport=%d", port)
-	_ = iptablesCmd(bin, "-D", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN")
-	_ = iptablesCmd(bin, "-D", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT")
-}
-
-// removeAllPortJumps 移除 INPUT/OUTPUT 中所有跳转到 EMBY_PROXY_IN/OUT 的规则。
-// 用于启动时清理异常退出（kill -9 / 崩溃）残留的旧端口跳转规则。
+// 停止或清理 removeAllPortJumps 相关资源。
 func removeAllPortJumps(bin string) {
 	for _, dir := range []string{"INPUT", "OUTPUT"} {
-		chain := "EMBY_PROXY_IN"
-		if dir == "OUTPUT" {
-			chain = "EMBY_PROXY_OUT"
+		for _, chain := range []string{"EMBY_PROXY_IN", "EMBY_PROXY_OUT"} {
+			out, err := iptablesOut(bin, "-S", dir)
+			if err != nil {
+				continue
+			}
+			for _, line := range strings.Split(out, "\n") {
+				line = strings.TrimSpace(line)
+				if !strings.HasSuffix(line, "-j "+chain) {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) < 3 || fields[0] != "-A" {
+					continue
+				}
+				_ = iptablesCmd(bin, append([]string{"-D", dir}, fields[1:]...)...)
+			}
 		}
-		out, err := iptablesOut(bin, "-S", dir)
+	}
+	// 清理 mangle 表里的 CONNMARK 规则
+	for _, dir := range []string{"OUTPUT", "INPUT"} {
+		out, err := iptablesOut(bin, "-t", "mangle", "-S", dir)
 		if err != nil {
 			continue
 		}
 		for _, line := range strings.Split(out, "\n") {
 			line = strings.TrimSpace(line)
-			if !strings.HasSuffix(line, "-j "+chain) {
+			if !strings.Contains(line, "CONNMARK") || !strings.Contains(line, "0x1001") {
 				continue
 			}
 			fields := strings.Fields(line)
 			if len(fields) < 3 || fields[0] != "-A" {
 				continue
 			}
-			// 按 -S 输出的原始参数重建 -D 规则，保证精确删除
-			_ = iptablesCmd(bin, append([]string{"-D", dir}, fields[1:]...)...)
+			_ = iptablesCmd(bin, append([]string{"-t", "mangle", "-D", dir}, fields[1:]...)...)
 		}
 	}
 }
 
+// 写入/保存 setupOwnerAcct 对应的数据。
+func setupOwnerAcct(bin string, uid int, port int) bool {
+	uidStr := strconv.Itoa(uid)
+	dport := fmt.Sprintf("--dport=%d", port)
+	// 计数链
+	_ = iptablesCmd(bin, "-N", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-N", "EMBY_PROXY_OUT")
+	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_OUT")
+	// 链内规则：只计数，不做其他动作
+	_ = iptablesCmd(bin, "-A", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-A", "EMBY_PROXY_OUT")
+
+	// mangle: 给本用户的出站连接打 connmark，便于在 INPUT 侧识别源站回包
+	_ = iptablesCmd(bin, "-t", "mangle", "-A", "OUTPUT", "-m", "owner", "--uid-owner", uidStr, "-j", "CONNMARK", "--set-mark", "0x1001")
+	_ = iptablesCmd(bin, "-t", "mangle", "-A", "INPUT", "-m", "connmark", "--mark", "0x1001", "-j", "CONNMARK", "--restore-mark")
+
+	// filter: 出站全部用 owner（客户端响应 + 源站请求）
+	_ = iptablesCmd(bin, "-I", "OUTPUT", "-m", "owner", "--uid-owner", uidStr, "-j", "EMBY_PROXY_OUT")
+	// 入站：监听端口（客户端请求）+ connmark（源站响应）
+	_ = iptablesCmd(bin, "-I", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-I", "INPUT", "-m", "connmark", "--mark", "0x1001", "-j", "EMBY_PROXY_IN")
+
+	// 验证关键规则
+	if iptablesCmd(bin, "-C", "OUTPUT", "-m", "owner", "--uid-owner", uidStr, "-j", "EMBY_PROXY_OUT") != nil {
+		return false
+	}
+	return true
+}
+
+// 写入/保存 setupPortOnlyAcct 对应的数据。
+func setupPortOnlyAcct(bin string, port int) bool {
+	dport := fmt.Sprintf("--dport=%d", port)
+	sport := fmt.Sprintf("--sport=%d", port)
+	_ = iptablesCmd(bin, "-N", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-N", "EMBY_PROXY_OUT")
+	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_OUT")
+	_ = iptablesCmd(bin, "-A", "EMBY_PROXY_IN", "-p", "tcp", dport)
+	_ = iptablesCmd(bin, "-A", "EMBY_PROXY_OUT", "-p", "tcp", sport)
+	_ = iptablesCmd(bin, "-I", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-I", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT")
+	return iptablesCmd(bin, "-C", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN") == nil &&
+		iptablesCmd(bin, "-C", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT") == nil
+}
+
+// 写入/保存 setupPortAcct 对应的数据。
 func setupPortAcct(port int) {
 	if port <= 0 {
 		return
@@ -2142,34 +2318,38 @@ func setupPortAcct(port int) {
 	if portAcctPort == port && portAcctOK.Load() {
 		return
 	}
-	dport := fmt.Sprintf("--dport=%d", port)
-	sport := fmt.Sprintf("--sport=%d", port)
+	uid := os.Getuid()
 	ok := false
+	mode := ""
 	for _, bin := range []string{"iptables", "ip6tables"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			continue
 		}
-		// v4.2.0: 先清掉所有指向计数链的跳转规则（含 kill -9 等异常退出残留的旧端口规则），
-		// 避免残留堆积；随后再插入本端口的跳转。
 		removeAllPortJumps(bin)
-		ensureAcctChain(bin, "EMBY_PROXY_IN", dport)
-		ensureAcctChain(bin, "EMBY_PROXY_OUT", sport)
-		// v4.2.0: 用 -C 验证跳转规则确实插入成功（无权限/容器环境会静默失败），
-		// 失败则整体回退网卡统计，避免计数恒为 0 还被当作"端口模式"。
-		if iptablesCmd(bin, "-C", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN") == nil &&
-			iptablesCmd(bin, "-C", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT") == nil {
+		if uid != 0 && setupOwnerAcct(bin, uid, port) {
 			ok = true
+			mode = "owner"
+		} else if setupPortOnlyAcct(bin, port) {
+			ok = true
+			if mode == "" {
+				mode = "port"
+			}
 		}
 	}
 	portAcctPort = port
 	portAcctOK.Store(ok)
-	if ok {
-		log.Printf("[acct] 已对监听端口 %d 启用 iptables 流量计数（仅本端口，不影响转发）", port)
-	} else {
-		log.Printf("[acct] 未找到 iptables，流量统计回退为整机网卡")
+	portAcctMode = mode
+	switch mode {
+	case "owner":
+		log.Printf("[acct] 已启用 iptables owner 计数（仅本进程，含源站与客户端，uid=%d）", uid)
+	case "port":
+		log.Printf("[acct] owner 不可用（当前 uid=%d），回退为监听端口 %d 计数", uid, port)
+	default:
+		log.Printf("[acct] iptables 不可用，流量统计回退为整机网卡")
 	}
 }
 
+// 解析 IptablesBytes 相关输入。
 func parseIptablesBytes(out string) int64 {
 	var total int64
 	for _, line := range strings.Split(out, "\n") {
@@ -2177,7 +2357,6 @@ func parseIptablesBytes(out string) int64 {
 		if len(fields) < 2 {
 			continue
 		}
-		// 计数行形如: pkts bytes target ...  或  pkts bytes  tcp ...
 		if _, err := strconv.ParseInt(fields[0], 10, 64); err != nil {
 			continue
 		}
@@ -2190,6 +2369,7 @@ func parseIptablesBytes(out string) int64 {
 	return total
 }
 
+// 读取/获取 readPortAcctBytes 对应的数据。
 func readPortAcctBytes() (rx, tx int64, ok bool) {
 	if !portAcctOK.Load() {
 		return 0, 0, false
@@ -2210,16 +2390,17 @@ func readPortAcctBytes() (rx, tx int64, ok bool) {
 	return rx, tx, ok
 }
 
-// cleanupPortAcct 退出时移除 iptables 跳转规则（计数链本身保留，无副作用）。
+// cleanupPortAcct 退出时移除跳转规则与 connmark 规则。
 func cleanupPortAcct() {
 	for _, bin := range []string{"iptables", "ip6tables"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			continue
 		}
-		removePortJump(bin, portAcctPort)
+		removeAllPortJumps(bin)
 	}
 }
 
+// 启动 NetSpeedSampler 相关后台任务或监听。
 func startNetSpeedSampler() {
 	go func() {
 		var lastRx, lastTx int64
@@ -2258,12 +2439,14 @@ func startNetSpeedSampler() {
 	}()
 }
 
+// 读取/获取 getNetSpeed 对应的数据。
 func getNetSpeed() netSpeed {
 	netSpeedMu.RLock()
 	defer netSpeedMu.RUnlock()
 	return curNetSpeed
 }
 
+// 测速链接令牌：可用次数与创建时间。
 type speedToken struct {
 	Token   string
 	MaxUses int
@@ -2275,6 +2458,7 @@ var speedTokens sync.Map
 
 const speedTokenValidity = 7 * 24 * time.Hour
 
+// speedTokenExpired：相关逻辑处理。
 func speedTokenExpired(st *speedToken) bool {
 	t, err := time.Parse(time.RFC3339, st.Created)
 	if err != nil {
@@ -2283,6 +2467,7 @@ func speedTokenExpired(st *speedToken) bool {
 	return time.Since(t) > speedTokenValidity
 }
 
+// 启动 SpeedTokenCleaner 相关后台任务或监听。
 func startSpeedTokenCleaner() {
 	go func() {
 		for {
@@ -2302,6 +2487,7 @@ func startSpeedTokenCleaner() {
 	}()
 }
 
+// 写入/保存 saveSpeedTokens 对应的数据。
 func saveSpeedTokens() {
 	type tokRec struct {
 		Token   string `json:"token"`
@@ -2325,6 +2511,7 @@ func saveSpeedTokens() {
 	})
 }
 
+// 读取/获取 loadSpeedTokens 对应的数据。
 func loadSpeedTokens() {
 	_ = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("speed_tokens"))
@@ -2353,6 +2540,7 @@ func loadSpeedTokens() {
 	})
 }
 
+// 一次测速结果记录。
 type speedResult struct {
 	Time     string  `json:"time"`
 	Token    string  `json:"token"`
@@ -2370,6 +2558,7 @@ var (
 
 const maxSpeedResults = 100
 
+// 读取/获取 loadSpeedResults 对应的数据。
 func loadSpeedResults() {
 	speedResults = nil
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -2387,6 +2576,7 @@ func loadSpeedResults() {
 	})
 }
 
+// appendSpeedResult：相关逻辑处理。
 func appendSpeedResult(r speedResult) {
 	speedResultsMu.Lock()
 	speedResults = append(speedResults, r)
@@ -2406,6 +2596,7 @@ func appendSpeedResult(r speedResult) {
 	})
 }
 
+// 上报用的统计快照。
 type reportSnap struct {
 	Date       string           `json:"date"`
 	At         string           `json:"at"`
@@ -2421,6 +2612,7 @@ type reportSnap struct {
 	Countries  map[string]int64 `json:"countries,omitempty"`
 }
 
+// satSub：相关逻辑处理。
 func satSub(a, b int64) int64 {
 	if a > b {
 		return a - b
@@ -2428,6 +2620,7 @@ func satSub(a, b int64) int64 {
 	return 0
 }
 
+// mapDelta：相关逻辑处理。
 func mapDelta(cur, prev map[string]int64) map[string]int64 {
 	out := make(map[string]int64, len(cur))
 	for k, v := range cur {
@@ -2438,6 +2631,7 @@ func mapDelta(cur, prev map[string]int64) map[string]int64 {
 	return out
 }
 
+// 实际上报的报文结构。
 type reportPayload struct {
 	BatchID     string           `json:"batch_id"`
 	NodeKey     string           `json:"node_key"`
@@ -2468,6 +2662,7 @@ type reportPayload struct {
 
 var reportQueueMu sync.Mutex
 
+// buildCurrentSnap：相关逻辑处理。
 func buildCurrentSnap() reportSnap {
 	now := nowBeijing()
 	date := beijingDate(now)
@@ -2486,6 +2681,7 @@ func buildCurrentSnap() reportSnap {
 	return sn
 }
 
+// 读取/获取 loadReportSnaps 对应的数据。
 func loadReportSnaps() []reportSnap {
 	var list []reportSnap
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -2499,6 +2695,7 @@ func loadReportSnaps() []reportSnap {
 	return list
 }
 
+// 写入/保存 saveReportSnaps 对应的数据。
 func saveReportSnaps(list []reportSnap) {
 	raw, _ := json.Marshal(list)
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -2510,6 +2707,7 @@ func saveReportSnaps(list []reportSnap) {
 	})
 }
 
+// 启动 HourlySnapshotWorker 相关后台任务或监听。
 func startHourlySnapshotWorker() {
 	go func() {
 		for {
@@ -2531,6 +2729,7 @@ func startHourlySnapshotWorker() {
 	}()
 }
 
+// payloadFromDelta：相关逻辑处理。
 func payloadFromDelta(base, cur reportSnap) reportPayload {
 	p := reportPayload{
 		NodeKey:    getNodeKey(),
@@ -2566,6 +2765,7 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 	return p
 }
 
+// topIPsByTotal：相关逻辑处理。
 func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} {
 	score := make(map[string]int64, len(total)+len(up)+len(down))
 	for ip := range total {
@@ -2604,6 +2804,7 @@ func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} 
 	return out
 }
 
+// alignIPStats：相关逻辑处理。
 func alignIPStats(m map[string]int64, keep map[string]struct{}) map[string]int64 {
 	out := make(map[string]int64, len(keep))
 	for ip := range keep {
@@ -2612,6 +2813,7 @@ func alignIPStats(m map[string]int64, keep map[string]struct{}) map[string]int64
 	return out
 }
 
+// lastFullHourReport：相关逻辑处理。
 func lastFullHourReport() (reportPayload, bool) {
 	snaps := loadReportSnaps()
 	if len(snaps) < 2 {
@@ -2707,6 +2909,7 @@ func lastDailyReportSent() string {
 	return m.Date
 }
 
+// markDailyReportSent：相关逻辑处理。
 func markDailyReportSent(date string) {
 	raw, _ := json.Marshal(map[string]string{"date": date, "time": beijingRFC3339(nowBeijing())})
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -2729,6 +2932,7 @@ const defaultDailyTmpl = `{
   "text": "📊 <b>昨日请求统计报告</b>\n\n📅 日期：<code>{{date}}</code>\n🖥 节点：<code>{{node}}</code>\n📝 备注：{{note}}\n\n📈 <b>请求概览</b>\n\n🔢 总请求数：<b><code>{{requests}}</code></b> 次\n\n🛡 <b>安全拦截统计</b>\n\n🚫 总拦截：<b>{{blocked}}</b>\n🇨🇳 国内拦截：{{blocked_cn}}\n🌐 白名单拦截：{{blocked_wl}}\n⛔ 黑名单拦截：{{blocked_ban}}\n🤖 UA 拦截：{{blocked_ua}}\n\n📍 <b>访问排行榜</b>\n\n🌐 <b>IP 访问 TOP</b>\n<pre>{{ips_top_lines}}</pre>\n\n🔗 <b>域名访问 TOP</b>\n<pre>{{hosts_top_lines}}</pre>\n\n🌍 <b>国家 / 地区 TOP</b>\n<pre>{{countries_top_lines}}</pre>\n\n🏙 <b>省份 TOP</b>\n<pre>{{provinces_top}}</pre>\n\n🤖 <i>自动统计 · 每日运行</i>"
 }`
 
+// humanBytes：相关逻辑处理。
 func humanBytes(n int64) string {
 	if n <= 0 {
 		return "0 B"
@@ -2877,6 +3081,7 @@ func jsonSafeValue(v string) string {
 	return v
 }
 
+// mustJSON：相关逻辑处理。
 func mustJSON(v any) []byte {
 	raw, _ := json.Marshal(v)
 	return raw
@@ -2904,6 +3109,7 @@ func dailyTarget(c *Config) (string, string) {
 	return c.ReportURL, c.ReportToken
 }
 
+// dailyContentType：相关逻辑处理。
 func dailyContentType(c *Config) string {
 	if c.DailyTmplOn {
 		if t := strings.TrimSpace(c.DailyTmplType); t != "" {
@@ -2966,6 +3172,7 @@ type reportChannelPlan struct {
 	Mode   string `json:"mode,omitempty"` // 通知通道：template / json / off
 }
 
+// 上报通道的执行计划（下次时间、是否就绪等）。
 type reportPlan struct {
 	API   reportChannelPlan `json:"api"`
 	Daily reportChannelPlan `json:"daily"`
@@ -3114,11 +3321,13 @@ func startDailyReportWorker() {
 	}()
 }
 
+// 解析 RFC3339 相关输入。
 func parseRFC3339(s string) time.Time {
 	t, _ := time.Parse(time.RFC3339, s)
 	return t
 }
 
+// detectNodeName：相关逻辑处理。
 func detectNodeName() string {
 	if ip, _ := selfPublicIP.Load().(string); ip != "" {
 		return ip
@@ -3131,6 +3340,7 @@ func detectNodeName() string {
 
 var nodeKeyCache atomic.Value
 
+// 读取/获取 getNodeKey 对应的数据。
 func getNodeKey() string {
 	if v, _ := nodeKeyCache.Load().(string); v != "" {
 		return v
@@ -3158,6 +3368,7 @@ func getNodeKey() string {
 	return key
 }
 
+// 一条上报历史记录。
 type reportRecord struct {
 	ID           string `json:"id"`
 	Time         string `json:"time"`
@@ -3195,6 +3406,7 @@ var (
 	reportRecordsMu sync.Mutex
 )
 
+// 读取/获取 loadReportRecords 对应的数据。
 func loadReportRecords() {
 	reportRecordsMu.Lock()
 	defer reportRecordsMu.Unlock()
@@ -3215,6 +3427,7 @@ func loadReportRecords() {
 	gcReportPayloadsLocked()
 }
 
+// pruneReportRecordsLocked：调用方需已持有对应锁。
 func pruneReportRecordsLocked() bool {
 	cutoff := nowBeijing().AddDate(0, 0, -reportRecordKeepDays).Format(time.RFC3339)
 	out := reportRecords[:0]
@@ -3243,6 +3456,7 @@ func pruneReportRecordsLocked() bool {
 	return false
 }
 
+// 写入/保存 saveReportPayload 对应的数据。
 func saveReportPayload(id string, payload []byte) {
 	if id == "" || len(payload) == 0 {
 		return
@@ -3256,6 +3470,7 @@ func saveReportPayload(id string, payload []byte) {
 	})
 }
 
+// 读取/获取 loadReportPayload 对应的数据。
 func loadReportPayload(id string) (string, bool) {
 	if id == "" {
 		return "", false
@@ -3272,6 +3487,7 @@ func loadReportPayload(id string) (string, bool) {
 	return string(out), out != nil
 }
 
+// deleteReportPayloads：相关逻辑处理。
 func deleteReportPayloads(ids []string) {
 	if len(ids) == 0 {
 		return
@@ -3288,6 +3504,7 @@ func deleteReportPayloads(ids []string) {
 	})
 }
 
+// clearReportPayloads：相关逻辑处理。
 func clearReportPayloads() {
 	_ = db.Update(func(tx *bolt.Tx) error {
 		if tx.Bucket([]byte(reportPayloadBucket)) != nil {
@@ -3297,6 +3514,7 @@ func clearReportPayloads() {
 	})
 }
 
+// gcReportPayloadsLocked：调用方需已持有对应锁。
 func gcReportPayloadsLocked() {
 	keep := make(map[string]struct{}, len(reportRecords))
 	for _, r := range reportRecords {
@@ -3320,6 +3538,7 @@ func gcReportPayloadsLocked() {
 	deleteReportPayloads(orphan)
 }
 
+// persistReportRecordsLocked：调用方需已持有对应锁。
 func persistReportRecordsLocked() {
 	snap := make([]reportRecord, len(reportRecords))
 	copy(snap, reportRecords)
@@ -3333,6 +3552,7 @@ func persistReportRecordsLocked() {
 	})
 }
 
+// appendReportRecord：相关逻辑处理。
 func appendReportRecord(rec reportRecord, payload []byte) {
 	if rec.Time == "" {
 		rec.Time = beijingRFC3339(nowBeijing())
@@ -3357,6 +3577,7 @@ func appendReportRecord(rec reportRecord, payload []byte) {
 	persistReportRecordsLocked()
 }
 
+// 启动 ReportRecordCleaner 相关后台任务或监听。
 func startReportRecordCleaner() {
 	go func() {
 		for {
@@ -3375,6 +3596,7 @@ const maxReportQueue = 24
 // maxQueueAttempts 单条队列项最大重试次数，超过则放弃（防止坏地址无限堆积）
 const maxQueueAttempts = 50
 
+// queuedReport：相关数据结构。
 type queuedReport struct {
 	ID          string `json:"id"`
 	Payload     []byte `json:"payload"`
@@ -3387,6 +3609,7 @@ type queuedReport struct {
 	ContentType string `json:"content_type,omitempty"` // 留空为 application/json
 }
 
+// 读取/获取 loadReportQueue 对应的数据。
 func loadReportQueue() []queuedReport {
 	var list []queuedReport
 	_ = db.View(func(tx *bolt.Tx) error {
@@ -3402,6 +3625,7 @@ func loadReportQueue() []queuedReport {
 	return list
 }
 
+// 写入/保存 saveReportQueue 对应的数据。
 func saveReportQueue(list []queuedReport) {
 	raw, _ := json.Marshal(list)
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -3413,10 +3637,12 @@ func saveReportQueue(list []queuedReport) {
 	})
 }
 
+// sendOnceResp：相关逻辑处理。
 func sendOnceResp(url, token string, body []byte) (int, string, error) {
 	return sendOnceRespCT(url, token, body, "application/json")
 }
 
+// sendOnceRespCT：相关逻辑处理。
 func sendOnceRespCT(url, token string, body []byte, contentType string) (int, string, error) {
 	if contentType == "" {
 		contentType = "application/json"
@@ -3446,6 +3672,7 @@ func sendOnceRespCT(url, token string, body []byte, contentType string) (int, st
 
 var reportClient = &http.Client{Timeout: 25 * time.Second}
 
+// errString：相关逻辑处理。
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -3453,6 +3680,7 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// flushReportQueue：相关逻辑处理。
 func flushReportQueue() {
 	c := cfgPtr.Load()
 	if c == nil {
@@ -3563,6 +3791,7 @@ func flushReportQueue() {
 	saveReportQueue(keep)
 }
 
+// recordFromPayload：相关逻辑处理。
 func recordFromPayload(payload []byte, batchID, trigger string, status int, respBody string, err error, attempts int, start time.Time, ip, targetURL string) reportRecord {
 	var p reportPayload
 	_ = json.Unmarshal(payload, &p)
@@ -3593,6 +3822,7 @@ func recordFromPayload(payload []byte, batchID, trigger string, status int, resp
 	return rec
 }
 
+// enqueueAndSend：相关逻辑处理。
 func enqueueAndSend() {
 	c := cfgPtr.Load()
 	if c == nil || c.ReportURL == "" || !c.ReportOn {
@@ -3616,6 +3846,7 @@ func enqueueAndSend() {
 	flushReportQueue()
 }
 
+// 启动 ReportWorker 相关后台任务或监听。
 func startReportWorker() {
 	go func() {
 		for {
@@ -3636,6 +3867,7 @@ func startReportWorker() {
 	}()
 }
 
+// 处理 serveSpeedTest 对应的 HTTP 请求。
 func serveSpeedTest(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/speed/")
 	if rest == "" {
@@ -4019,6 +4251,7 @@ var wsUpgrader = websocket.Upgrader{
 
 var statDropped atomic.Int64
 
+// pruneTopN：相关逻辑处理。
 func pruneTopN[K comparable](m map[K]int64, n int) {
 	if len(m) <= n {
 		return
@@ -4046,6 +4279,7 @@ func pruneTopN[K comparable](m map[K]int64, n int) {
 	}
 }
 
+// pruneStatsLocked：调用方需已持有对应锁。
 func pruneStatsLocked() {
 	pruneTopN(stats.IPCounts, 1000)
 	pruneTopN(stats.IPBytes, 1000)
@@ -4072,12 +4306,40 @@ func pruneStatsLocked() {
 	if len(stats.Audit) > maxAuditEvents {
 		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
 	}
+	// 按时间清理：拦截/审计只保留最近 7 天，避免长期堆积
+	cutoffT := time.Now().AddDate(0, 0, -7).Format(time.RFC3339)
+	if len(stats.Blocks) > 0 {
+		i := 0
+		for _, b := range stats.Blocks {
+			if b.Time >= cutoffT {
+				stats.Blocks[i] = b
+				i++
+			}
+		}
+		stats.Blocks = stats.Blocks[:i]
+	}
+	if len(stats.Blocks) > maxBlockEvents {
+		stats.Blocks = stats.Blocks[len(stats.Blocks)-maxBlockEvents:]
+	}
+	if len(stats.Audit) > 0 {
+		i := 0
+		for _, a := range stats.Audit {
+			if a.Time >= cutoffT {
+				stats.Audit[i] = a
+				i++
+			}
+		}
+		stats.Audit = stats.Audit[:i]
+	}
+	if len(stats.Audit) > maxAuditEvents {
+		stats.Audit = stats.Audit[len(stats.Audit)-maxAuditEvents:]
+	}
 }
 
+// 启动 StatsWorker 相关后台任务或监听。
 func startStatsWorker() {
 	go func() {
-		for ev := range statChan {
-			statsMu.Lock()
+		apply := func(ev statEvent) {
 			now := nowBeijing()
 			t := beijingDate(now)
 			hour := beijingHour(now)
@@ -4124,7 +4386,10 @@ func startStatsWorker() {
 					d.UARaw[ev.UARaw]++
 					// 超过容量时批量裁剪，避免每次插入都全表扫描。
 					if len(d.UARaw) > uaRawCap+20 {
-						type kv struct{ k string; v int64 }
+						type kv struct {
+							k string
+							v int64
+						}
 						arr := make([]kv, 0, len(d.UARaw))
 						for k, v := range d.UARaw {
 							arr = append(arr, kv{k, v})
@@ -4142,11 +4407,25 @@ func startStatsWorker() {
 					}
 				}
 			}
+		}
+		for ev := range statChan {
+			statsMu.Lock()
+			apply(ev)
+			// 一次锁处理多条，减少高并发下的锁竞争
+			for n := 0; n < 64; n++ {
+				select {
+				case ev2 := <-statChan:
+					apply(ev2)
+				default:
+					n = 64
+				}
+			}
 			statsMu.Unlock()
 		}
 	}()
 }
 
+// recordRequestStart：相关逻辑处理。
 func recordRequestStart(ip, country, host, ua string) {
 	select {
 	case statChan <- statEvent{IP: ip, Country: country, Host: host, UAClass: uaClassOfEx(ua), UARaw: uaRawKey(ua), IsStart: true}:
@@ -4155,6 +4434,7 @@ func recordRequestStart(ip, country, host, ua string) {
 	}
 }
 
+// statsMetaDisk：相关数据结构。
 type statsMetaDisk struct {
 	SchemaVersion    int    `json:"schema_version"`
 	TodayDate        string `json:"today_date"`
@@ -4173,6 +4453,7 @@ type statsMetaDisk struct {
 	LastProxyAt      string `json:"last_proxy_at"`
 }
 
+// emptyStats：相关逻辑处理。
 func emptyStats() Stats {
 	return Stats{
 		SchemaVersion: 2,
@@ -4188,6 +4469,7 @@ func emptyStats() Stats {
 	}
 }
 
+// rebuildAggregatesFromDaily：相关逻辑处理。
 func rebuildAggregatesFromDaily() {
 	stats.CountryCounts = map[string]int64{}
 	stats.IPCounts = map[string]int64{}
@@ -4367,6 +4649,7 @@ func loadStats() {
 	}
 }
 
+// statsSnapshot：相关数据结构。
 type statsSnapshot struct {
 	meta       []byte
 	blocks     []byte
@@ -4488,6 +4771,7 @@ func persistStats(snap *statsSnapshot) error {
 	return nil
 }
 
+// 写入/保存 saveStatsOnce 对应的数据。
 func saveStatsOnce() {
 	statsMu.Lock()
 	snap := marshalStatsLocked()
@@ -4495,6 +4779,7 @@ func saveStatsOnce() {
 	persistStats(snap)
 }
 
+// 启动 StatsSaver 相关后台任务或监听。
 func startStatsSaver() {
 	go func() {
 		t := time.NewTicker(5 * time.Minute)
@@ -4509,6 +4794,7 @@ func startStatsSaver() {
 	}()
 }
 
+// 读取/获取 getClientIP 对应的数据。
 func getClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -4544,12 +4830,14 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+// 判断 TrustedProxy 是否成立。
 func isTrustedProxy(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 var selfPublicIP atomic.Value
 
+// detectSelfPublicIP：相关逻辑处理。
 func detectSelfPublicIP() {
 	go func() {
 		client := &http.Client{Timeout: 4 * time.Second}
@@ -4573,6 +4861,7 @@ func detectSelfPublicIP() {
 	}()
 }
 
+// provinceOf：相关逻辑处理。
 func provinceOf(ipStr string) string {
 	ipStr = strings.TrimSpace(ipStr)
 	if ipStr == "" || countryOf(ipStr) != "CN" {
@@ -4609,6 +4898,7 @@ func provinceOf(ipStr string) string {
 	return normalizeProvince(ge.Region)
 }
 
+// 规范化 rovince。
 func normalizeProvince(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -4640,6 +4930,7 @@ func normalizeProvince(s string) string {
 	return s
 }
 
+// countryOf：相关逻辑处理。
 func countryOf(ipStr string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -4909,6 +5200,7 @@ var countryNames = map[string]string{
 	"ZZ": "未知",
 }
 
+// countryName：相关逻辑处理。
 func countryName(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if code == "" || code == "ZZ" {
@@ -4946,6 +5238,7 @@ var countryCodeByEnglishName = map[string]string{
 	"Morocco": "MA", "Algeria": "DZ", "Tunisia": "TN", "Ethiopia": "ET",
 }
 
+// countryCodeByName：相关逻辑处理。
 func countryCodeByName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -4971,6 +5264,7 @@ func countryCodeByName(name string) string {
 	return ""
 }
 
+// 判断 SelfOrLocalIP 是否成立。
 func isSelfOrLocalIP(ip, country string) bool {
 	if country == "LO" || country == "PV" {
 		return true
@@ -4992,6 +5286,7 @@ func isSelfOrLocalIP(ip, country string) bool {
 var blockRateMu sync.Mutex
 var blockRates = make(map[string]*blockRateEntry)
 
+// blockRateEntry：相关数据结构。
 type blockRateEntry struct {
 	count int
 	start time.Time
@@ -5143,6 +5438,7 @@ func isScannerUA(ua string) bool {
 	return false
 }
 
+// shouldAutoBanUA：相关逻辑处理。
 func shouldAutoBanUA(ua string) bool {
 	ua = strings.ToLower(strings.TrimSpace(ua))
 	if ua == "" {
@@ -5187,17 +5483,37 @@ func autoBanIP(ip, reason string) {
 	recordAudit("system", "auto_ban", ip+"（"+reason+"）")
 }
 
+// rateBucket：相关数据结构。
 type rateBucket struct {
 	tokens float64
 	last   time.Time
 	seen   time.Time
 }
 
-var (
-	rateMu        sync.Mutex
-	rateBuckets   = map[string]*rateBucket{}
-	rateLastSweep time.Time
-)
+// ipStateShard 将 IP 级限速与并发状态分片，避免所有客户端争抢同一把全局锁。
+// 同一个 IP 始终落入同一分片，因此令牌桶与并发计数仍然保持原子语义。
+const ipStateShardCount = 64
+
+// ipStateShard：相关数据结构。
+type ipStateShard struct {
+	mu        sync.Mutex
+	rates     map[string]*rateBucket
+	inflight  map[string]int
+	lastSweep time.Time
+}
+
+var ipStateShards [ipStateShardCount]ipStateShard
+
+// ipStateShardFor：相关逻辑处理。
+func ipStateShardFor(ip string) *ipStateShard {
+	// FNV-1a，直接对字符串计算，不创建临时字节切片。
+	h := uint32(2166136261)
+	for i := 0; i < len(ip); i++ {
+		h ^= uint32(ip[i])
+		h *= 16777619
+	}
+	return &ipStateShards[h%ipStateShardCount]
+}
 
 // globalRateLimited 单 IP 令牌桶限速：超出每秒速率或突发上限返回 true。
 func globalRateLimited(ip string, perSec, burst int) bool {
@@ -5211,22 +5527,19 @@ func globalRateLimited(ip string, perSec, burst int) bool {
 		burst = 240
 	}
 	now := time.Now()
-	rateMu.Lock()
-	defer rateMu.Unlock()
-	b, ok := rateBuckets[ip]
-	if !ok {
-		b = &rateBucket{tokens: float64(burst), last: now, seen: now}
-		rateBuckets[ip] = b
-		// 惰性清理，避免扫描器刷出大量 IP 导致 map 膨胀
-		if len(rateBuckets) > 4000 && now.Sub(rateLastSweep) > time.Minute {
-			for k, v := range rateBuckets {
-				if now.Sub(v.seen) > 3*time.Minute {
-					delete(rateBuckets, k)
-				}
-			}
-			rateLastSweep = now
-		}
+	shard := ipStateShardFor(ip)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if shard.rates == nil {
+		shard.rates = make(map[string]*rateBucket)
 	}
+	b := shard.rates[ip]
+	if b == nil {
+		b = &rateBucket{tokens: float64(burst), last: now, seen: now}
+		shard.rates[ip] = b
+	}
+
 	if el := now.Sub(b.last).Seconds(); el > 0 {
 		b.tokens += el * float64(perSec)
 		if b.tokens > float64(burst) {
@@ -5235,6 +5548,17 @@ func globalRateLimited(ip string, perSec, burst int) bool {
 		b.last = now
 	}
 	b.seen = now
+
+	// 每个分片独立惰性清理，限制随机 IP 请求造成的长期内存增长。
+	if len(shard.rates) > 64 && now.Sub(shard.lastSweep) > time.Minute {
+		for k, v := range shard.rates {
+			if now.Sub(v.seen) > 3*time.Minute {
+				delete(shard.rates, k)
+			}
+		}
+		shard.lastSweep = now
+	}
+
 	if b.tokens < 1 {
 		return true
 	}
@@ -5242,23 +5566,40 @@ func globalRateLimited(ip string, perSec, burst int) bool {
 	return false
 }
 
-// ipInflight 记录每个 IP 当前在途请求数，用于单 IP 并发上限。
-var ipInflight sync.Map
-
-// ipConnAcquire 申请一个并发名额；超限返回 ok=false。
+// ipConnAcquire 申请单 IP 并发名额。计数归零时立即删除，避免 sync.Map
+// 长期保存已经没有活动请求的 IP。
 func ipConnAcquire(ip string, limit int) (func(), bool) {
 	if ip == "" || limit <= 0 {
 		return func() {}, true
 	}
-	v, _ := ipInflight.LoadOrStore(ip, new(int64))
-	p := v.(*int64)
-	if atomic.AddInt64(p, 1) > int64(limit) {
-		atomic.AddInt64(p, -1)
+
+	shard := ipStateShardFor(ip)
+	shard.mu.Lock()
+	if shard.inflight == nil {
+		shard.inflight = make(map[string]int)
+	}
+	if shard.inflight[ip] >= limit {
+		shard.mu.Unlock()
 		return func() {}, false
 	}
-	return func() { atomic.AddInt64(p, -1) }, true
+	shard.inflight[ip]++
+	shard.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			shard.mu.Lock()
+			if n := shard.inflight[ip]; n <= 1 {
+				delete(shard.inflight, ip)
+			} else {
+				shard.inflight[ip] = n - 1
+			}
+			shard.mu.Unlock()
+		})
+	}, true
 }
 
+// truncStr：相关逻辑处理。
 func truncStr(s string, n int) string {
 	if n <= 0 || len(s) <= n {
 		return s
@@ -5307,7 +5648,7 @@ func recordBlocked(ip, country, path, reason, ua, host string, reqBytes, respByt
 	case "ban":
 		stats.BlockedBan++
 		day.BlockedBan++
-	case "ua":
+	case "ua", "ua_block":
 		stats.BlockedUA++
 		day.BlockedUA++
 	case "login_fail":
@@ -5331,6 +5672,7 @@ func recordBlocked(ip, country, path, reason, ua, host string, reqBytes, respByt
 	}
 }
 
+// blockReasonText：相关逻辑处理。
 func blockReasonText(reason string) string {
 	switch reason {
 	case "cn":
@@ -5339,6 +5681,8 @@ func blockReasonText(reason string) string {
 		return "IP 在黑名单中"
 	case "ua":
 		return "User-Agent 不在允许列表"
+	case "ua_block":
+		return "User-Agent 在黑名单中"
 	case "host_ip":
 		return "IP / localhost 直连被拒绝（未使用授权域名）"
 	case "host_deny":
@@ -5358,9 +5702,10 @@ func reasonMatches(evReason, want string) bool {
 	return evReason == want || strings.HasPrefix(evReason, want+"_")
 }
 
-const maxBlockEvents = 5000
-const maxAuditEvents = 1000
+const maxBlockEvents = 2000
+const maxAuditEvents = 500
 
+// geoEntry：相关数据结构。
 type geoEntry struct {
 	Code   string  `json:"code"`
 	Name   string  `json:"name"`
@@ -5380,6 +5725,7 @@ var (
 	geoGroup singleflight.Group
 )
 
+// geoPrune：相关逻辑处理。
 func geoPrune() {
 	const geoMaxEntries = 50000
 	now := time.Now().Unix()
@@ -5395,6 +5741,7 @@ func geoPrune() {
 	geoMu.Unlock()
 }
 
+// geoParseGeneric：相关逻辑处理。
 func geoParseGeneric(m map[string]any) (geoEntry, error) {
 	if data, ok := m["data"].(map[string]any); ok {
 		m = data
@@ -5451,6 +5798,7 @@ func geoParseGeneric(m map[string]any) (geoEntry, error) {
 	return geoEntry{Code: code, Name: raw, Region: region, City: city, ISP: isp, Org: org, AS: asn, At: time.Now().Unix()}, nil
 }
 
+// 判断 ASCIIName 是否成立。
 func isASCIIName(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 0x80 {
@@ -5460,6 +5808,7 @@ func isASCIIName(s string) bool {
 	return true
 }
 
+// toFloat：相关逻辑处理。
 func toFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -5475,6 +5824,7 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
+// geoEndpoints：相关逻辑处理。
 func geoEndpoints(ipEscaped string) []string {
 	return []string{
 		"https://ip9.com.cn/get?ip=" + ipEscaped,
@@ -5482,12 +5832,14 @@ func geoEndpoints(ipEscaped string) []string {
 	}
 }
 
+// geoFetch：相关逻辑处理。
 func geoFetch(ipStr string) (geoEntry, error) {
 	return geoFetchVia(geoEndpoints(url.QueryEscape(ipStr)), ipStr)
 }
 
 var geoClient = &http.Client{Timeout: 6 * time.Second}
 
+// geoFetchVia：相关逻辑处理。
 func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
 	var last error
 	for _, u := range urls {
@@ -5516,6 +5868,7 @@ func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
 	return geoEntry{}, last
 }
 
+// ipLabelSync：相关逻辑处理。
 func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -5564,13 +5917,16 @@ var (
 	adminCredPtr atomic.Pointer[adminCred]
 )
 
+// adminCred：相关数据结构。
 type adminCred struct {
 	User     string
 	PassHash string
 }
 
+// 写入/保存 setAdminCred 对应的数据。
 func setAdminCred(u, hash string) { adminCredPtr.Store(&adminCred{User: u, PassHash: hash}) }
 
+// 读取/获取 getAdminUser 对应的数据。
 func getAdminUser() string {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -5579,6 +5935,7 @@ func getAdminUser() string {
 	return c.User
 }
 
+// 读取/获取 getAdminHash 对应的数据。
 func getAdminHash() string {
 	c := adminCredPtr.Load()
 	if c == nil {
@@ -5587,6 +5944,7 @@ func getAdminHash() string {
 	return c.PassHash
 }
 
+// 判断 hPassword 是否成立。
 func hashPassword(plain string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
 	if err != nil {
@@ -5595,6 +5953,7 @@ func hashPassword(plain string) (string, error) {
 	return string(b), nil
 }
 
+// verifyPassword：相关逻辑处理。
 func verifyPassword(hash, plain string) bool {
 	if hash == "" || plain == "" {
 		return false
@@ -5605,6 +5964,7 @@ func verifyPassword(hash, plain string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 
+// 判断 BcryptHash 是否成立。
 func isBcryptHash(s string) bool {
 	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }
@@ -5615,7 +5975,9 @@ const (
 	captchaTTL    = 5 * time.Minute
 )
 
+// sessionEntry：相关数据结构。
 type sessionEntry struct{ Expires time.Time }
+// captchaEntry：相关数据结构。
 type captchaEntry struct {
 	Answer  string
 	Expires time.Time
@@ -5626,12 +5988,14 @@ var (
 	captchas sync.Map
 )
 
+// randToken：相关逻辑处理。
 func randToken(n int) string {
 	b := make([]byte, n)
 	_, _ = io.ReadFull(rand.Reader, b)
 	return hex.EncodeToString(b)
 }
 
+// initSessionsCleanup：相关逻辑处理。
 func initSessionsCleanup() {
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
@@ -5653,12 +6017,14 @@ func initSessionsCleanup() {
 	}()
 }
 
+// createSession：相关逻辑处理。
 func createSession() string {
 	tok := randToken(16)
 	sessions.Store(tok, sessionEntry{Expires: time.Now().Add(sessionTTL)})
 	return tok
 }
 
+// validSession：相关逻辑处理。
 func validSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -5679,6 +6045,7 @@ func validSession(tok string) bool {
 	return true
 }
 
+// destroyOtherSessions：相关逻辑处理。
 func destroyOtherSessions(keep string) {
 	sessions.Range(func(k, _ interface{}) bool {
 		if ks, ok := k.(string); ok && ks != keep {
@@ -5688,12 +6055,14 @@ func destroyOtherSessions(keep string) {
 	})
 }
 
+// destroySession：相关逻辑处理。
 func destroySession(tok string) {
 	if tok != "" {
 		sessions.Delete(tok)
 	}
 }
 
+// 读取/获取 getSessionToken 对应的数据。
 func getSessionToken(r *http.Request) string {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
@@ -5702,6 +6071,7 @@ func getSessionToken(r *http.Request) string {
 	return c.Value
 }
 
+// requestIsHTTPS：相关逻辑处理。
 func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -5712,6 +6082,7 @@ func requestIsHTTPS(r *http.Request) bool {
 	return false
 }
 
+// 写入/保存 setSessionCookie 对应的数据。
 func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	c := &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/admin",
@@ -5724,10 +6095,12 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	http.SetCookie(w, c)
 }
 
+// clearSessionCookie：相关逻辑处理。
 func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
 }
 
+// generateCaptchaSVG：相关逻辑处理。
 func generateCaptchaSVG() (id, answer, svg string) {
 	const digits = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 	rb := make([]byte, 16)
@@ -5763,6 +6136,7 @@ func generateCaptchaSVG() (id, answer, svg string) {
 	return id, answer, svg
 }
 
+// verifyCaptcha：相关逻辑处理。
 func verifyCaptcha(id, input string) bool {
 	if id == "" || input == "" {
 		return false
@@ -5779,6 +6153,7 @@ func verifyCaptcha(id, input string) bool {
 	return strings.EqualFold(strings.TrimSpace(input), e.Answer)
 }
 
+// requireAuth：相关逻辑处理。
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
@@ -5922,6 +6297,7 @@ loadCaptcha();
 </body>
 </html>`
 
+// 写入/保存 saveAdminPassHash 对应的数据。
 func saveAdminPassHash(hash string) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -5948,6 +6324,7 @@ func recordAudit(ip, action, detail string) {
 	}
 }
 
+// loginFailEntry：相关数据结构。
 type loginFailEntry struct {
 	Count    atomic.Int64
 	Window   atomic.Int64
@@ -5965,6 +6342,7 @@ const (
 	captchaRateLimit = 30
 )
 
+// loginLockDuration：相关逻辑处理。
 func loginLockDuration(lockouts int64) time.Duration {
 	d := loginLockBase
 	for i := int64(1); i < lockouts && d < loginLockMax; i++ {
@@ -5976,6 +6354,7 @@ func loginLockDuration(lockouts int64) time.Duration {
 	return d
 }
 
+// checkLoginAllowed：相关逻辑处理。
 func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
 	now := time.Now().UnixNano()
 	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
@@ -6023,10 +6402,12 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 	return false, 0, fails
 }
 
+// clearLoginFail：相关逻辑处理。
 func clearLoginFail(ip string) {
 	loginFailers.Delete(ip)
 }
 
+// captchaRateEntry：相关数据结构。
 type captchaRateEntry struct {
 	Count       atomic.Int64
 	WindowStart atomic.Int64
@@ -6034,6 +6415,7 @@ type captchaRateEntry struct {
 
 var captchaLimiters sync.Map
 
+// checkCaptchaRate：相关逻辑处理。
 func checkCaptchaRate(ip string) bool {
 	val, _ := captchaLimiters.LoadOrStore(ip, &captchaRateEntry{})
 	e := val.(*captchaRateEntry)
@@ -6080,8 +6462,10 @@ func startAuthStateCleaner() {
 	}()
 }
 
+// switchTransport：相关数据结构。
 type switchTransport struct{ v atomic.Value }
 
+// RoundTrip：方法实现。
 func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t, _ := s.v.Load().(*http.Transport)
 	if t == nil {
@@ -6090,8 +6474,10 @@ func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.RoundTrip(r)
 }
 
+// bufferPool：相关数据结构。
 type bufferPool struct{ pool sync.Pool }
 
+// Get：方法实现。
 func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
@@ -6099,6 +6485,7 @@ func (b *bufferPool) Get() []byte {
 	return make([]byte, 32*1024)
 }
 
+// Put：方法实现。
 func (b *bufferPool) Put(p []byte) {
 	if cap(p) >= 32*1024 {
 		b.pool.Put(p[:32*1024])
@@ -6107,11 +6494,12 @@ func (b *bufferPool) Put(p []byte) {
 
 var proxyBufPool = &bufferPool{}
 
+// newTransport：相关逻辑处理。
 func newTransport() *http.Transport {
 	return &http.Transport{
 		// 反代上游必须走已校验并固定的 IP，不能被 HTTP_PROXY/HTTPS_PROXY 绕过。
 		Proxy: nil, DialContext: dialPinned,
-		// v4.2.1 回退：上游 HTTP/2 在高 RTT/丢包链路下所有流挤在一条 TCP 连接里，
+		// v4.3.0：保留经过实测取向的 HTTP/1.1 媒体转发策略；上游 HTTP/2 在高 RTT/丢包链路下所有流挤在一条 TCP 连接里，
 		// 队头阻塞会让大流量播放反而变慢；媒体转发场景 HTTP/1.1 多连接并行更快。
 		// 32K 读写缓冲保留（降低系统调用次数）。
 		ForceAttemptHTTP2: false, ReadBufferSize: 32 << 10, WriteBufferSize: 32 << 10,
@@ -6124,6 +6512,7 @@ func newTransport() *http.Transport {
 
 var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
 
+// rewriteOriginHeaders：相关逻辑处理。
 func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	if o := out.Header.Get("Origin"); o != "" && o != "null" {
 		if u, err := url.Parse(o); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) {
@@ -6211,6 +6600,7 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	}
 }
 
+// adminConfigResp：相关数据结构。
 type adminConfigResp struct {
 	Config
 	EffectivePort int    `json:"effective_port"`
@@ -6219,6 +6609,7 @@ type adminConfigResp struct {
 
 const iconVer = "?v=4"
 
+// pwaHeadExtra：相关逻辑处理。
 func pwaHeadExtra() string {
 	return "<link rel=\"icon\" href=\"/favicon.ico" + iconVer + "\">\n" +
 		"<link rel=\"apple-touch-icon\" href=\"/admin/icon-192.png" + iconVer + "\">\n" +
@@ -6230,15 +6621,17 @@ func pwaHeadExtra() string {
 		"<meta name=\"apple-mobile-web-app-title\" content=\"Emby Proxy\">\n"
 }
 
+// pwaBodyExtra：相关逻辑处理。
 func pwaBodyExtra() string {
 	return "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/admin/sw.js').catch(function(){})})}</script>"
 }
 
+// pwaManifestJSON：相关逻辑处理。
 func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.0.0 管理控制台",
+		"description":      "Emby 路径反代 v4.3.0 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6312,6 +6705,7 @@ self.addEventListener('activate', function (e) {
 
 var gzipWriterPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
 
+// gzipCompressible：相关逻辑处理。
 func gzipCompressible(ct string) bool {
 	ct = strings.ToLower(ct)
 	for _, p := range []string{"text/", "application/json", "application/javascript", "application/manifest", "image/svg"} {
@@ -6322,6 +6716,7 @@ func gzipCompressible(ct string) bool {
 	return false
 }
 
+// gzipResponseWriter：相关数据结构。
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	gz      *gzip.Writer
@@ -6329,6 +6724,7 @@ type gzipResponseWriter struct {
 	gzOn    bool
 }
 
+// WriteHeader：方法实现。
 func (g *gzipResponseWriter) WriteHeader(code int) {
 	if !g.decided {
 		g.decided = true
@@ -6344,6 +6740,7 @@ func (g *gzipResponseWriter) WriteHeader(code int) {
 	g.ResponseWriter.WriteHeader(code)
 }
 
+// Write：方法实现。
 func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	if !g.decided {
 		g.WriteHeader(http.StatusOK)
@@ -6354,6 +6751,7 @@ func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	return g.ResponseWriter.Write(b)
 }
 
+// Flush：方法实现。
 func (g *gzipResponseWriter) Flush() {
 	if g.gzOn {
 		_ = g.gz.Flush()
@@ -6363,6 +6761,7 @@ func (g *gzipResponseWriter) Flush() {
 	}
 }
 
+// Hijack：方法实现。
 func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	h, ok := g.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -6373,6 +6772,7 @@ func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return h.Hijack()
 }
 
+// gzipMiddleware：相关逻辑处理。
 func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || r.Header.Get("Upgrade") != "" {
@@ -6394,6 +6794,7 @@ func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // 没必要每个请求都重新压缩一遍（单次 gzip 约 1-3ms，缓存后近似为 0）。
 var htmlGzCache sync.Map
 
+// 处理 serveHTML 对应的 HTTP 请求。
 func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheControl string) {
 	w.Header().Set("Content-Type", contentType)
 	if cacheControl != "" {
@@ -6419,8 +6820,10 @@ func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheC
 	_, _ = io.WriteString(w, html)
 }
 
+// diskSpace：相关数据结构。
 type diskSpace struct{ free, total uint64 }
 
+// diskUsage：相关逻辑处理。
 func diskUsage(path string) (diskSpace, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
@@ -6432,8 +6835,9 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.2.1"
+const appVersionStr = "4.3.0"
 
+// activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
 	now := time.Now()
 	n := 0
@@ -7428,6 +7832,7 @@ func adminHandler() http.HandlerFunc {
 	}
 }
 
+// 启动 GeoDBUpdater 相关后台任务或监听。
 func startGeoDBUpdater() {
 	go func() {
 		time.Sleep(30 * time.Second)
@@ -7584,7 +7989,20 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				errPageCtx{Code: "ban", Label: "IP 在黑名单中"})
 			return
 		}
-		// 判定链 ③ UA 白名单
+		// 判定链 ③ UA 黑名单（优先于白名单）
+		if uaBlocked(r.UserAgent()) {
+			if blockedRateLimited(ip) {
+				dropOrMinimal429(w)
+				return
+			}
+			reqB, respB := estimateBlockedBytes(r)
+			recordBlocked(ip, country, r.URL.RequestURI(), "ua_block", r.UserAgent(), r.Host, reqB, respB)
+			serveError(w, r, http.StatusForbidden, "客户端已被禁止",
+				"当前客户端的 User-Agent 命中了 UA 黑名单，请求被拒绝。",
+				errPageCtx{Code: "ua_block", Label: "User-Agent 在黑名单中"})
+			return
+		}
+		// 判定链 ④ UA 白名单
 		if !uaAllowed(r.UserAgent()) {
 			if blockedRateLimited(ip) {
 				dropOrMinimal429(w)
@@ -7593,7 +8011,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			reqB, respB := estimateBlockedBytes(r)
 			recordBlocked(ip, country, r.URL.RequestURI(), "ua", r.UserAgent(), r.Host, reqB, respB)
 			serveError(w, r, http.StatusForbidden, "客户端不被允许",
-				"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求在判定链第 ③ 步被拒绝。",
+				"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求被拒绝。",
 				errPageCtx{Code: "ua", Label: "User-Agent 不在允许列表"})
 			return
 		}
@@ -7870,6 +8288,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// uaClassOf：相关逻辑处理。
 func uaClassOf(ua string) string {
 	if strings.TrimSpace(ua) == "" {
 		return "未知"
@@ -7942,6 +8361,7 @@ func uaClassOf(ua string) string {
 	}
 }
 
+// statsView：相关数据结构。
 type statsView struct {
 	at time.Time
 
@@ -7981,6 +8401,7 @@ var (
 	statsViewEvery = 5 * time.Second
 )
 
+// cloneInt64Map：相关逻辑处理。
 func cloneInt64Map(src map[string]int64) map[string]int64 {
 	dst := make(map[string]int64, len(src))
 	for k, v := range src {
@@ -7989,6 +8410,7 @@ func cloneInt64Map(src map[string]int64) map[string]int64 {
 	return dst
 }
 
+// cloneDayStat：相关逻辑处理。
 func cloneDayStat(d *DayStat) *DayStat {
 	if d == nil {
 		return nil
@@ -8009,6 +8431,7 @@ func cloneDayStat(d *DayStat) *DayStat {
 	return &n
 }
 
+// buildStatsViewLocked：调用方需已持有对应锁。
 func buildStatsViewLocked() *statsView {
 	v := &statsView{
 		at:             time.Now(),
@@ -8046,6 +8469,7 @@ func buildStatsViewLocked() *statsView {
 	return v
 }
 
+// publishStatsView：相关逻辑处理。
 func publishStatsView() *statsView {
 	statsViewMu.Lock()
 	defer statsViewMu.Unlock()
@@ -8059,6 +8483,7 @@ func publishStatsView() *statsView {
 	return v
 }
 
+// currentStatsView：相关逻辑处理。
 func currentStatsView() *statsView {
 	if v := statsViewPtr.Load(); v != nil && time.Since(v.at) < statsViewEvery {
 		return v
@@ -8066,8 +8491,10 @@ func currentStatsView() *statsView {
 	return publishStatsView()
 }
 
+// invalidateStatsView：相关逻辑处理。
 func invalidateStatsView() { statsViewPtr.Store(nil) }
 
+// blockedTotal：相关逻辑处理。
 func blockedTotal(v *statsView) int64 {
 	if v == nil {
 		return 0
@@ -8075,6 +8502,7 @@ func blockedTotal(v *statsView) int64 {
 	return v.blockedCN + v.blockedWL + v.blockedBan + v.blockedUA
 }
 
+// adminAllowList：相关逻辑处理。
 func adminAllowList(c *Config) []string {
 	if c == nil {
 		return nil
@@ -8089,10 +8517,12 @@ func adminAllowList(c *Config) []string {
 	return out
 }
 
+// adminIPAllowed：相关逻辑处理。
 func adminIPAllowed(ipStr string) bool {
 	return adminAllowContains(currentCfg(), ipStr)
 }
 
+// validateAdminAllow：相关逻辑处理。
 func validateAdminAllow(list []string, currentIP string) error {
 	cleaned := make([]string, 0, len(list))
 	for _, s := range list {
@@ -8119,6 +8549,7 @@ func validateAdminAllow(list []string, currentIP string) error {
 	return nil
 }
 
+// adminAllowContains：相关逻辑处理。
 func adminAllowContains(c *Config, ipStr string) bool {
 	list := adminAllowList(c)
 	if len(list) == 0 {
@@ -8166,12 +8597,14 @@ type ruleStepSpec struct {
 var ruleChainOrder = []ruleStepSpec{
 	{"access_host", "访问域名白名单", "请求 Host 必须在允许列表内；开启后禁止 IP / localhost 直连", "block"},
 	{"ban", "IP 黑名单", "来源 IP 精确匹配或命中 CIDR 段", "block"},
+	{"ua_block", "UA 黑名单", "客户端 UA 包含黑名单关键字即拒绝，空=不启用", "block"},
 	{"ua", "UA 白名单", "客户端 UA 需包含白名单关键字，空=不限制", "block"},
 	{"cn", "地区限制", "开启「仅允许中国大陆 IP」时，非大陆来源被拒", "block"},
 	{"whitelist", "上游域名白名单", "路径中的目标需匹配白名单（支持 域名 / *.域名 / 域名+路径 / IP:端口+路径，http(s) 前缀可省略），空=不限制", "block"},
 	{"forward", "放行转发", "全部通过后反代到上游，并计入流量统计", "pass"},
 }
 
+// registerExtraRoutes：相关逻辑处理。
 func registerExtraRoutes(mux *http.ServeMux) {
 	// 判定链顺序（后台面板渲染用），与 ruleChainOrder 同源
 	mux.HandleFunc("/admin/api/rules/chain", func(w http.ResponseWriter, r *http.Request) {
@@ -8263,44 +8696,57 @@ func registerExtraRoutes(mux *http.ServeMux) {
 			}
 		}
 
-		// ③ UA 白名单
+		// ③ UA 黑名单
 		if final == "pass" {
 			switch {
-			case len(c.AllowedUAs) == 0:
+			case len(c.BlockedUAs) == 0:
 				add(2, "pass", "未启用（空=不限制）")
-			case uaAllowed(ua):
-				add(2, "pass", "命中白名单关键字")
+			case uaBlocked(ua):
+				final, blockedReason = "block", "ua_block"
+				add(2, "block", "User-Agent 命中黑名单关键字")
 			default:
-				final, blockedReason = "block", "ua"
-				add(2, "block", "User-Agent 不包含任何白名单关键字")
+				add(2, "pass", "未命中黑名单")
 			}
 		}
 
-		// ④ 地区限制（IP 归属只解析一次，与真实请求一致）
+		// ④ UA 白名单
+		if final == "pass" {
+			switch {
+			case len(c.AllowedUAs) == 0:
+				add(3, "pass", "未启用（空=不限制）")
+			case uaAllowed(ua):
+				add(3, "pass", "命中白名单关键字")
+			default:
+				final, blockedReason = "block", "ua"
+				add(3, "block", "User-Agent 不包含任何白名单关键字")
+			}
+		}
+
+		// ⑤ 地区限制（IP 归属只解析一次，与真实请求一致）
 		country := countryOf(ip)
 		cname := countryName(country)
 		if final == "pass" {
 			if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
 				final, blockedReason = "block", "cn"
-				add(3, "block", "来源地区为 "+cname+"，不在中国大陆放行范围")
+				add(4, "block", "来源地区为 "+cname+"，不在中国大陆放行范围")
 			} else if c.ChinaOnly {
-				add(3, "pass", "来源地区 "+cname+"，允许访问")
+				add(4, "pass", "来源地区 "+cname+"，允许访问")
 			} else {
-				add(3, "pass", "未开启（仅记录来源："+cname+"）")
+				add(4, "pass", "未开启（仅记录来源："+cname+"）")
 			}
 		}
 
-		// ⑤ 上游域名白名单（真实请求里由 parseTarget 解析路径得到目标域名与路径）
+		// ⑥ 上游域名白名单（真实请求里由 parseTarget 解析路径得到目标域名与路径）
 		if final == "pass" {
 			if host == "" {
-				add(4, "pass", "未填写目标上游，跳过校验")
+				add(5, "pass", "未填写目标上游，跳过校验")
 			} else if len(c.Whitelist) == 0 {
-				add(4, "pass", "未启用（空=不限制）")
+				add(5, "pass", "未启用（空=不限制）")
 			} else if whitelistMatchPath(c.Whitelist, host, targetPath) {
-				add(4, "pass", host+targetPath+" 在白名单内")
+				add(5, "pass", host+targetPath+" 在白名单内")
 			} else {
 				final, blockedReason = "block", "whitelist"
-				add(4, "block", host+targetPath+" 不在白名单内")
+				add(5, "block", host+targetPath+" 不在白名单内")
 			}
 		}
 
@@ -8492,6 +8938,7 @@ func registerExtraRoutes(mux *http.ServeMux) {
 	})
 }
 
+// topNMap：相关逻辑处理。
 func topNMap(m map[string]int64, n int) map[string]int64 {
 	if len(m) == 0 {
 		return map[string]int64{}
@@ -8520,6 +8967,7 @@ func topNMap(m map[string]int64, n int) map[string]int64 {
 	return out
 }
 
+// 确保 Dir 已就绪，不存在则创建。
 func ensureDir(p string) error { return os.MkdirAll(filepath.Dir(p), 0o755) }
 FEATURES_GO
   base64 -d <<'CHART_GZ_B64' | gzip -d > "$dir/chart.umd.min.js"
@@ -9841,6 +10289,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <option value="host_deny">└ 非白名单域名</option>
     <option value="ban">IP 黑名单</option>
     <option value="ua">UA 不允许</option>
+    <option value="ua_block">UA 黑名单</option>
     <option value="honeypot">蜜罐路径</option>
     <option value="scan_ua">扫描器 UA</option>
     <option value="rate">请求过快</option>
@@ -10047,6 +10496,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <div class="card" style="margin-bottom:0;">
     <div class="ch"><div><h2 class="ct">安全与访问控制</h2><div class="cd">代理转发的准入规则；保存后立即生效并预编译匹配</div></div></div>
     <div class="row"><div><div class="rl">仅允许中国大陆 IP</div><div class="rd">非大陆来源将被拒绝</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
+    <div class="fi"><label class="fl">UA 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，大小写不敏感，命中即拒绝（优先于白名单）。留空表示不启用</div><textarea id="blockedUAs" class="tarea" placeholder="留空并保存可关闭；未配置时默认拦截浏览器与爬虫"></textarea></div>
     <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
     <div class="row"><div><div class="rl">禁止 IP 直连 / 访问域名白名单</div><div class="rd">开启后，只有通过下方允许的域名访问代理才被放行；用服务器 IP、localhost 或其它域名访问一律返回 403。管理后台 /admin/、健康检查 /health、测速链接与 favicon 等页面元素不受限制，不会被锁在门外</div></div><label class="sw"><input type="checkbox" id="hostGuardOn"><span class="tr2"></span></label></div>
     <div class="fi"><label class="fl">允许访问的域名</label><div class="hint" style="margin-bottom:8px">每行一个，支持 *.example.com 通配；也可直接粘贴完整网址（会自动忽略 https:// 与路径）。留空表示只禁止 IP / localhost 直连，任意域名均可访问。前面挂了 Nginx / CDN 时，请回传 X-Forwarded-Host 或保留原始 Host，否则后端看到的会是回环 IP。注意：只填根域不会放行子域，用到的子域请逐个添加或改用通配</div><textarea id="allowedHosts" class="tarea" placeholder="emby.example.com&#10;*.example.com"></textarea><div class="hint" id="curHostHint" style="margin-top:8px;color:var(--pd)">当前访问域名：加载中…</div></div>
@@ -10110,6 +10560,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
       <div class="tl" id="rtChain">
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">访问域名白名单</div><div class="tl-v">请求 Host 必须在允许列表内；开启后禁止 IP / localhost 直连</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">IP 黑名单</div><div class="tl-v">来源 IP 精确匹配或命中 CIDR 段</div></div>
+        <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">UA 黑名单</div><div class="tl-v">客户端 UA 包含黑名单关键字即拒绝，空=不启用</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">UA 白名单</div><div class="tl-v">客户端 UA 需包含白名单关键字，空=不限制</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">地区限制</div><div class="tl-v">开启「仅允许中国大陆 IP」时，非大陆来源被拒</div></div>
         <div class="tl-i block"><div class="tl-d"></div><div class="tl-n">上游域名白名单</div><div class="tl-v">路径中的目标需匹配白名单（支持 域名 / *.域名 / 域名+路径 / IP:端口+路径，http(s) 前缀可省略），空=不限制</div></div>
@@ -10349,6 +10800,7 @@ async function loadConfig(){
     const ch=document.getElementById('curHostHint');if(ch){const h=c.current_host||'';ch.textContent=h?('当前访问域名（请确认它已填在上方白名单）：'+h):'当前访问域名：未知';}
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');
     document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
+    const bua=document.getElementById('blockedUAs');if(bua)bua.value=(c.blocked_uas||[]).join('\n');
     const ro=document.getElementById('reportOn');if(ro)ro.checked=!!c.report_on;
     const ru=document.getElementById('reportUrl');if(ru)ru.value=c.report_url||'';
     const rt=document.getElementById('reportToken');if(rt)rt.value=c.report_token||'';
@@ -11183,6 +11635,7 @@ function collect(){
     whitelist:lines('whitelist'),
     ban_list:lines('banList'),
     allowed_uas:lines('allowedUAs'),
+    blocked_uas:lines('blockedUAs'),
     admin_allow:lines('adminAllow'),
     report_on:!!document.getElementById('reportOn')?.checked,
     report_url:(document.getElementById('reportUrl')?.value||'').trim(),
@@ -11876,7 +12329,7 @@ loadConfig();
     if(typeof Chart!=='undefined'||n>200){ clearInterval(t); loadOverview(); }
   },50);
 })();
-let ovTimer=setInterval(()=>{if(!document.hidden && document.getElementById('overview')?.classList.contains('on'))loadOverview()},8000);
+let ovTimer=setInterval(()=>{if(!document.hidden && document.getElementById('overview')?.classList.contains('on'))loadOverview()},20000);
 window.addEventListener('beforeunload',()=>clearInterval(ovTimer));
 let lastHiddenAt=0;
 const STALE_MS=60*1000;
@@ -11970,6 +12423,8 @@ Type=simple
 Environment=GOGC=100
 Environment=GOMEMLIMIT=512MiB
 ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${u} -db ${DB_FILE}
+User=emby-proxy
+Group=emby-proxy
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
@@ -12084,6 +12539,18 @@ cmd_install() {
   [[ "$BIN_PATH" == /* && "$BIN_PATH" != *[[:space:]]* && "$BIN_PATH" != *%* ]] || die "二进制路径必须是绝对路径，且不能包含空白字符或百分号: $BIN_PATH"
   if [[ $BINARY_ONLY -eq 1 ]]; then info "更新模式：只替换程序"; fi
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
+  # 专用用户，供 iptables owner 只统计本进程流量
+  if ! id -u emby-proxy >/dev/null 2>&1; then
+    if command -v useradd >/dev/null 2>&1; then
+      useradd -r -s /usr/sbin/nologin -d /nonexistent emby-proxy 2>/dev/null || true
+    elif command -v adduser >/dev/null 2>&1; then
+      adduser -S -D -H -s /sbin/nologin emby-proxy 2>/dev/null || true
+    fi
+  fi
+  if id -u emby-proxy >/dev/null 2>&1; then
+    chown -R emby-proxy:emby-proxy "$CONFIG_DIR" 2>/dev/null || chown -R emby-proxy "$CONFIG_DIR" 2>/dev/null || true
+    chmod 750 "$CONFIG_DIR" 2>/dev/null || true
+  fi
   if [[ ! -f "$DB_FILE" ]]; then
     if [[ -n "$ADMIN_PASS" ]]; then GENERATED_PASS=1
     else ADMIN_PASS="$(genpass)"; GENERATED_PASS=1; fi
@@ -12136,6 +12603,10 @@ cmd_install() {
       die "替换新程序失败，已保留旧程序"
     fi
     info "已安装二进制: $BIN_PATH"
+    if id -u emby-proxy >/dev/null 2>&1; then
+      chown root:emby-proxy "$BIN_PATH" 2>/dev/null || true
+      chmod 0750 "$BIN_PATH" 2>/dev/null || true
+    fi
     if [[ -z "$PREBUILT" ]]; then [[ -n "$new_hash" ]] || new_hash="$(compute_source_hash)"; printf '%s' "$new_hash" > "$BUILD_HASH_FILE"; else rm -f "$BUILD_HASH_FILE"; fi
   fi
   if [[ $need_reload -eq 1 ]]; then
