@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.3.0"
+APP_VERSION="4.3.1"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,16 +275,16 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.3.0
+// emby-proxy v4.3.1
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
 // 数据路径（v4.0 起）：
 //   - 纯转发。httputil.ReverseProxy 直接写回客户端，
 //     不再用 countingReader / countingWriter 逐块计数。
-//   - 实时网速优先用 iptables owner + connmark 只统计本进程流量
-//     （客户端侧 + 源站侧，不含其他软件）；无 iptables 或非专用用户时
-//     回退监听端口计数，再不行回退 /proc/net/dev 整机网卡。
+//   - 实时网速优先用 iptables cgroup + connmark 只统计本服务流量
+//     （客户端侧 + 源站侧，不含其他软件，继续以 root 运行）；
+//     cgroup 不可用时回退监听端口计数，再不行回退 /proc/net/dev 整机网卡。
 //
 // 访问控制（判定链，命中即拒绝）：
 //   ① IP 黑名单
@@ -2194,17 +2194,17 @@ func accumulateNIC(dRx, dTx int64) {
 	statsMu.Unlock()
 }
 
-// portAcct 用 iptables owner + connmark 只统计本进程的进出流量
-// （客户端侧 + 源站侧），不把机器上其他软件算进去。
-// 要求服务以非 root 专用用户运行；以 root 运行时回退为监听端口计数。
+// portAcct 用 iptables cgroup + connmark 只统计本服务进出流量
+// （客户端侧 + 源站侧）。内核计数，不进 Go 转发路径。
+// cgroup 不可用时回退为监听端口计数。
 var (
 	portAcctMu   sync.Mutex
 	portAcctPort int
 	portAcctOK   atomic.Bool
-	portAcctMode string // "owner" | "port" | ""
+	portAcctMode string // "cgroup" | "port" | ""
 )
 
-// iptablesCmd：相关逻辑处理。
+// iptablesCmd 执行一条 iptables/ip6tables 命令，3 秒超时。
 func iptablesCmd(bin string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -2212,7 +2212,7 @@ func iptablesCmd(bin string, args ...string) error {
 	return cmd.Run()
 }
 
-// iptablesOut：相关逻辑处理。
+// iptablesOut 执行 iptables 并返回标准输出。
 func iptablesOut(bin string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -2221,7 +2221,34 @@ func iptablesOut(bin string, args ...string) (string, error) {
 	return string(b), err
 }
 
-// 停止或清理 removeAllPortJumps 相关资源。
+// selfCgroupPath 从 /proc/self/cgroup 取出本进程的 cgroup 路径（供 iptables --path）。
+// 优先 cgroup v2 的 0:: 行；取不到非根路径则返回空。
+func selfCgroupPath() string {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return ""
+	}
+	var fallback string
+	for _, line := range strings.Split(string(b), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		path := strings.TrimPrefix(parts[2], "/")
+		if path == "" || path == "/" {
+			continue
+		}
+		if parts[0] == "0" && parts[1] == "" {
+			return path
+		}
+		if fallback == "" {
+			fallback = path
+		}
+	}
+	return fallback
+}
+
+// removeAllPortJumps 清掉指向计数链的跳转，以及本服务打的 connmark 规则。
 func removeAllPortJumps(bin string) {
 	for _, dir := range []string{"INPUT", "OUTPUT"} {
 		for _, chain := range []string{"EMBY_PROXY_IN", "EMBY_PROXY_OUT"} {
@@ -2242,7 +2269,6 @@ func removeAllPortJumps(bin string) {
 			}
 		}
 	}
-	// 清理 mangle 表里的 CONNMARK 规则
 	for _, dir := range []string{"OUTPUT", "INPUT"} {
 		out, err := iptablesOut(bin, "-t", "mangle", "-S", dir)
 		if err != nil {
@@ -2262,37 +2288,35 @@ func removeAllPortJumps(bin string) {
 	}
 }
 
-// 写入/保存 setupOwnerAcct 对应的数据。
-func setupOwnerAcct(bin string, uid int, port int) bool {
-	uidStr := strconv.Itoa(uid)
+// setupCgroupAcct 用 cgroup 匹配本服务出站，并用 connmark 找回源站回包。
+// 出站全部计入本服务；入站 = 监听端口（客户端请求）+ connmark（源站响应）。
+func setupCgroupAcct(bin, cgPath string, port int) bool {
+	if cgPath == "" {
+		return false
+	}
 	dport := fmt.Sprintf("--dport=%d", port)
-	// 计数链
 	_ = iptablesCmd(bin, "-N", "EMBY_PROXY_IN")
 	_ = iptablesCmd(bin, "-N", "EMBY_PROXY_OUT")
 	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_IN")
 	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_OUT")
-	// 链内规则：只计数，不做其他动作
 	_ = iptablesCmd(bin, "-A", "EMBY_PROXY_IN")
 	_ = iptablesCmd(bin, "-A", "EMBY_PROXY_OUT")
 
-	// mangle: 给本用户的出站连接打 connmark，便于在 INPUT 侧识别源站回包
-	_ = iptablesCmd(bin, "-t", "mangle", "-A", "OUTPUT", "-m", "owner", "--uid-owner", uidStr, "-j", "CONNMARK", "--set-mark", "0x1001")
-	_ = iptablesCmd(bin, "-t", "mangle", "-A", "INPUT", "-m", "connmark", "--mark", "0x1001", "-j", "CONNMARK", "--restore-mark")
-
-	// filter: 出站全部用 owner（客户端响应 + 源站请求）
-	_ = iptablesCmd(bin, "-I", "OUTPUT", "-m", "owner", "--uid-owner", uidStr, "-j", "EMBY_PROXY_OUT")
-	// 入站：监听端口（客户端请求）+ connmark（源站响应）
-	_ = iptablesCmd(bin, "-I", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN")
-	_ = iptablesCmd(bin, "-I", "INPUT", "-m", "connmark", "--mark", "0x1001", "-j", "EMBY_PROXY_IN")
-
-	// 验证关键规则
-	if iptablesCmd(bin, "-C", "OUTPUT", "-m", "owner", "--uid-owner", uidStr, "-j", "EMBY_PROXY_OUT") != nil {
+	// 本服务发起的连接打标，便于在 INPUT 识别源站回包
+	if iptablesCmd(bin, "-t", "mangle", "-A", "OUTPUT", "-m", "cgroup", "--path", cgPath, "-j", "CONNMARK", "--set-mark", "0x1001") != nil {
 		return false
 	}
-	return true
+	_ = iptablesCmd(bin, "-t", "mangle", "-A", "INPUT", "-m", "connmark", "--mark", "0x1001", "-j", "CONNMARK", "--restore-mark")
+
+	if iptablesCmd(bin, "-I", "OUTPUT", "-m", "cgroup", "--path", cgPath, "-j", "EMBY_PROXY_OUT") != nil {
+		return false
+	}
+	_ = iptablesCmd(bin, "-I", "INPUT", "-p", "tcp", dport, "-j", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-I", "INPUT", "-m", "connmark", "--mark", "0x1001", "-j", "EMBY_PROXY_IN")
+	return iptablesCmd(bin, "-C", "OUTPUT", "-m", "cgroup", "--path", cgPath, "-j", "EMBY_PROXY_OUT") == nil
 }
 
-// 写入/保存 setupPortOnlyAcct 对应的数据。
+// setupPortOnlyAcct 只按监听端口计数（少源站流量，作回退）。
 func setupPortOnlyAcct(bin string, port int) bool {
 	dport := fmt.Sprintf("--dport=%d", port)
 	sport := fmt.Sprintf("--sport=%d", port)
@@ -2308,7 +2332,7 @@ func setupPortOnlyAcct(bin string, port int) bool {
 		iptablesCmd(bin, "-C", "OUTPUT", "-p", "tcp", sport, "-j", "EMBY_PROXY_OUT") == nil
 }
 
-// 写入/保存 setupPortAcct 对应的数据。
+// setupPortAcct 优先 cgroup 计数，失败再退回监听端口。
 func setupPortAcct(port int) {
 	if port <= 0 {
 		return
@@ -2318,7 +2342,7 @@ func setupPortAcct(port int) {
 	if portAcctPort == port && portAcctOK.Load() {
 		return
 	}
-	uid := os.Getuid()
+	cg := selfCgroupPath()
 	ok := false
 	mode := ""
 	for _, bin := range []string{"iptables", "ip6tables"} {
@@ -2326,9 +2350,9 @@ func setupPortAcct(port int) {
 			continue
 		}
 		removeAllPortJumps(bin)
-		if uid != 0 && setupOwnerAcct(bin, uid, port) {
+		if setupCgroupAcct(bin, cg, port) {
 			ok = true
-			mode = "owner"
+			mode = "cgroup"
 		} else if setupPortOnlyAcct(bin, port) {
 			ok = true
 			if mode == "" {
@@ -2340,16 +2364,16 @@ func setupPortAcct(port int) {
 	portAcctOK.Store(ok)
 	portAcctMode = mode
 	switch mode {
-	case "owner":
-		log.Printf("[acct] 已启用 iptables owner 计数（仅本进程，含源站与客户端，uid=%d）", uid)
+	case "cgroup":
+		log.Printf("[acct] 已启用 iptables cgroup 计数（仅本服务，含源站与客户端，path=%s）", cg)
 	case "port":
-		log.Printf("[acct] owner 不可用（当前 uid=%d），回退为监听端口 %d 计数", uid, port)
+		log.Printf("[acct] cgroup 不可用（path=%q），回退为监听端口 %d 计数", cg, port)
 	default:
 		log.Printf("[acct] iptables 不可用，流量统计回退为整机网卡")
 	}
 }
 
-// 解析 IptablesBytes 相关输入。
+// parseIptablesBytes 从 iptables -L -v -x 输出里累加字节列。
 func parseIptablesBytes(out string) int64 {
 	var total int64
 	for _, line := range strings.Split(out, "\n") {
@@ -2369,7 +2393,7 @@ func parseIptablesBytes(out string) int64 {
 	return total
 }
 
-// 读取/获取 readPortAcctBytes 对应的数据。
+// readPortAcctBytes 读取计数链上的入站/出站累计字节。
 func readPortAcctBytes() (rx, tx int64, ok bool) {
 	if !portAcctOK.Load() {
 		return 0, 0, false
@@ -2400,7 +2424,6 @@ func cleanupPortAcct() {
 	}
 }
 
-// 启动 NetSpeedSampler 相关后台任务或监听。
 func startNetSpeedSampler() {
 	go func() {
 		var lastRx, lastTx int64
@@ -6631,7 +6654,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.3.0 管理控制台",
+		"description":      "Emby 路径反代 v4.3.1 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6835,7 +6858,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.3.0"
+const appVersionStr = "4.3.1"
 
 // activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
@@ -12423,8 +12446,6 @@ Type=simple
 Environment=GOGC=100
 Environment=GOMEMLIMIT=512MiB
 ExecStart=${BIN_PATH} run -port ${PORT} -admin-user ${u} -db ${DB_FILE}
-User=emby-proxy
-Group=emby-proxy
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
@@ -12539,18 +12560,7 @@ cmd_install() {
   [[ "$BIN_PATH" == /* && "$BIN_PATH" != *[[:space:]]* && "$BIN_PATH" != *%* ]] || die "二进制路径必须是绝对路径，且不能包含空白字符或百分号: $BIN_PATH"
   if [[ $BINARY_ONLY -eq 1 ]]; then info "更新模式：只替换程序"; fi
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
-  # 专用用户，供 iptables owner 只统计本进程流量
-  if ! id -u emby-proxy >/dev/null 2>&1; then
-    if command -v useradd >/dev/null 2>&1; then
-      useradd -r -s /usr/sbin/nologin -d /nonexistent emby-proxy 2>/dev/null || true
-    elif command -v adduser >/dev/null 2>&1; then
-      adduser -S -D -H -s /sbin/nologin emby-proxy 2>/dev/null || true
-    fi
-  fi
-  if id -u emby-proxy >/dev/null 2>&1; then
-    chown -R emby-proxy:emby-proxy "$CONFIG_DIR" 2>/dev/null || chown -R emby-proxy "$CONFIG_DIR" 2>/dev/null || true
-    chmod 750 "$CONFIG_DIR" 2>/dev/null || true
-  fi
+
   if [[ ! -f "$DB_FILE" ]]; then
     if [[ -n "$ADMIN_PASS" ]]; then GENERATED_PASS=1
     else ADMIN_PASS="$(genpass)"; GENERATED_PASS=1; fi
@@ -12603,10 +12613,7 @@ cmd_install() {
       die "替换新程序失败，已保留旧程序"
     fi
     info "已安装二进制: $BIN_PATH"
-    if id -u emby-proxy >/dev/null 2>&1; then
-      chown root:emby-proxy "$BIN_PATH" 2>/dev/null || true
-      chmod 0750 "$BIN_PATH" 2>/dev/null || true
-    fi
+
     if [[ -z "$PREBUILT" ]]; then [[ -n "$new_hash" ]] || new_hash="$(compute_source_hash)"; printf '%s' "$new_hash" > "$BUILD_HASH_FILE"; else rm -f "$BUILD_HASH_FILE"; fi
   fi
   if [[ $need_reload -eq 1 ]]; then
