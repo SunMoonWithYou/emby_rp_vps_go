@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.3.4"
+APP_VERSION="4.3.5"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,7 +275,7 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.3.4
+// emby-proxy v4.3.5
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
@@ -6758,7 +6758,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.3.4 管理控制台",
+		"description":      "Emby 路径反代 v4.3.5 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6962,7 +6962,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.3.4"
+const appVersionStr = "4.3.5"
 
 // activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
@@ -10652,14 +10652,13 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
       <div class="hint" style="margin-top:8px">留空即使用默认值 30 / 60 / 64。播放高清视频建议并发不低于 32；填 0 或负数会被忽略</div>
     </div>
     <div style="border-top:1px dashed var(--bd);margin:16px 0 12px"></div>
-    <div class="fi"><label class="fl">专用反代（路径 key）</label><div class="hint" style="margin-bottom:8px">设一个 key 对应一个地址，走路径、不用参数。访问 <b>/key</b> 或 <b>/key/后面的路径</b> 就转到该地址。key 自己填，或点「随机 key」。例：key 填 emby、地址填 https://movie.example.com，则打开 /emby/Items 会转到 https://movie.example.com/Items</div>
+    <div class="fi"><label class="fl">专用反代（两段路径）</label><div class="hint" style="margin-bottom:8px">路径分两段：<b>/你自定义/随机串</b>。第一段自己填，第二段点生成时自动随机。访问 /自定义/随机串/后面的路径 就转到对应地址，不用参数。例：自定义填 emby，生成后是 /emby/a7k2m9xq，打开 /emby/a7k2m9xq/Items 会转到目标的 /Items</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-        <input id="prKey" class="inp" placeholder="key，如 emby" style="flex:1;min-width:120px">
+        <input id="prKey" class="inp" placeholder="自定义段，如 emby" style="flex:1;min-width:120px">
         <input id="prAddr" class="inp" placeholder="目标地址，如 https://movie.example.com" style="flex:2;min-width:200px">
-        <button type="button" class="btn g s" id="prAdd">添加</button>
-        <button type="button" class="btn g s" id="prRand">随机 key</button>
+        <button type="button" class="btn g s" id="prAdd">生成两段</button>
       </div>
-      <textarea id="prefixRoutes" class="tarea" placeholder="/emby=https://movie.example.com&#10;/jf=http://10.0.0.5:8096"></textarea>
+      <textarea id="prefixRoutes" class="tarea" placeholder="/emby/a7k2m9xq=https://movie.example.com&#10;/jf/k3p8n2wd=http://10.0.0.5:8096"></textarea>
     </div>
     <div class="fi"><label class="fl">上游域名白名单（可反代到的目标）</label><div class="hint" style="margin-bottom:8px">每行一条，http(s):// 前缀可省略。支持：域名（如 example.com，自动匹配根域名）、通配（*.cdn.example.com）、完整域名+路径（如 example.com/emby，仅放行该路径前缀）、IP:端口+路径（如 1.2.3.4:8096/emby，端口参与匹配）。限制路径里能反代到哪些上游主机，与上面的访问域名无关</div><textarea id="whitelist" class="tarea" placeholder="example.com&#10;*.cdn.example.com&#10;example.com/emby&#10;1.2.3.4:8096/emby"></textarea></div>
     <div class="fi"><label class="fl">IP 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个 IP，支持 CIDR</div><textarea id="banList" class="tarea" placeholder="1.1.1.1"></textarea></div>
@@ -10946,24 +10945,22 @@ async function loadConfig(){
     const ah=document.getElementById('allowedHosts');if(ah)ah.value=(c.allowed_hosts||[]).join('\n');
     const ch=document.getElementById('curHostHint');if(ch){const h=c.current_host||'';ch.textContent=h?('当前访问域名（请确认它已填在上方白名单）：'+h):'当前访问域名：未知';}
     const pr=document.getElementById('prefixRoutes');if(pr)pr.value=(c.prefix_routes||[]).join('\n');
-    function prAppend(random){
+    function prAppend(){
       const addr=(document.getElementById('prAddr')?.value||'').trim();
       if(!addr){alert('请填写目标地址');return}
-      let key=(document.getElementById('prKey')?.value||'').trim().replace(/^\/+|\/+$/g,'');
-      if(random||!key){
-        const chars='abcdefghijkmnpqrstuvwxyz23456789';
-        key=Array.from({length:8},()=>chars[Math.floor(Math.random()*chars.length)]).join('');
-        const kEl=document.getElementById('prKey'); if(kEl) kEl.value=key;
-      }
-      if(!/^[A-Za-z0-9_-]+$/.test(key)){alert('key 只能用字母、数字、下划线、中划线');return}
-      const line='/'+key+'='+addr;
+      const custom=(document.getElementById('prKey')?.value||'').trim().replace(/^\/+|\/+$/g,'');
+      if(!custom){alert('请填写自定义段');return}
+      if(!/^[A-Za-z0-9_-]+$/.test(custom)){alert('自定义段只能用字母、数字、下划线、中划线');return}
+      const chars='abcdefghijkmnpqrstuvwxyz23456789';
+      const rand=Array.from({length:8},()=>chars[Math.floor(Math.random()*chars.length)]).join('');
+      const line='/'+custom+'/'+rand+'='+addr;
       const ta=document.getElementById('prefixRoutes');
       if(!ta)return;
       ta.value=(ta.value.trim()?ta.value.trim()+'\n':'')+line;
       const aEl=document.getElementById('prAddr'); if(aEl) aEl.value='';
+      alert('已生成：/'+custom+'/'+rand+'\\n访问 /'+custom+'/'+rand+'/后面的路径 即可');
     }
-    document.getElementById('prAdd')?.addEventListener('click',()=>prAppend(false));
-    document.getElementById('prRand')?.addEventListener('click',()=>prAppend(true));
+    document.getElementById('prAdd')?.addEventListener('click',()=>prAppend());
     document.getElementById('whitelist').value=(c.whitelist||[]).join('\n');document.getElementById('banList').value=(c.ban_list||[]).join('\n');
     document.getElementById('allowedUAs').value=(c.allowed_uas||[]).join('\n');
     const bua=document.getElementById('blockedUAs');if(bua)bua.value=(c.blocked_uas||[]).join('\n');
