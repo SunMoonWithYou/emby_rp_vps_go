@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.3.6"
+APP_VERSION="4.3.8"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,7 +275,7 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.3.6
+// emby-proxy v4.3.8
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
@@ -2376,43 +2376,63 @@ func selfCgroupPath() string {
 }
 
 // removeAllPortJumps 清掉指向计数链的跳转，以及本服务打的 connmark 规则。
+// deleteListedRules 按 -S 输出删规则。-S 行形如 "-A INPUT ..."，删除时用 -D + 原参数，不能再拼链名。
+func deleteListedRules(bin string, lines []string, extra ...string) int {
+	n := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "-A ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		args := append(append([]string{}, extra...), append([]string{"-D"}, fields[1:]...)...)
+		if iptablesCmd(bin, args...) == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// removeAllPortJumps 循环清掉所有指向计数链的跳转和本服务的 connmark，直到没有残留。
+// 旧版本删规则时链名写重了，重启会叠规则；这里多轮删除，安装/更新/启动都会先清干净。
 func removeAllPortJumps(bin string) {
-	for _, dir := range []string{"INPUT", "OUTPUT"} {
-		for _, chain := range []string{"EMBY_PROXY_IN", "EMBY_PROXY_OUT"} {
+	for pass := 0; pass < 12; pass++ {
+		removed := 0
+		for _, dir := range []string{"INPUT", "OUTPUT"} {
 			out, err := iptablesOut(bin, "-S", dir)
 			if err != nil {
 				continue
 			}
+			var hits []string
 			for _, line := range strings.Split(out, "\n") {
-				line = strings.TrimSpace(line)
-				if !strings.HasSuffix(line, "-j "+chain) {
-					continue
+				if strings.Contains(line, "-j EMBY_PROXY_IN") || strings.Contains(line, "-j EMBY_PROXY_OUT") {
+					hits = append(hits, line)
 				}
-				fields := strings.Fields(line)
-				if len(fields) < 3 || fields[0] != "-A" {
-					continue
-				}
-				_ = iptablesCmd(bin, append([]string{"-D", dir}, fields[1:]...)...)
 			}
+			removed += deleteListedRules(bin, hits)
 		}
-	}
-	for _, dir := range []string{"OUTPUT", "INPUT"} {
-		out, err := iptablesOut(bin, "-t", "mangle", "-S", dir)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.Contains(line, "CONNMARK") || !strings.Contains(line, "0x1001") {
+		for _, dir := range []string{"OUTPUT", "INPUT"} {
+			out, err := iptablesOut(bin, "-t", "mangle", "-S", dir)
+			if err != nil {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) < 3 || fields[0] != "-A" {
-				continue
+			var hits []string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, "CONNMARK") && strings.Contains(line, "0x1001") {
+					hits = append(hits, line)
+				}
 			}
-			_ = iptablesCmd(bin, append([]string{"-t", "mangle", "-D", dir}, fields[1:]...)...)
+			removed += deleteListedRules(bin, hits, "-t", "mangle")
+		}
+		if removed == 0 {
+			break
 		}
 	}
+	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_IN")
+	_ = iptablesCmd(bin, "-F", "EMBY_PROXY_OUT")
 }
 
 // setupCgroupAcct 用 cgroup 匹配本服务出站，并用 connmark 找回源站回包。
@@ -6781,7 +6801,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.3.6 管理控制台",
+		"description":      "Emby 路径反代 v4.3.8 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6985,7 +7005,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.3.6"
+const appVersionStr = "4.3.8"
 
 // activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
@@ -12707,6 +12727,35 @@ EOF
   fi
 }
 
+
+# 清掉本服务的流量计数规则，避免旧版本残留叠计。安装/更新重启前都会跑。
+clean_acct_rules() {
+  local bin pass changed line
+  for bin in iptables ip6tables; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    for pass in 1 2 3 4 5 6 7 8; do
+      changed=0
+      while IFS= read -r line; do
+        [[ "$line" == -A\ * ]] || continue
+        if [[ "$line" == *-j\ EMBY_PROXY_IN || "$line" == *-j\ EMBY_PROXY_OUT ]]; then
+          # shellcheck disable=SC2086
+          if "$bin" -D ${line#-A }; then changed=1; fi
+        fi
+      done < <("$bin" -S INPUT 2>/dev/null; "$bin" -S OUTPUT 2>/dev/null)
+      while IFS= read -r line; do
+        [[ "$line" == -A\ * ]] || continue
+        if [[ "$line" == *CONNMARK* && "$line" == *0x1001* ]]; then
+          # shellcheck disable=SC2086
+          if "$bin" -t mangle -D ${line#-A }; then changed=1; fi
+        fi
+      done < <("$bin" -t mangle -S INPUT 2>/dev/null; "$bin" -t mangle -S OUTPUT 2>/dev/null)
+      [[ "$changed" == 0 ]] && break
+    done
+    "$bin" -F EMBY_PROXY_IN 2>/dev/null || true
+    "$bin" -F EMBY_PROXY_OUT 2>/dev/null || true
+  done
+}
+
 # cmd_install 执行完整安装：检查环境、编译、写 unit、启动服务。
 cmd_install() {
   parse_install_args "$@"
@@ -12801,6 +12850,7 @@ cmd_install() {
     info "已更新 systemd unit"; systemctl daemon-reload
   fi
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  clean_acct_rules
   systemctl restart "$SERVICE_NAME" || true
   sleep 2
   if [[ ${first_boot:-0} -eq 1 ]] && systemctl is-active --quiet "$SERVICE_NAME"; then
