@@ -4043,7 +4043,8 @@ func startReportWorker() {
 	go func() {
 		for {
 			now := nowBeijing()
-			next := now.Truncate(time.Hour).Add(5 * time.Second)
+			// 整点后 5 分钟再上报，给上一小时的请求留足落库时间
+			next := now.Truncate(time.Hour).Add(5 * time.Minute)
 			if !next.After(now) {
 				next = next.Add(time.Hour)
 			}
