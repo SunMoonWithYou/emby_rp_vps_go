@@ -2828,6 +2828,7 @@ type reportPayload struct {
 	IPRequests  map[string]int64 `json:"ip_requests"`
 	Countries   map[string]int64 `json:"countries"`
 	Provinces   map[string]int64 `json:"provinces"`
+	Regions     map[string]map[string]int64 `json:"regions"`
 	Clients     map[string]int64 `json:"clients"`
 	StatDropped int64            `json:"stats_dropped"`
 	QueueDepth  int              `json:"queue_depth"`
@@ -2940,6 +2941,11 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 	pruneTopN(p.Provinces, 50)
 	p.Clients = mapDelta(cur.UAClass, base.UAClass)
 	pruneTopN(p.Clients, 50)
+	// 省份挂到中国下（当前省份数据均为中国）
+	p.Regions = map[string]map[string]int64{}
+	if len(p.Provinces) > 0 {
+		p.Regions["中国"] = p.Provinces
+	}
 	p.StatDropped = statDropped.Load()
 	p.BatchID = p.NodeKey + "-" + p.PeriodDate + "-" + p.PeriodHour
 	return p
@@ -3064,6 +3070,10 @@ func buildDailyReportPayload(date string) (reportPayload, bool) {
 	pruneTopN(p.Hosts, 100)
 	pruneTopN(p.IPs, 100)
 	pruneTopN(p.Clients, 50)
+	p.Regions = map[string]map[string]int64{}
+	if len(p.Provinces) > 0 {
+		p.Regions["中国"] = p.Provinces
+	}
 	if p.Countries != nil {
 		named := make(map[string]int64, len(p.Countries))
 		for code, v := range p.Countries {
