@@ -2780,6 +2780,8 @@ type reportSnap struct {
 	Hosts      map[string]int64 `json:"hosts,omitempty"`
 	IPs        map[string]int64 `json:"ips,omitempty"`
 	Countries  map[string]int64 `json:"countries,omitempty"`
+	Provinces  map[string]int64 `json:"provinces,omitempty"`
+	UAClass    map[string]int64 `json:"ua_class,omitempty"`
 }
 
 // satSub：相关逻辑处理。
@@ -2826,6 +2828,7 @@ type reportPayload struct {
 	IPRequests  map[string]int64 `json:"ip_requests"`
 	Countries   map[string]int64 `json:"countries"`
 	Provinces   map[string]int64 `json:"provinces"`
+	Clients     map[string]int64 `json:"clients"`
 	StatDropped int64            `json:"stats_dropped"`
 	QueueDepth  int              `json:"queue_depth"`
 }
@@ -2847,6 +2850,8 @@ func buildCurrentSnap() reportSnap {
 		sn.Hosts = copyInt64Map(d.Hosts)
 		sn.IPs = copyInt64Map(d.IPs)
 		sn.Countries = copyInt64Map(d.Countries)
+		sn.Provinces = copyInt64Map(d.Provinces)
+		sn.UAClass = copyInt64Map(d.UAClass)
 	}
 	return sn
 }
@@ -2930,6 +2935,11 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 		name := countryName(code)
 		p.Countries[name] += v
 	}
+	provDelta := mapDelta(cur.Provinces, base.Provinces)
+	p.Provinces = provDelta
+	pruneTopN(p.Provinces, 50)
+	p.Clients = mapDelta(cur.UAClass, base.UAClass)
+	pruneTopN(p.Clients, 50)
 	p.StatDropped = statDropped.Load()
 	p.BatchID = p.NodeKey + "-" + p.PeriodDate + "-" + p.PeriodHour
 	return p
@@ -3037,6 +3047,7 @@ func buildDailyReportPayload(date string) (reportPayload, bool) {
 		IPs:         copyInt64Map(d.IPs),
 		Countries:   copyInt64Map(d.Countries),
 		Provinces:   copyInt64Map(d.Provinces),
+		Clients:     copyInt64Map(d.UAClass),
 		StatDropped: statDropped.Load(),
 	}
 	statsMu.Unlock()
@@ -3052,6 +3063,7 @@ func buildDailyReportPayload(date string) (reportPayload, bool) {
 	p.IPRequests = p.IPs
 	pruneTopN(p.Hosts, 100)
 	pruneTopN(p.IPs, 100)
+	pruneTopN(p.Clients, 50)
 	if p.Countries != nil {
 		named := make(map[string]int64, len(p.Countries))
 		for code, v := range p.Countries {
