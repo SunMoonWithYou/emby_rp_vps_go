@@ -55,7 +55,7 @@
 
 ### 6. 数据上报与通知
 - 支持定时统计数据上报。
-- 支持自定义上报地址。
+- 支持自定义上报地址。[数据上报后台代码：https://github.com/SunMoonWithYou/embypanel]
 - 支持 Bearer Token。
 - 支持节点名称及备注。
 - 支持昨日访问日报。
