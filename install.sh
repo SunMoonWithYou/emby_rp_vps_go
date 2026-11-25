@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.3.8"
+APP_VERSION="4.4.0"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,36 +275,34 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.3.8
+// emby-proxy v4.4.0
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
-// 数据路径（v4.0 起）：
-//   - 纯转发。httputil.ReverseProxy 直接写回客户端，
-//     不再用 countingReader / countingWriter 逐块计数。
-//   - 实时网速优先用 iptables cgroup + connmark 只统计本服务流量
-//     （客户端侧 + 源站侧，不含其他软件，继续以 root 运行）；
-//     cgroup 不可用时回退监听端口计数，再不行回退 /proc/net/dev 整机网卡。
+// 转发（v4.4）：
+//   - 纯转发。ReverseProxy 直接写回客户端，不在热路径逐块计数。
+//   - 复制缓冲与传输缓冲 128KB；FlushInterval 100ms，兼顾视频实时与开销。
+//   - HTTP/1.1、DNS 校验后固定上游 IP；连接池与 TCP 窗口按媒体场景调大。
+//   - 实时网速优先用 iptables cgroup + connmark，只统计本服务流量。
 //
-// 访问控制（判定链，命中即拒绝）：
+// 访问控制（判定链，保存后立即生效）：
 //   ① IP 黑名单
 //   ② 访问域名守卫（Host）
-//   ③ UA 黑名单（BlockedUAs 非空时命中即拒绝）
-//   ④ UA 白名单（AllowedUAs 非空时做大小写不敏感子串匹配）
+//   ③ UA 黑名单（搜索引擎/自定义关键字，命中回 403）
+//   ④ UA 白名单
 //   ⑤ 地区限制（ChinaOnly）
-//   ⑥ 上游域名白名单
+//   ⑥ 上游域名白名单 / 前缀路由
 //
-// 早筛层（独立开关，默认关）：
-//   - 蜜罐路径：命中断连并自动拉黑
-//   - 扫描器 UA / 空 UA：断连；仅明确扫描器特征才自动拉黑
+// 早筛层（独立开关，默认关，在判定链之前）：
+//   - 蜜罐路径：断连并自动拉黑
+//   - 扫描器 UA：工具特征断连并拉黑；curl/python-requests 只断连；空 UA 断连不拉黑
 //   - 单 IP 全局限速：令牌桶 + 并发上限，超限断连不拉黑
 //
-// 管理后台：
-//   - 登录带验证码，失败锁定；空 UA 登录失败只记拦截，不自动进永久黑名单
-//   - 日报默认 JSON 模板，chat_id 用 {{chat_id}} 占位，不写死
-//   - 不再统计/展示每个 IP 的流量字节
-//
-// 持久化：配置与统计存 BoltDB；端口变更热切换监听。
+// 统计与后台：
+//   - 客户端按 UA 前缀正则归类；实时请求流含客户端列
+//   - 日报留空时使用内置 Telegram HTML 模板
+//   - 配置与统计存 BoltDB；端口变更热切换监听
+//   - IP / 地区 / UA 在热路径有短缓存，避免重复解析
 
 import (
 	"bufio"
@@ -1008,10 +1006,7 @@ func storeDNSCache(host string, ips []net.IP) {
 	dnsCacheMu.Unlock()
 }
 
-// dialPinned 只拨号到本次请求预先校验过的 DNS 结果，避免解析校验与实际连接之间
-// 再次查询 DNS 所产生的 rebinding 窗口。TLS 仍使用 URL 中的原始主机名校验证书。
-// dialPinned 只拨号到本次请求已校验的 IP，不再二次 DNS 查询。
-// TLS 仍用原始主机名校验证书。多 IP 时按顺序尝试，直到成功或上下文取消。
+// dialPinned 只拨到本次请求已校验的 IP，避免 DNS rebinding。TLS 仍用原始主机名校验证书。
 func dialPinned(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1021,11 +1016,24 @@ func dialPinned(ctx context.Context, network, addr string) (net.Conn, error) {
 	if !ok || resolution == nil || !strings.EqualFold(strings.TrimSuffix(host, "."), resolution.host) {
 		return nil, fmt.Errorf("缺少已校验的上游 DNS 结果")
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 60 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// 加大 socket 缓冲，减少高码率视频时的内核排队
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 512*1024)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 512*1024)
+			})
+		},
+	}
 	var lastErr error
 	for _, ip := range resolution.ips {
 		conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 		if dialErr == nil {
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
 			return conn, nil
 		}
 		lastErr = dialErr
@@ -1280,23 +1288,38 @@ func (a *compiledACL) matchWhitelist(targetHost, targetPath string) bool {
 }
 
 // 客户端归类：优先识别已知播放器，否则回退到白名单关键字。
+// 相同 UA 短缓存，避免每个请求都跑正则。
+var uaClassCache sync.Map // ua -> string
+
 func uaClassOfEx(ua string) string {
+	if ua == "" {
+		return "未知"
+	}
+	if v, ok := uaClassCache.Load(ua); ok {
+		return v.(string)
+	}
 	cls := uaClassOf(ua)
 	if cls == "其他" || cls == "未知" {
 		if k := uaWhitelistKeyword(ua); k != "" {
-			return k
+			cls = k
 		}
+	}
+	// 简单限制缓存规模
+	n := 0
+	uaClassCache.Range(func(_, _ any) bool { n++; return n < 512 })
+	if n < 512 {
+		uaClassCache.Store(ua, cls)
 	}
 	return cls
 }
 
-// uaAllowed 检查 User-Agent 是否命中白名单关键字。
-// 白名单为空时全部放行；非空时必须包含任一关键字才放行。
-// uaAllowed 检查 User-Agent 是否放行。
-// AllowedUAs 为空时全部放行；非空时做大小写不敏感的子串匹配，命中任一关键字即通过。
+// uaAllowed：白名单为空时全部放行；非空时大小写不敏感子串匹配，命中任一即通过。
 func uaAllowed(ua string) bool {
-	a := currentACL()
-	if len(a.uaNeedles) == 0 {
+	return uaAllowedACL(currentACL(), ua)
+}
+
+func uaAllowedACL(a *compiledACL, ua string) bool {
+	if a == nil || len(a.uaNeedles) == 0 {
 		return true
 	}
 	ua = strings.ToLower(ua)
@@ -1312,8 +1335,11 @@ func uaAllowed(ua string) bool {
 // 黑名单为空时不拦截；非空时做大小写不敏感子串匹配，命中任一即拒绝。
 // 判定顺序上优先于白名单。
 func uaBlocked(ua string) bool {
-	a := currentACL()
-	if len(a.uaBlockNeedles) == 0 {
+	return uaBlockedACL(currentACL(), ua)
+}
+
+func uaBlockedACL(a *compiledACL, ua string) bool {
+	if a == nil || len(a.uaBlockNeedles) == 0 {
 		return false
 	}
 	low := strings.ToLower(ua)
@@ -1358,18 +1384,16 @@ func startListen(srv *http.Server, port int) error {
 // loadConfig 从 BoltDB 读取配置到内存。
 // 库不存在或为空时使用默认配置，不报错退出。
 
-// defaultBlockedUAs 默认 UA 黑名单：常见浏览器与爬虫。
-// 仅在配置里从未设置过黑名单（nil）时填入；用户清空保存后不再自动加回。
-// defaultBlockedUAs 只放明确的爬虫/扫描器全名。
-// 不要用 Mozilla、Safari、Chrome、bot 这类宽关键字：Infuse、Emby 等正常客户端
-// 的 User-Agent 里也会带这些字，会被误伤。
+// defaultBlockedUAs 仅在从未设置黑名单时填入。只放搜索引擎/社交爬虫全名，
+// 不用 Mozilla、Chrome、bot 等宽关键字，以免误伤 Infuse、Emby 等正常客户端。
 func defaultBlockedUAs() []string {
+	// 只放搜索引擎 / 社交爬虫。curl、python-requests、scrapy 等工具特征
+	// 由「扫描器 UA 拦截」负责，避免两处重复。
 	return []string{
 		"Googlebot", "bingbot", "Baiduspider", "YandexBot", "DuckDuckBot",
 		"facebookexternalhit", "Twitterbot", "LinkedInBot", "Slackbot",
 		"Discordbot", "TelegramBot", "SemrushBot", "AhrefsBot", "MJ12bot",
-		"DotBot", "PetalBot", "Bytespider", "python-requests", "Scrapy",
-		"Go-http-client", "curl/", "wget/",
+		"DotBot", "PetalBot", "Bytespider",
 	}
 }
 
@@ -1421,8 +1445,7 @@ func loadConfig() {
 	rebuildACL(c)
 }
 
-// saveConfig 将配置整份写入 BoltDB。后台保存、导入配置时调用。
-// saveConfig 把配置整份写入 BoltDB config 桶，并更新内存指针。
+// saveConfig 把配置整份写入 BoltDB，并重建内存中的 ACL。
 func saveConfig(c *Config) error {
 	if db == nil {
 		return fmt.Errorf("db not ready")
@@ -1648,10 +1671,17 @@ func upstreamAddr(u *url.URL) string {
 
 // matchPrefixRoute 用最长前缀匹配请求路径，命中则拼出上游 URL（保留查询串由调用方处理）。
 func matchPrefixRoute(path string) (*url.URL, bool) {
+	return matchPrefixRouteACL(currentACL(), path)
+}
+
+// matchPrefixRouteACL 使用调用方已取得的 ACL，避免热路径重复原子读。
+func matchPrefixRouteACL(a *compiledACL, path string) (*url.URL, bool) {
+	if a == nil {
+		a = currentACL()
+	}
 	if path == "" {
 		path = "/"
 	}
-	a := currentACL()
 	for _, rt := range a.prefixRoutes {
 		if path != rt.prefix && !strings.HasPrefix(path, rt.prefix+"/") {
 			continue
@@ -2043,13 +2073,16 @@ func reqBytesFrom(ctx context.Context) *reqBytes {
 	return rb
 }
 
-// 单个 IP 的瞬时上下行计数。
+// 单个 IP 的瞬时上下行计数。带最后活跃时间，便于过期清理。
 type ipLiveRate struct {
-	up   atomic.Int64
-	down atomic.Int64
+	up       atomic.Int64
+	down     atomic.Int64
+	lastUnix atomic.Int64 // unix nano，最近一次有流量的时间
 }
 
 var ipLiveRates sync.Map
+
+const ipLiveIdleExpire = 10 * time.Minute // 无流量超过此时长则从 map 删除
 
 // 累加某个 IP 的实时上下行字节（供后台瞬时速率）。
 func addIPLive(ip string, up, down int64) {
@@ -2058,6 +2091,8 @@ func addIPLive(ip string, up, down int64) {
 	}
 	v, _ := ipLiveRates.LoadOrStore(ip, &ipLiveRate{})
 	r := v.(*ipLiveRate)
+	now := time.Now().UnixNano()
+	r.lastUnix.Store(now)
 	if up > 0 {
 		r.up.Add(up)
 	}
@@ -2066,14 +2101,19 @@ func addIPLive(ip string, up, down int64) {
 	}
 }
 
-// 拍一份各 IP 的瞬时速率并清零计数器。
+// 拍一份各 IP 的瞬时速率并清零计数器。同时清理长期无流量的条目。
 func snapshotIPRates() map[string][2]int64 {
 	out := make(map[string][2]int64)
+	now := time.Now().UnixNano()
+	expireBefore := now - int64(ipLiveIdleExpire)
 	ipLiveRates.Range(func(k, v any) bool {
 		r := v.(*ipLiveRate)
 		up, down := r.up.Swap(0), r.down.Swap(0)
+		last := r.lastUnix.Load()
 		if up > 0 || down > 0 {
 			out[k.(string)] = [2]int64{up, down}
+		} else if last > 0 && last < expireBefore {
+			ipLiveRates.Delete(k)
 		}
 		return true
 	})
@@ -2173,6 +2213,8 @@ type liveEvent struct {
 	Country string `json:"country"`
 	Host    string `json:"host"`
 	Path    string `json:"path"`
+	UA      string `json:"ua"`
+	UARaw   string `json:"ua_raw,omitempty"`
 	Seq     int64  `json:"seq"`
 }
 
@@ -2188,7 +2230,7 @@ var (
 )
 
 // 向实时面板推一条访问事件；无订阅者时直接跳过。
-func pushLiveEvent(ip, country, host, path string) {
+func pushLiveEvent(ip, country, host, path, ua string) {
 	if liveClients.Load() == 0 {
 		return
 	}
@@ -2200,12 +2242,18 @@ func pushLiveEvent(ip, country, host, path string) {
 	} else {
 		rpsCount.Add(1)
 	}
+	raw := ua
+	if len(raw) > 180 {
+		raw = raw[:180] + "…"
+	}
 	ev := liveEvent{
 		Time:    now.In(beijingLoc).Format("15:04:05"),
 		IP:      ip,
 		Country: country,
 		Host:    host,
 		Path:    path,
+		UA:      uaClassOfEx(ua),
+		UARaw:   raw,
 		Seq:     liveSeq.Add(1),
 	}
 	liveMu.Lock()
@@ -2628,7 +2676,6 @@ var speedTokens sync.Map
 
 const speedTokenValidity = 7 * 24 * time.Hour
 
-// speedTokenExpired：相关逻辑处理。
 func speedTokenExpired(st *speedToken) bool {
 	t, err := time.Parse(time.RFC3339, st.Created)
 	if err != nil {
@@ -2746,7 +2793,6 @@ func loadSpeedResults() {
 	})
 }
 
-// appendSpeedResult：相关逻辑处理。
 func appendSpeedResult(r speedResult) {
 	speedResultsMu.Lock()
 	speedResults = append(speedResults, r)
@@ -2784,7 +2830,6 @@ type reportSnap struct {
 	UAClass    map[string]int64 `json:"ua_class,omitempty"`
 }
 
-// satSub：相关逻辑处理。
 func satSub(a, b int64) int64 {
 	if a > b {
 		return a - b
@@ -2792,7 +2837,6 @@ func satSub(a, b int64) int64 {
 	return 0
 }
 
-// mapDelta：相关逻辑处理。
 func mapDelta(cur, prev map[string]int64) map[string]int64 {
 	out := make(map[string]int64, len(cur))
 	for k, v := range cur {
@@ -2836,7 +2880,6 @@ type reportPayload struct {
 
 var reportQueueMu sync.Mutex
 
-// buildCurrentSnap：相关逻辑处理。
 func buildCurrentSnap() reportSnap {
 	now := nowBeijing()
 	date := beijingDate(now)
@@ -2905,7 +2948,6 @@ func startHourlySnapshotWorker() {
 	}()
 }
 
-// payloadFromDelta：相关逻辑处理。
 func payloadFromDelta(base, cur reportSnap) reportPayload {
 	p := reportPayload{
 		NodeKey:    getNodeKey(),
@@ -2951,7 +2993,6 @@ func payloadFromDelta(base, cur reportSnap) reportPayload {
 	return p
 }
 
-// topIPsByTotal：相关逻辑处理。
 func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} {
 	score := make(map[string]int64, len(total)+len(up)+len(down))
 	for ip := range total {
@@ -2990,7 +3031,6 @@ func topIPsByTotal(total, up, down map[string]int64, n int) map[string]struct{} 
 	return out
 }
 
-// alignIPStats：相关逻辑处理。
 func alignIPStats(m map[string]int64, keep map[string]struct{}) map[string]int64 {
 	out := make(map[string]int64, len(keep))
 	for ip := range keep {
@@ -2999,7 +3039,6 @@ func alignIPStats(m map[string]int64, keep map[string]struct{}) map[string]int64
 	return out
 }
 
-// lastFullHourReport：相关逻辑处理。
 func lastFullHourReport() (reportPayload, bool) {
 	snaps := loadReportSnaps()
 	if len(snaps) < 2 {
@@ -3101,7 +3140,6 @@ func lastDailyReportSent() string {
 	return m.Date
 }
 
-// markDailyReportSent：相关逻辑处理。
 func markDailyReportSent(date string) {
 	raw, _ := json.Marshal(map[string]string{"date": date, "time": beijingRFC3339(nowBeijing())})
 	_ = db.Update(func(tx *bolt.Tx) error {
@@ -3124,7 +3162,6 @@ const defaultDailyTmpl = `{
   "text": "📊 <b>昨日请求统计报告</b>\n\n📅 日期：<code>{{date}}</code>\n🖥 节点：<code>{{node}}</code>\n📝 备注：{{note}}\n\n📈 <b>请求概览</b>\n\n🔢 总请求数：<b><code>{{requests}}</code></b> 次\n\n🛡 <b>安全拦截统计</b>\n\n🚫 总拦截：<b>{{blocked}}</b>\n🇨🇳 国内拦截：{{blocked_cn}}\n🌐 白名单拦截：{{blocked_wl}}\n⛔ 黑名单拦截：{{blocked_ban}}\n🤖 UA 拦截：{{blocked_ua}}\n\n📍 <b>访问排行榜</b>\n\n🌐 <b>IP 访问 TOP</b>\n<pre>{{ips_top_lines}}</pre>\n\n🔗 <b>域名访问 TOP</b>\n<pre>{{hosts_top_lines}}</pre>\n\n🌍 <b>国家 / 地区 TOP</b>\n<pre>{{countries_top_lines}}</pre>\n\n🏙 <b>省份 TOP</b>\n<pre>{{provinces_top}}</pre>\n\n🤖 <i>自动统计 · 每日运行</i>"
 }`
 
-// humanBytes：相关逻辑处理。
 func humanBytes(n int64) string {
 	if n <= 0 {
 		return "0 B"
@@ -3273,7 +3310,6 @@ func jsonSafeValue(v string) string {
 	return v
 }
 
-// mustJSON：相关逻辑处理。
 func mustJSON(v any) []byte {
 	raw, _ := json.Marshal(v)
 	return raw
@@ -3301,7 +3337,6 @@ func dailyTarget(c *Config) (string, string) {
 	return c.ReportURL, c.ReportToken
 }
 
-// dailyContentType：相关逻辑处理。
 func dailyContentType(c *Config) string {
 	if c.DailyTmplOn {
 		if t := strings.TrimSpace(c.DailyTmplType); t != "" {
@@ -3411,7 +3446,8 @@ func buildReportPlan(c *Config) reportPlan {
 		case isGetUpdatesURL(tURL):
 			pl.Daily.Reason = "发送地址以 /getUpdates 结尾，发不出通知，请改为 /sendMessage"
 		case strings.TrimSpace(c.DailyTmpl) == "":
-			pl.Daily.Reason = "已开启模板推送但模板内容为空，不会执行（填写模板后自动生效）"
+			pl.Daily.Ready = true
+			pl.Daily.Reason = "模板为空，将使用内置默认模板"
 		default:
 			pl.Daily.Ready = true
 			pl.Daily.Reason = "运行中：每天 00:10 推送模板消息"
@@ -3442,10 +3478,8 @@ func sendDailyReportIfDue() int {
 	if !c.DailyTmplOn && !c.ReportOn {
 		return 0
 	}
-	// 已开启模板推送但未填写模板内容 → 视为未配置，定时任务不执行（手动发送仍可用默认模板）
-	if c.DailyTmplOn && strings.TrimSpace(c.DailyTmpl) == "" {
-		return 0
-	}
+	// 已开启模板推送但模板为空时，使用内置默认模板（与手动发送一致）
+
 	tURL, _ := dailyTarget(c)
 	if tURL == "" {
 		return 0
@@ -3519,7 +3553,6 @@ func parseRFC3339(s string) time.Time {
 	return t
 }
 
-// detectNodeName：相关逻辑处理。
 func detectNodeName() string {
 	if ip, _ := selfPublicIP.Load().(string); ip != "" {
 		return ip
@@ -3679,7 +3712,6 @@ func loadReportPayload(id string) (string, bool) {
 	return string(out), out != nil
 }
 
-// deleteReportPayloads：相关逻辑处理。
 func deleteReportPayloads(ids []string) {
 	if len(ids) == 0 {
 		return
@@ -3696,7 +3728,6 @@ func deleteReportPayloads(ids []string) {
 	})
 }
 
-// clearReportPayloads：相关逻辑处理。
 func clearReportPayloads() {
 	_ = db.Update(func(tx *bolt.Tx) error {
 		if tx.Bucket([]byte(reportPayloadBucket)) != nil {
@@ -3744,7 +3775,6 @@ func persistReportRecordsLocked() {
 	})
 }
 
-// appendReportRecord：相关逻辑处理。
 func appendReportRecord(rec reportRecord, payload []byte) {
 	if rec.Time == "" {
 		rec.Time = beijingRFC3339(nowBeijing())
@@ -3788,7 +3818,6 @@ const maxReportQueue = 24
 // maxQueueAttempts 单条队列项最大重试次数，超过则放弃（防止坏地址无限堆积）
 const maxQueueAttempts = 50
 
-// queuedReport：相关数据结构。
 type queuedReport struct {
 	ID          string `json:"id"`
 	Payload     []byte `json:"payload"`
@@ -3829,12 +3858,10 @@ func saveReportQueue(list []queuedReport) {
 	})
 }
 
-// sendOnceResp：相关逻辑处理。
 func sendOnceResp(url, token string, body []byte) (int, string, error) {
 	return sendOnceRespCT(url, token, body, "application/json")
 }
 
-// sendOnceRespCT：相关逻辑处理。
 func sendOnceRespCT(url, token string, body []byte, contentType string) (int, string, error) {
 	if contentType == "" {
 		contentType = "application/json"
@@ -3864,7 +3891,6 @@ func sendOnceRespCT(url, token string, body []byte, contentType string) (int, st
 
 var reportClient = &http.Client{Timeout: 25 * time.Second}
 
-// errString：相关逻辑处理。
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -3872,7 +3898,6 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// flushReportQueue：相关逻辑处理。
 func flushReportQueue() {
 	c := cfgPtr.Load()
 	if c == nil {
@@ -3983,7 +4008,6 @@ func flushReportQueue() {
 	saveReportQueue(keep)
 }
 
-// recordFromPayload：相关逻辑处理。
 func recordFromPayload(payload []byte, batchID, trigger string, status int, respBody string, err error, attempts int, start time.Time, ip, targetURL string) reportRecord {
 	var p reportPayload
 	_ = json.Unmarshal(payload, &p)
@@ -4014,7 +4038,6 @@ func recordFromPayload(payload []byte, batchID, trigger string, status int, resp
 	return rec
 }
 
-// enqueueAndSend：相关逻辑处理。
 func enqueueAndSend() {
 	c := cfgPtr.Load()
 	if c == nil || c.ReportURL == "" || !c.ReportOn {
@@ -4444,7 +4467,6 @@ var wsUpgrader = websocket.Upgrader{
 
 var statDropped atomic.Int64
 
-// pruneTopN：相关逻辑处理。
 func pruneTopN[K comparable](m map[K]int64, n int) {
 	if len(m) <= n {
 		return
@@ -4618,7 +4640,6 @@ func startStatsWorker() {
 	}()
 }
 
-// recordRequestStart：相关逻辑处理。
 func recordRequestStart(ip, country, host, ua string) {
 	select {
 	case statChan <- statEvent{IP: ip, Country: country, Host: host, UAClass: uaClassOfEx(ua), UARaw: uaRawKey(ua), IsStart: true}:
@@ -4627,7 +4648,6 @@ func recordRequestStart(ip, country, host, ua string) {
 	}
 }
 
-// statsMetaDisk：相关数据结构。
 type statsMetaDisk struct {
 	SchemaVersion    int    `json:"schema_version"`
 	TodayDate        string `json:"today_date"`
@@ -4646,7 +4666,6 @@ type statsMetaDisk struct {
 	LastProxyAt      string `json:"last_proxy_at"`
 }
 
-// emptyStats：相关逻辑处理。
 func emptyStats() Stats {
 	return Stats{
 		SchemaVersion: 2,
@@ -4662,7 +4681,6 @@ func emptyStats() Stats {
 	}
 }
 
-// rebuildAggregatesFromDaily：相关逻辑处理。
 func rebuildAggregatesFromDaily() {
 	stats.CountryCounts = map[string]int64{}
 	stats.IPCounts = map[string]int64{}
@@ -4842,7 +4860,6 @@ func loadStats() {
 	}
 }
 
-// statsSnapshot：相关数据结构。
 type statsSnapshot struct {
 	meta       []byte
 	blocks     []byte
@@ -4987,8 +5004,23 @@ func startStatsSaver() {
 	}()
 }
 
-// 读取/获取 getClientIP 对应的数据。
+// clientIPKey 把本次请求解析出的客户端 IP 放进 context，避免判定链里多次解析。
+type clientIPKey struct{}
+
+func withClientIP(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey{}, ip)
+}
+
+func clientIPFrom(ctx context.Context) (string, bool) {
+	s, ok := ctx.Value(clientIPKey{}).(string)
+	return s, ok && s != ""
+}
+
+// 读取/获取 getClientIP 对应的数据。同一请求内优先用 context 缓存。
 func getClientIP(r *http.Request) string {
+	if s, ok := clientIPFrom(r.Context()); ok {
+		return s
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -5030,7 +5062,6 @@ func isTrustedProxy(ip net.IP) bool {
 
 var selfPublicIP atomic.Value
 
-// detectSelfPublicIP：相关逻辑处理。
 func detectSelfPublicIP() {
 	go func() {
 		client := &http.Client{Timeout: 4 * time.Second}
@@ -5054,7 +5085,6 @@ func detectSelfPublicIP() {
 	}()
 }
 
-// provinceOf：相关逻辑处理。
 func provinceOf(ipStr string) string {
 	ipStr = strings.TrimSpace(ipStr)
 	if ipStr == "" || countryOf(ipStr) != "CN" {
@@ -5123,17 +5153,31 @@ func normalizeProvince(s string) string {
 	return s
 }
 
-// countryOf：相关逻辑处理。
+// countryOf：相关逻辑处理。带短缓存，同一 IP 不重复查库。
+var countryCache sync.Map // ip -> country code
+
 func countryOf(ipStr string) string {
-	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	ipStr = strings.TrimSpace(ipStr)
+	if ipStr == "" {
+		return "??"
+	}
+	if v, ok := countryCache.Load(ipStr); ok {
+		return v.(string)
+	}
+	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return "??"
 	}
-	c := iploc.Country(ip)
-	if len(c) == 0 || c == "ZZ" {
-		return "??"
+	cc := iploc.Country(ip)
+	if len(cc) == 0 || cc == "ZZ" {
+		cc = "??"
 	}
-	return c
+	n := 0
+	countryCache.Range(func(_, _ any) bool { n++; return n < 2048 })
+	if n < 2048 {
+		countryCache.Store(ipStr, cc)
+	}
+	return cc
 }
 
 var countryNames = map[string]string{
@@ -5393,7 +5437,6 @@ var countryNames = map[string]string{
 	"ZZ": "未知",
 }
 
-// countryName：相关逻辑处理。
 func countryName(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if code == "" || code == "ZZ" {
@@ -5431,7 +5474,6 @@ var countryCodeByEnglishName = map[string]string{
 	"Morocco": "MA", "Algeria": "DZ", "Tunisia": "TN", "Ethiopia": "ET",
 }
 
-// countryCodeByName：相关逻辑处理。
 func countryCodeByName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -5479,7 +5521,6 @@ func isSelfOrLocalIP(ip, country string) bool {
 var blockRateMu sync.Mutex
 var blockRates = make(map[string]*blockRateEntry)
 
-// blockRateEntry：相关数据结构。
 type blockRateEntry struct {
 	count int
 	start time.Time
@@ -5611,38 +5652,34 @@ var softScannerUA = []string{
 	"curl/", "wget/",
 }
 
-// isScannerUA 判断是否为扫描器 UA。空 UA 视为扫描器（断连），
-// 但不自动永久拉黑（见 shouldAutoBanUA）。明确特征（sqlmap/nuclei 等）才会自动拉黑。
-func isScannerUA(ua string) bool {
+// scannerMatch 一次小写后同时判断是否扫描器、是否应自动拉黑。
+// hard=工具特征（断连+拉黑），soft=脚本工具（只断连），空 UA 只断连不拉黑。
+func scannerMatch(ua string) (hit, autoBan bool) {
 	ua = strings.ToLower(strings.TrimSpace(ua))
 	if ua == "" {
-		return true
+		return true, false
 	}
 	for _, m := range hardScannerUA {
 		if strings.Contains(ua, m) {
-			return true
+			return true, true
 		}
 	}
 	for _, m := range softScannerUA {
 		if strings.Contains(ua, m) {
-			return true
+			return true, false
 		}
 	}
-	return false
+	return false, false
 }
 
-// shouldAutoBanUA：相关逻辑处理。
+func isScannerUA(ua string) bool {
+	hit, _ := scannerMatch(ua)
+	return hit
+}
+
 func shouldAutoBanUA(ua string) bool {
-	ua = strings.ToLower(strings.TrimSpace(ua))
-	if ua == "" {
-		return false
-	}
-	for _, m := range hardScannerUA {
-		if strings.Contains(ua, m) {
-			return true
-		}
-	}
-	return false
+	_, ban := scannerMatch(ua)
+	return ban
 }
 
 // autoBanMu 串行化自动拉黑，避免并发请求读改写配置时互相覆盖。
@@ -5676,7 +5713,6 @@ func autoBanIP(ip, reason string) {
 	recordAudit("system", "auto_ban", ip+"（"+reason+"）")
 }
 
-// rateBucket：相关数据结构。
 type rateBucket struct {
 	tokens float64
 	last   time.Time
@@ -5687,7 +5723,6 @@ type rateBucket struct {
 // 同一个 IP 始终落入同一分片，因此令牌桶与并发计数仍然保持原子语义。
 const ipStateShardCount = 64
 
-// ipStateShard：相关数据结构。
 type ipStateShard struct {
 	mu        sync.Mutex
 	rates     map[string]*rateBucket
@@ -5697,7 +5732,6 @@ type ipStateShard struct {
 
 var ipStateShards [ipStateShardCount]ipStateShard
 
-// ipStateShardFor：相关逻辑处理。
 func ipStateShardFor(ip string) *ipStateShard {
 	// FNV-1a，直接对字符串计算，不创建临时字节切片。
 	h := uint32(2166136261)
@@ -5792,7 +5826,6 @@ func ipConnAcquire(ip string, limit int) (func(), bool) {
 	}, true
 }
 
-// truncStr：相关逻辑处理。
 func truncStr(s string, n int) string {
 	if n <= 0 || len(s) <= n {
 		return s
@@ -5865,7 +5898,6 @@ func recordBlocked(ip, country, path, reason, ua, host string, reqBytes, respByt
 	}
 }
 
-// blockReasonText：相关逻辑处理。
 func blockReasonText(reason string) string {
 	switch reason {
 	case "cn":
@@ -5898,7 +5930,6 @@ func reasonMatches(evReason, want string) bool {
 const maxBlockEvents = 2000
 const maxAuditEvents = 500
 
-// geoEntry：相关数据结构。
 type geoEntry struct {
 	Code   string  `json:"code"`
 	Name   string  `json:"name"`
@@ -5918,7 +5949,6 @@ var (
 	geoGroup singleflight.Group
 )
 
-// geoPrune：相关逻辑处理。
 func geoPrune() {
 	const geoMaxEntries = 50000
 	now := time.Now().Unix()
@@ -5934,7 +5964,6 @@ func geoPrune() {
 	geoMu.Unlock()
 }
 
-// geoParseGeneric：相关逻辑处理。
 func geoParseGeneric(m map[string]any) (geoEntry, error) {
 	if data, ok := m["data"].(map[string]any); ok {
 		m = data
@@ -6001,7 +6030,6 @@ func isASCIIName(s string) bool {
 	return true
 }
 
-// toFloat：相关逻辑处理。
 func toFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -6017,7 +6045,6 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
-// geoEndpoints：相关逻辑处理。
 func geoEndpoints(ipEscaped string) []string {
 	return []string{
 		"https://ip9.com.cn/get?ip=" + ipEscaped,
@@ -6025,14 +6052,12 @@ func geoEndpoints(ipEscaped string) []string {
 	}
 }
 
-// geoFetch：相关逻辑处理。
 func geoFetch(ipStr string) (geoEntry, error) {
 	return geoFetchVia(geoEndpoints(url.QueryEscape(ipStr)), ipStr)
 }
 
 var geoClient = &http.Client{Timeout: 6 * time.Second}
 
-// geoFetchVia：相关逻辑处理。
 func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
 	var last error
 	for _, u := range urls {
@@ -6061,7 +6086,6 @@ func geoFetchVia(urls []string, ipStr string) (geoEntry, error) {
 	return geoEntry{}, last
 }
 
-// ipLabelSync：相关逻辑处理。
 func ipLabelSync(ipStr string) (string, string) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -6110,7 +6134,6 @@ var (
 	adminCredPtr atomic.Pointer[adminCred]
 )
 
-// adminCred：相关数据结构。
 type adminCred struct {
 	User     string
 	PassHash string
@@ -6146,7 +6169,6 @@ func hashPassword(plain string) (string, error) {
 	return string(b), nil
 }
 
-// verifyPassword：相关逻辑处理。
 func verifyPassword(hash, plain string) bool {
 	if hash == "" || plain == "" {
 		return false
@@ -6168,9 +6190,7 @@ const (
 	captchaTTL    = 5 * time.Minute
 )
 
-// sessionEntry：相关数据结构。
 type sessionEntry struct{ Expires time.Time }
-// captchaEntry：相关数据结构。
 type captchaEntry struct {
 	Answer  string
 	Expires time.Time
@@ -6181,14 +6201,12 @@ var (
 	captchas sync.Map
 )
 
-// randToken：相关逻辑处理。
 func randToken(n int) string {
 	b := make([]byte, n)
 	_, _ = io.ReadFull(rand.Reader, b)
 	return hex.EncodeToString(b)
 }
 
-// initSessionsCleanup：相关逻辑处理。
 func initSessionsCleanup() {
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
@@ -6210,14 +6228,12 @@ func initSessionsCleanup() {
 	}()
 }
 
-// createSession：相关逻辑处理。
 func createSession() string {
 	tok := randToken(16)
 	sessions.Store(tok, sessionEntry{Expires: time.Now().Add(sessionTTL)})
 	return tok
 }
 
-// validSession：相关逻辑处理。
 func validSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -6238,7 +6254,6 @@ func validSession(tok string) bool {
 	return true
 }
 
-// destroyOtherSessions：相关逻辑处理。
 func destroyOtherSessions(keep string) {
 	sessions.Range(func(k, _ interface{}) bool {
 		if ks, ok := k.(string); ok && ks != keep {
@@ -6248,7 +6263,6 @@ func destroyOtherSessions(keep string) {
 	})
 }
 
-// destroySession：相关逻辑处理。
 func destroySession(tok string) {
 	if tok != "" {
 		sessions.Delete(tok)
@@ -6264,7 +6278,6 @@ func getSessionToken(r *http.Request) string {
 	return c.Value
 }
 
-// requestIsHTTPS：相关逻辑处理。
 func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -6288,12 +6301,10 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
 	http.SetCookie(w, c)
 }
 
-// clearSessionCookie：相关逻辑处理。
 func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", HttpOnly: true, MaxAge: -1})
 }
 
-// generateCaptchaSVG：相关逻辑处理。
 func generateCaptchaSVG() (id, answer, svg string) {
 	const digits = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 	rb := make([]byte, 16)
@@ -6329,7 +6340,6 @@ func generateCaptchaSVG() (id, answer, svg string) {
 	return id, answer, svg
 }
 
-// verifyCaptcha：相关逻辑处理。
 func verifyCaptcha(id, input string) bool {
 	if id == "" || input == "" {
 		return false
@@ -6346,7 +6356,6 @@ func verifyCaptcha(id, input string) bool {
 	return strings.EqualFold(strings.TrimSpace(input), e.Answer)
 }
 
-// requireAuth：相关逻辑处理。
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
@@ -6517,7 +6526,6 @@ func recordAudit(ip, action, detail string) {
 	}
 }
 
-// loginFailEntry：相关数据结构。
 type loginFailEntry struct {
 	Count    atomic.Int64
 	Window   atomic.Int64
@@ -6535,7 +6543,6 @@ const (
 	captchaRateLimit = 30
 )
 
-// loginLockDuration：相关逻辑处理。
 func loginLockDuration(lockouts int64) time.Duration {
 	d := loginLockBase
 	for i := int64(1); i < lockouts && d < loginLockMax; i++ {
@@ -6547,7 +6554,6 @@ func loginLockDuration(lockouts int64) time.Duration {
 	return d
 }
 
-// checkLoginAllowed：相关逻辑处理。
 func checkLoginAllowed(ip string) (ok bool, retryAfterSec int) {
 	now := time.Now().UnixNano()
 	val, _ := loginFailers.LoadOrStore(ip, &loginFailEntry{})
@@ -6595,12 +6601,10 @@ func recordLoginFail(ip, reason string) (locked bool, retryAfterSec int, fails i
 	return false, 0, fails
 }
 
-// clearLoginFail：相关逻辑处理。
 func clearLoginFail(ip string) {
 	loginFailers.Delete(ip)
 }
 
-// captchaRateEntry：相关数据结构。
 type captchaRateEntry struct {
 	Count       atomic.Int64
 	WindowStart atomic.Int64
@@ -6608,7 +6612,6 @@ type captchaRateEntry struct {
 
 var captchaLimiters sync.Map
 
-// checkCaptchaRate：相关逻辑处理。
 func checkCaptchaRate(ip string) bool {
 	val, _ := captchaLimiters.LoadOrStore(ip, &captchaRateEntry{})
 	e := val.(*captchaRateEntry)
@@ -6655,7 +6658,6 @@ func startAuthStateCleaner() {
 	}()
 }
 
-// switchTransport：相关数据结构。
 type switchTransport struct{ v atomic.Value }
 
 // RoundTrip：方法实现。
@@ -6667,27 +6669,29 @@ func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.RoundTrip(r)
 }
 
-// bufferPool：相关数据结构。
+// bufferPool：固定 64KB 缓冲区复用，降低视频转发时的 GC 压力。
 type bufferPool struct{ pool sync.Pool }
 
-// Get：方法实现。
 func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
 	}
-	return make([]byte, 32*1024)
+	return make([]byte, 128*1024)
 }
 
-// Put：方法实现。
 func (b *bufferPool) Put(p []byte) {
-	if cap(p) >= 32*1024 {
-		b.pool.Put(p[:32*1024])
+	if cap(p) >= 128*1024 {
+		// 归还时裁到固定长度，避免池里出现过大的切片
+		b.pool.Put(p[:128*1024])
 	}
 }
 
-var proxyBufPool = &bufferPool{}
+var proxyBufPool = &bufferPool{
+	pool: sync.Pool{
+		New: func() any { return make([]byte, 128*1024) },
+	},
+}
 
-// newTransport：相关逻辑处理。
 func newTransport() *http.Transport {
 	return &http.Transport{
 		// 反代上游必须走已校验并固定的 IP，不能被 HTTP_PROXY/HTTPS_PROXY 绕过。
@@ -6695,8 +6699,8 @@ func newTransport() *http.Transport {
 		// v4.3.0：保留经过实测取向的 HTTP/1.1 媒体转发策略；上游 HTTP/2 在高 RTT/丢包链路下所有流挤在一条 TCP 连接里，
 		// 队头阻塞会让大流量播放反而变慢；媒体转发场景 HTTP/1.1 多连接并行更快。
 		// 32K 读写缓冲保留（降低系统调用次数）。
-		ForceAttemptHTTP2: false, ReadBufferSize: 32 << 10, WriteBufferSize: 32 << 10,
-		MaxIdleConns: 1024, MaxIdleConnsPerHost: 128, IdleConnTimeout: 120 * time.Second,
+		ForceAttemptHTTP2: false, ReadBufferSize: 128 << 10, WriteBufferSize: 128 << 10,
+		MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, IdleConnTimeout: 180 * time.Second,
 		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 180 * time.Second, ExpectContinueTimeout: 1 * time.Second,
 		MaxResponseHeaderBytes: 1 << 20,
 		DisableCompression:     true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
@@ -6705,7 +6709,6 @@ func newTransport() *http.Transport {
 
 var cookieDomainRE = regexp.MustCompile(`(?i);\s*domain=[^;]*`)
 
-// rewriteOriginHeaders：相关逻辑处理。
 func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 	if o := out.Header.Get("Origin"); o != "" && o != "null" {
 		if u, err := url.Parse(o); err == nil && u.Host != "" && !strings.EqualFold(u.Host, host) {
@@ -6723,9 +6726,10 @@ func rewriteOriginHeaders(out *http.Request, scheme, host string) {
 
 // buildProxy 构造反向代理。请求经判定链放行后，由它转发到路径中指定的上游。
 // 支持 http/https、查询参数、WebSocket；会统计上下行流量。
+// FlushInterval=100ms：视频等流式响应定期刷新，避免积压；又不会像 -1 那样每次写入都刷，降低开销。
 func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: tr, FlushInterval: -1, BufferPool: proxyBufPool,
+		Transport: tr, FlushInterval: 100 * time.Millisecond, BufferPool: proxyBufPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			t, ok := pr.In.Context().Value(targetCtxKey{}).(*url.URL)
 			if !ok || t == nil {
@@ -6793,7 +6797,6 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 	}
 }
 
-// adminConfigResp：相关数据结构。
 type adminConfigResp struct {
 	Config
 	EffectivePort int    `json:"effective_port"`
@@ -6802,7 +6805,6 @@ type adminConfigResp struct {
 
 const iconVer = "?v=4"
 
-// pwaHeadExtra：相关逻辑处理。
 func pwaHeadExtra() string {
 	return "<link rel=\"icon\" href=\"/favicon.ico" + iconVer + "\">\n" +
 		"<link rel=\"apple-touch-icon\" href=\"/admin/icon-192.png" + iconVer + "\">\n" +
@@ -6814,17 +6816,15 @@ func pwaHeadExtra() string {
 		"<meta name=\"apple-mobile-web-app-title\" content=\"Emby Proxy\">\n"
 }
 
-// pwaBodyExtra：相关逻辑处理。
 func pwaBodyExtra() string {
 	return "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/admin/sw.js').catch(function(){})})}</script>"
 }
 
-// pwaManifestJSON：相关逻辑处理。
 func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.3.8 管理控制台",
+		"description":      "Emby 路径反代 v4.4.0 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -6898,7 +6898,6 @@ self.addEventListener('activate', function (e) {
 
 var gzipWriterPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
 
-// gzipCompressible：相关逻辑处理。
 func gzipCompressible(ct string) bool {
 	ct = strings.ToLower(ct)
 	for _, p := range []string{"text/", "application/json", "application/javascript", "application/manifest", "image/svg"} {
@@ -6909,7 +6908,6 @@ func gzipCompressible(ct string) bool {
 	return false
 }
 
-// gzipResponseWriter：相关数据结构。
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	gz      *gzip.Writer
@@ -6965,7 +6963,6 @@ func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return h.Hijack()
 }
 
-// gzipMiddleware：相关逻辑处理。
 func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || r.Header.Get("Upgrade") != "" {
@@ -7013,10 +7010,8 @@ func serveHTML(w http.ResponseWriter, r *http.Request, html, contentType, cacheC
 	_, _ = io.WriteString(w, html)
 }
 
-// diskSpace：相关数据结构。
 type diskSpace struct{ free, total uint64 }
 
-// diskUsage：相关逻辑处理。
 func diskUsage(path string) (diskSpace, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
@@ -7028,9 +7023,8 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.3.8"
+const appVersionStr = "4.4.0"
 
-// activeSessionCount：相关逻辑处理。
 func activeSessionCount() int {
 	now := time.Now()
 	n := 0
@@ -8165,6 +8159,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		}
 		ip := getClientIP(r)
 		c := currentCfg()
+		acl := currentACL()
 		// IP 归属整条判定链只解析一次，下面各步共用
 		country := countryOf(ip)
 
@@ -8183,7 +8178,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 		// 判定链 ③ UA 黑名单（优先于白名单）
-		if uaBlocked(r.UserAgent()) {
+		if uaBlockedACL(acl, r.UserAgent()) {
 			if blockedRateLimited(ip) {
 				dropOrMinimal429(w)
 				return
@@ -8196,7 +8191,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 			return
 		}
 		// 判定链 ④ UA 白名单
-		if !uaAllowed(r.UserAgent()) {
+		if !uaAllowedACL(acl, r.UserAgent()) {
 			if blockedRateLimited(ip) {
 				dropOrMinimal429(w)
 				return
@@ -8225,7 +8220,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		// 前缀路由优先：/xxx/** → 管理员配置的固定目标，不再走路径解析与上游白名单。
 		var target *url.URL
 		var err error
-		if u, ok := matchPrefixRoute(r.URL.Path); ok {
+		if u, ok := matchPrefixRouteACL(acl, r.URL.Path); ok {
 			target = u
 			target.RawQuery = r.URL.RawQuery
 		} else {
@@ -8235,7 +8230,7 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				serveHome(w, r)
 				return
 			}
-			if !currentACL().matchWhitelist(target.Host, target.Path) {
+			if !acl.matchWhitelist(target.Host, target.Path) {
 				if blockedRateLimited(ip) {
 					dropOrMinimal429(w)
 					return
@@ -8272,12 +8267,15 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 		// 纯转发：不包装 ResponseWriter / Body，避免逐块计数影响播放流畅度。
 		// 实时速率由网卡采样提供；请求次数仍由 recordRequestStart 统计。
 		proxy.ServeHTTP(w, r.WithContext(ctx))
-		pushLiveEvent(ip, country, upHost, upPath)
+		pushLiveEvent(ip, country, upHost, upPath, r.UserAgent())
 	})
 
 	adminSrv := adminHandler()
 	adminGz := gzipMiddleware(adminSrv)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 尽早解析客户端 IP 并放进 context，判定链与反代共用，避免重复解析头
+		ip0 := getClientIP(r)
+		r = r.WithContext(withClientIP(r.Context(), ip0))
 		// 静态资源统一放行（图标、robots、manifest 等），必须在 Host 守卫之前
 		if isStaticAsset(r.URL.Path) {
 			handleStaticAsset(w, r)
@@ -8315,14 +8313,16 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				dropConn(w)
 				return
 			}
-			if guardCfg.ScanGuardOn && isScannerUA(r.UserAgent()) {
-				reqB, respB := estimateBlockedBytes(r)
-				recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "scan_ua", r.UserAgent(), r.Host, reqB, respB)
-				if shouldAutoBanUA(r.UserAgent()) {
-					autoBanIP(guardIP, "扫描器 UA "+truncStr(r.UserAgent(), 60))
+			if guardCfg.ScanGuardOn {
+				if hit, autoBan := scannerMatch(r.UserAgent()); hit {
+					reqB, respB := estimateBlockedBytes(r)
+					recordBlocked(guardIP, countryOf(guardIP), r.URL.RequestURI(), "scan_ua", r.UserAgent(), r.Host, reqB, respB)
+					if autoBan {
+						autoBanIP(guardIP, "扫描器 UA "+truncStr(r.UserAgent(), 60))
+					}
+					dropConn(w)
+					return
 				}
-				dropConn(w)
-				return
 			}
 			if guardCfg.RateLimitOn {
 				if globalRateLimited(guardIP, guardCfg.RatePerSec, guardCfg.RateBurst) {
@@ -8482,6 +8482,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -8492,56 +8493,82 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// uaClassOf：相关逻辑处理。
+// uaClassOf：用正则从 UA 开头提取客户端标识并归类。
+// 优先识别 Name/version 或 Name-xxx/version 形式，未识别的直接用提取到的名称，
+// 减少「其他」里堆积的已知播放器。
+var (
+	uaPrefixRe = regexp.MustCompile(`(?i)^([a-z0-9][a-z0-9_-]{1,40})(?:[/-]|\s|$)`)
+	uaKnown    = map[string]string{
+		"infuse": "Infuse", "infuse-direct": "Infuse", "infuse-library": "Infuse",
+		"eplayerx": "EplayerX", "eplayer": "EplayerX",
+		"rex": "Rex", "rex-standard": "Rex",
+		"lenna": "Lenna",
+		"senplayer": "SenPlayer",
+		"capyplayer": "CapyPlayer",
+		"rodelplayer": "RodelPlayer",
+		"fileball": "FileBall",
+		"vidhub": "VidHub",
+		"hills": "Hills",
+		"nplayer": "nPlayer",
+		"mxplayer": "MX Player", "mx": "MX Player",
+		"dandanplay": "弹弹play",
+		"yamby": "Yamby",
+		"evermedia": "EverMedia",
+		"kodi": "Kodi",
+		"vlc": "VLC",
+		"potplayer": "PotPlayer",
+		"mpv": "mpv",
+		"emby": "Emby 客户端", "embytheater": "Emby Theater", "emby-theater": "Emby Theater",
+		"jellyfin": "Jellyfin 客户端",
+		"exoplayer": "Android 应用",
+		"okhttp": "Android 应用",
+		"dalvik": "Android 应用",
+	}
+)
+
+func isGenericUA(s string) bool {
+	switch s {
+	case "mozilla", "applewebkit", "compatible", "windows", "linux", "darwin", "http", "https", "dalvik":
+		return true
+	}
+	return false
+}
+
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	if r[0] >= 'a' && r[0] <= 'z' {
+		r[0] -= 32
+	}
+	return string(r)
+}
+
 func uaClassOf(ua string) string {
-	if strings.TrimSpace(ua) == "" {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
 		return "未知"
 	}
 	l := strings.ToLower(ua)
+
+	// 1. 正则提取前缀（Name/ 或 Name-）
+	if m := uaPrefixRe.FindStringSubmatch(ua); len(m) >= 2 {
+		key := strings.ToLower(m[1])
+		base := strings.Split(key, "-")[0]
+		if name, ok := uaKnown[key]; ok {
+			return name
+		}
+		if name, ok := uaKnown[base]; ok {
+			return name
+		}
+		if len(key) >= 3 && !isGenericUA(key) {
+			return titleCase(m[1])
+		}
+	}
+
+	// 2. 回退平台 / 浏览器 / 工具判断
 	switch {
-	// —— 主流第三方播放器 ——
-	case strings.Contains(l, "infuse"):
-		return "Infuse"
-	case strings.Contains(l, "fileball"):
-		return "FileBall"
-	case strings.Contains(l, "senplayer"):
-		return "SenPlayer"
-	case strings.Contains(l, "vidhub"):
-		return "VidHub"
-	case strings.Contains(l, "eplayerx") || strings.Contains(l, "eplayer"):
-		return "EplayerX"
-	case strings.Contains(l, "rex-") || strings.Contains(l, "rex/"):
-		return "Rex"
-	case strings.Contains(l, "lenna"):
-		return "Lenna"
-	case strings.Contains(l, "hills"):
-		return "Hills"
-	case strings.Contains(l, "nplayer"):
-		return "nPlayer"
-	case strings.Contains(l, "mxplayer") || strings.Contains(l, "mx player"):
-		return "MX Player"
-	case strings.Contains(l, "dandanplay") || strings.Contains(l, "弹弹play"):
-		return "弹弹play"
-	case strings.Contains(l, "yamby"):
-		return "Yamby"
-	case strings.Contains(l, "evermedia"):
-		return "EverMedia"
-	case strings.Contains(l, "kodi"):
-		return "Kodi"
-	case strings.Contains(l, "vlc"):
-		return "VLC"
-	case strings.Contains(l, "potplayer"):
-		return "PotPlayer"
-	case strings.Contains(l, "mpv"):
-		return "mpv"
-	// —— 官方客户端 ——
-	case strings.Contains(l, "emby theater") || strings.Contains(l, "embytheater"):
-		return "Emby Theater"
-	case strings.Contains(l, "emby"):
-		return "Emby 客户端"
-	case strings.Contains(l, "jellyfin"):
-		return "Jellyfin 客户端"
-	// —— 平台 ——
 	case strings.Contains(l, "android tv") || strings.Contains(l, "googletv") || strings.Contains(l, "bravia"):
 		return "Android TV"
 	case strings.Contains(l, "appletv") || strings.Contains(l, "apple tv"):
@@ -8550,22 +8577,17 @@ func uaClassOf(ua string) string {
 		return "iOS"
 	case strings.Contains(l, "android"):
 		return "Android"
-	// —— 其他播放器 / 工具 ——
 	case strings.Contains(l, "ffmpeg") || strings.Contains(l, "lavf") || strings.Contains(l, "libav"):
 		return "FFmpeg"
-	case strings.Contains(l, "exoplayer") || strings.Contains(l, "okhttp") || strings.Contains(l, "dalvik"):
-		return "Android 应用"
 	case strings.Contains(l, "mozilla") || strings.Contains(l, "chrome") || strings.Contains(l, "safari") ||
 		strings.Contains(l, "firefox") || strings.Contains(l, "edg"):
 		return "浏览器"
 	case strings.Contains(l, "curl") || strings.Contains(l, "wget") || strings.Contains(l, "python") || strings.Contains(l, "go-http"):
 		return "脚本/探针"
-	default:
-		return "其他"
 	}
+	return "其他"
 }
 
-// statsView：相关数据结构。
 type statsView struct {
 	at time.Time
 
@@ -8605,7 +8627,6 @@ var (
 	statsViewEvery = 5 * time.Second
 )
 
-// cloneInt64Map：相关逻辑处理。
 func cloneInt64Map(src map[string]int64) map[string]int64 {
 	dst := make(map[string]int64, len(src))
 	for k, v := range src {
@@ -8614,7 +8635,6 @@ func cloneInt64Map(src map[string]int64) map[string]int64 {
 	return dst
 }
 
-// cloneDayStat：相关逻辑处理。
 func cloneDayStat(d *DayStat) *DayStat {
 	if d == nil {
 		return nil
@@ -8673,7 +8693,6 @@ func buildStatsViewLocked() *statsView {
 	return v
 }
 
-// publishStatsView：相关逻辑处理。
 func publishStatsView() *statsView {
 	statsViewMu.Lock()
 	defer statsViewMu.Unlock()
@@ -8687,7 +8706,6 @@ func publishStatsView() *statsView {
 	return v
 }
 
-// currentStatsView：相关逻辑处理。
 func currentStatsView() *statsView {
 	if v := statsViewPtr.Load(); v != nil && time.Since(v.at) < statsViewEvery {
 		return v
@@ -8695,10 +8713,8 @@ func currentStatsView() *statsView {
 	return publishStatsView()
 }
 
-// invalidateStatsView：相关逻辑处理。
 func invalidateStatsView() { statsViewPtr.Store(nil) }
 
-// blockedTotal：相关逻辑处理。
 func blockedTotal(v *statsView) int64 {
 	if v == nil {
 		return 0
@@ -8706,7 +8722,6 @@ func blockedTotal(v *statsView) int64 {
 	return v.blockedCN + v.blockedWL + v.blockedBan + v.blockedUA
 }
 
-// adminAllowList：相关逻辑处理。
 func adminAllowList(c *Config) []string {
 	if c == nil {
 		return nil
@@ -8721,12 +8736,10 @@ func adminAllowList(c *Config) []string {
 	return out
 }
 
-// adminIPAllowed：相关逻辑处理。
 func adminIPAllowed(ipStr string) bool {
 	return adminAllowContains(currentCfg(), ipStr)
 }
 
-// validateAdminAllow：相关逻辑处理。
 func validateAdminAllow(list []string, currentIP string) error {
 	cleaned := make([]string, 0, len(list))
 	for _, s := range list {
@@ -8753,7 +8766,6 @@ func validateAdminAllow(list []string, currentIP string) error {
 	return nil
 }
 
-// adminAllowContains：相关逻辑处理。
 func adminAllowContains(c *Config, ipStr string) bool {
 	list := adminAllowList(c)
 	if len(list) == 0 {
@@ -8808,7 +8820,6 @@ var ruleChainOrder = []ruleStepSpec{
 	{"forward", "放行转发", "全部通过后反代到上游，并计入流量统计", "pass"},
 }
 
-// registerExtraRoutes：相关逻辑处理。
 func registerExtraRoutes(mux *http.ServeMux) {
 	// 判定链顺序（后台面板渲染用），与 ruleChainOrder 同源
 	mux.HandleFunc("/admin/api/rules/chain", func(w http.ResponseWriter, r *http.Request) {
@@ -9142,7 +9153,6 @@ func registerExtraRoutes(mux *http.ServeMux) {
 	})
 }
 
-// topNMap：相关逻辑处理。
 func topNMap(m map[string]int64, n int) map[string]int64 {
 	if len(m) == 0 {
 		return map[string]int64{}
@@ -10050,7 +10060,18 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .dn.m{font-family:var(--mono);font-size:12px}
 .bar{flex:1;height:8px;background:#f1f5f9;border-radius:99px;overflow:hidden;min-width:50px}
 .bar>i{display:block;height:100%;border-radius:99px;transition:width .4s ease-out}
-.bar.i>i{background:var(--p)}.bar.t>i{background:#10b981}
+.bar.i>i{background:#3b82f6}
+.bar.t>i{background:#10b981}
+.bar.u>i{background:#8b5cf6}
+.bar.h>i{background:#f59e0b}
+.card.accent-ip{border-top:3px solid #3b82f6}
+.card.accent-region{border-top:3px solid #10b981}
+.card.accent-ua{border-top:3px solid #8b5cf6}
+.card.accent-heat{border-top:3px solid #f59e0b}
+.card.accent-ip .ct{color:#2563eb}
+.card.accent-region .ct{color:#059669}
+.card.accent-ua .ct{color:#7c3aed}
+.card.accent-heat .ct{color:#d97706}
 .dv{width:80px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0;white-space:nowrap}
 .dv span{color:var(--t3);font-size:12px;margin-left:4px;font-weight:normal}
 .pager{margin-top:12px;display:flex;justify-content:center;align-items:center;gap:10px;font-size:13px;color:var(--t2);user-select:none}
@@ -10459,12 +10480,12 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 <div style="position:relative;height:240px"><canvas id="hostChart"></canvas></div><div id="hostPager"></div>
 </div>
 <div class="g2" style="margin-top:22px">
-<div class="card"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按请求次数汇总（不再统计流量字节）</div></div></div><div id="ipDist"></div></div>
-<div class="card"><div class="ch"><div><h2 class="ct">地区来源分布</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="regionDist"></div></div>
+<div class="card accent-ip"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按请求次数汇总（不再统计流量字节）</div></div></div><div id="ipDist"></div></div>
+<div class="card accent-region"><div class="ch"><div><h2 class="ct">地区来源分布</h2><div class="cd">按当前时间范围汇总</div></div></div><div id="regionDist"></div></div>
 </div>
 <div class="g2" style="margin-top:22px">
-<div class="card"><div class="ch"><div><h2 class="ct">客户端分布</h2><div class="cd">按 User-Agent 归类 · 点击行查看原始 UA 采样，识别「其他」里的请求</div></div></div><div id="uaDist"></div></div>
-<div class="card"><div class="ch"><div><h2 class="ct">时段热力图</h2><div class="cd" id="hourHeatSub">粒度随时间范围变化：单日按小时 · ≤31 天按天 · 更长按月</div></div></div><div class="hm-wrap" id="hourHeat"></div></div>
+<div class="card accent-ua"><div class="ch"><div><h2 class="ct">客户端分布</h2><div class="cd">按 User-Agent 归类 · 点击行查看原始 UA 采样，识别「其他」里的请求</div></div></div><div id="uaDist"></div></div>
+<div class="card accent-heat"><div class="ch"><div><h2 class="ct">时段热力图</h2><div class="cd" id="hourHeatSub">粒度随时间范围变化：单日按小时 · ≤31 天按天 · 更长按月</div></div></div><div class="hm-wrap" id="hourHeat"></div></div>
 </div>
 </section>
 <section id="realtime" class="pg">
@@ -10476,7 +10497,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </div>
 <div class="card">
 <div class="ch"><div><h2 class="ct">实时请求流</h2><div class="cd" id="rtStatus">进入页面才开始收集，退出即清空</div></div></div>
-<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th><th>地区</th><th>上游主机</th><th>路径</th></tr></thead><tbody id="rtTable"></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th><th>地区</th><th>客户端</th><th>上游主机</th><th>路径</th></tr></thead><tbody id="rtTable"></tbody></table></div>
 </div>
 </section>
 <section id="blocks" class="pg">
@@ -10642,8 +10663,8 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <div class="fi"><label class="fl">日报 Token</label><div class="hint" style="margin-bottom:8px">以 Bearer Authorization 头随请求发送；Telegram 不需要，留空即可</div><input id="dailyTmplToken" class="inp m" type="text" placeholder="可选"></div>
   <div class="fi"><label class="fl">日报 Content-Type</label><div class="hint" style="margin-bottom:8px">请求体类型：Telegram 用 application/json；Bark 用 text/plain；钉钉/企微机器人用 application/json</div><select id="dailyTmplType" class="inp m" style="width:auto"><option value="text/plain">text/plain</option><option value="text/markdown">text/markdown</option><option value="application/json">application/json</option><option value="application/x-www-form-urlencoded">application/x-www-form-urlencoded</option></select></div>
   <div class="fi"><label class="fl">消息模板（自定义格式）</label><div class="hint" style="margin-bottom:8px">占位符：{{date}}、{{node}}、{{note}}、{{requests}}、{{up}}、{{down}}、{{total}}、{{blocked}}、{{blocked_cn}}、{{blocked_wl}}、{{blocked_ban}}、{{blocked_ua}}、{{ips_top}}、{{ip_bytes_top}}、{{hosts_top}}、{{countries_top}}（*_top 挤在一行）；{{ips_top_lines}}、{{ip_bytes_top_lines}}、{{hosts_top_lines}}、{{countries_top_lines}}（每项一行，更适合 IM 展示）。模板为 JSON 时（如 Telegram）值会自动转义，可放心使用多行占位符；配合 "parse_mode":"HTML" 可用 &lt;b&gt;、&lt;code&gt; 标签美化</div>
-    <div class="hint" style="margin-bottom:8px">模板留空时定时任务<span style="color:#b45309;font-weight:600">不会自动执行</span>（手动点「发送昨日统计」仍可用内置默认模板）</div>
-    <textarea id="dailyTmpl" class="inp m" rows="8" style="width:100%;font-family:var(--mono,monospace);font-size:12.5px" placeholder="粘贴自定义模板，留空则定时任务不执行"></textarea></div>
+    <div class="hint" style="margin-bottom:8px">模板留空时定时任务会使用<span style="color:#15803d;font-weight:600">内置默认模板</span>（Telegram HTML 格式）。也可在下方修改后保存</div>
+    <textarea id="dailyTmpl" class="inp m" rows="8" style="width:100%;font-family:var(--mono,monospace);font-size:12.5px" placeholder="留空则使用内置默认模板"></textarea></div>
   <div class="acts" style="display:flex;gap:10px;flex-wrap:wrap">
     <button class="btn b" id="saveTmpl">保存配置</button>
     <button class="btn g" id="dailyReport">发送昨日统计</button>
@@ -10700,14 +10721,14 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
   <div class="card" style="margin-bottom:0;">
     <div class="ch"><div><h2 class="ct">安全与访问控制</h2><div class="cd">代理转发的准入规则；保存后立即生效并预编译匹配</div></div></div>
     <div class="row"><div><div class="rl">仅允许中国大陆 IP</div><div class="rd">非大陆来源将被拒绝</div></div><label class="sw"><input type="checkbox" id="chinaOnly"><span class="tr2"></span></label></div>
-    <div class="fi"><label class="fl">UA 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，大小写不敏感，命中即拒绝（优先于白名单）。留空表示不启用</div><textarea id="blockedUAs" class="tarea" placeholder="留空并保存可关闭；未配置时默认拦截浏览器与爬虫"></textarea></div>
+    <div class="fi"><label class="fl">UA 黑名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，大小写不敏感，命中即拒绝（优先于白名单）。建议只放搜索引擎/社交爬虫或你不想要的客户端。扫描工具交给上方「扫描器 UA 拦截」，两边不重复。留空表示不启用</div><textarea id="blockedUAs" class="tarea" placeholder="如 Googlebot、bingbot；留空并保存可关闭"></textarea></div>
     <div class="fi"><label class="fl">UA 白名单</label><div class="hint" style="margin-bottom:8px">每行一个关键字，留空表示不限制</div><textarea id="allowedUAs" class="tarea" placeholder="Infuse&#10;Emby"></textarea></div>
     <div class="row"><div><div class="rl">禁止 IP 直连 / 访问域名白名单</div><div class="rd">开启后，只有通过下方允许的域名访问代理才被放行；用服务器 IP、localhost 或其它域名访问一律返回 403。管理后台 /admin/、健康检查 /health、测速链接与 favicon 等页面元素不受限制，不会被锁在门外</div></div><label class="sw"><input type="checkbox" id="hostGuardOn"><span class="tr2"></span></label></div>
     <div class="fi"><label class="fl">允许访问的域名</label><div class="hint" style="margin-bottom:8px">每行一个，支持 *.example.com 通配；也可直接粘贴完整网址（会自动忽略 https:// 与路径）。留空表示只禁止 IP / localhost 直连，任意域名均可访问。前面挂了 Nginx / CDN 时，请回传 X-Forwarded-Host 或保留原始 Host，否则后端看到的会是回环 IP。注意：只填根域不会放行子域，用到的子域请逐个添加或改用通配</div><textarea id="allowedHosts" class="tarea" placeholder="emby.example.com&#10;*.example.com"></textarea><div class="hint" id="curHostHint" style="margin-top:8px;color:var(--pd)">当前访问域名：加载中…</div></div>
     <div style="border-top:1px dashed var(--bd);margin:16px 0 12px"></div>
     <div class="ch" style="margin-bottom:6px"><div><h2 class="ct" style="font-size:15px">反爬加固（早筛层）</h2><div class="cd">在判定链之前执行，命中后直接断开连接、不返回任何页面；只作用于代理转发路径，/admin/、/health、/speed/ 与页面图标不受影响</div></div></div>
     <div class="row"><div><div class="rl">蜜罐路径拦截</div><div class="rd">命中 /.env、/wp-login.php、/phpmyadmin、/.git/config 等正常客户端永不访问的路径时立即断连，并把来源 IP 自动写入黑名单（可在上方 IP 黑名单里移除）。真实用户不可能踩到，几乎零误伤</div></div><label class="sw"><input type="checkbox" id="honeypotOn"><span class="tr2"></span></label></div>
-    <div class="row"><div><div class="rl">扫描器 UA 拦截</div><div class="rd">UA 含 sqlmap / nikto / nmap / zgrab / nuclei / curl / python-requests 等工具特征，或 UA 为空时立即断连并自动拉黑。注意：如果你自己用脚本或 curl 调试，请先关掉再调</div></div><label class="sw"><input type="checkbox" id="scanGuardOn"><span class="tr2"></span></label></div>
+    <div class="row"><div><div class="rl">扫描器 UA 拦截</div><div class="rd">专门拦扫描工具：sqlmap / nmap / nuclei 等命中即断连并自动拉黑；curl / python-requests 等只断连不拉黑；空 UA 断连不拉黑。搜索引擎爬虫请用下方 UA 黑名单，两边不重复</div></div><label class="sw"><input type="checkbox" id="scanGuardOn"><span class="tr2"></span></label></div>
     <div class="row"><div><div class="rl">单 IP 全局限速</div><div class="rd">统计所有请求（不只是被拦截的），超出速率或并发上限直接断连，用于压住目录爆破与批量探测。只断连不拉黑，避免误伤同一 NAT 后的多个用户</div></div><label class="sw"><input type="checkbox" id="rateLimitOn"><span class="tr2"></span></label></div>
     <div class="fi" id="rateFields" style="display:none">
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">
@@ -10961,6 +10982,7 @@ function connectRealtime(){
         <td data-label="时间"><span class="cell-v muted mono">${esc(e.time)}</span></td>
         <td data-label="IP"><span class="cell-v mono ip-link" data-ip="${esc(e.ip)}" style="color:var(--pd);text-decoration:underline;cursor:pointer;font-weight:600">${esc(e.ip)}</span></td>
         <td data-label="地区"><span class="cell-v">${esc(countryLabel(e.country||'??'))}</span></td>
+        <td data-label="客户端"><span class="cell-v" title="${esc(e.ua_raw||'')}" style="font-weight:600">${esc(e.ua||'—')}</span></td>
         <td data-label="上游"><span class="cell-v mono">${esc(e.host)}</span></td>
         <td data-label="路径"><span class="cell-v mono" style="font-size:12px;word-break:break-all">${esc(e.path)}</span></td>
       </tr>`).join('');
@@ -10994,6 +11016,11 @@ function toggleRateFields(){
 }
 document.getElementById('rateLimitOn')?.addEventListener('change',toggleRateFields);
 
+const DEFAULT_DAILY_TMPL = `{
+  "chat_id": "{{chat_id}}",
+  "parse_mode": "HTML",
+  "text": "📊 <b>昨日请求统计报告</b>\n\n📅 日期：<code>{{date}}</code>\n🖥 节点：<code>{{node}}</code>\n📝 备注：{{note}}\n\n📈 <b>请求概览</b>\n\n🔢 总请求数：<b><code>{{requests}}</code></b> 次\n\n🛡 <b>安全拦截统计</b>\n\n🚫 总拦截：<b>{{blocked}}</b>\n🇨🇳 国内拦截：{{blocked_cn}}\n🌐 白名单拦截：{{blocked_wl}}\n⛔ 黑名单拦截：{{blocked_ban}}\n🤖 UA 拦截：{{blocked_ua}}\n\n📍 <b>访问排行榜</b>\n\n🌐 <b>IP 访问 TOP</b>\n<pre>{{ips_top_lines}}</pre>\n\n🔗 <b>域名访问 TOP</b>\n<pre>{{hosts_top_lines}}</pre>\n\n🌍 <b>国家 / 地区 TOP</b>\n<pre>{{countries_top_lines}}</pre>\n\n🏙 <b>省份 TOP</b>\n<pre>{{provinces_top}}</pre>\n\n🤖 <i>自动统计 · 每日运行</i>"
+}`;
 async function loadConfig(){
   try{
     const r=await fetch('/admin/api/config',{cache:'no-store'});
@@ -11035,7 +11062,7 @@ async function loadConfig(){
     const rt=document.getElementById('reportToken');if(rt)rt.value=c.report_token||'';
     const rn=document.getElementById('reportNote');if(rn)rn.value=c.report_note||'';
     const dtOn=document.getElementById('dailyTmplOn');if(dtOn)dtOn.checked=!!c.daily_tmpl_on;
-    const dt=document.getElementById('dailyTmpl');if(dt)dt.value=c.daily_tmpl||'';
+    const dt=document.getElementById('dailyTmpl');if(dt)dt.value=c.daily_tmpl||DEFAULT_DAILY_TMPL;
     const dtUrl=document.getElementById('dailyTmplUrl');if(dtUrl)dtUrl.value=c.daily_tmpl_url||'';
     const dtCid=document.getElementById('dailyChatId');if(dtCid)dtCid.value=c.daily_chat_id||'';
     const dtTok=document.getElementById('dailyTmplToken');if(dtTok)dtTok.value=c.daily_tmpl_token||'';
@@ -11637,7 +11664,7 @@ function renderUADist(map,rawMap){
     </div>`:'<div class="ua-raw"><div class="ua-raw-h">暂无原始 UA 采样（仅 v3.1.2 起的新数据）</div></div>';
   const pager=totalPages>1?`<div class="pager"><button type="button" data-act="prev" ${uaPage<=1?'disabled':''}>上一页</button><span class="pg-info">${uaPage} / ${totalPages}</span><button type="button" data-act="next" ${uaPage>=totalPages?'disabled':''}>下一页</button></div>`:'';
   box.innerHTML=rows.map(([name,n])=>
-    `<div class="dr ua-row" data-cls="${esc(name)}" style="cursor:pointer" title="点击查看原始 UA 采样"><span class="dn"><span class="tx">${esc(name)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`
+    `<div class="dr ua-row" data-cls="${esc(name)}" style="cursor:pointer" title="点击查看原始 UA 采样"><span class="dn"><span class="tx">${esc(name)}</span></span><div class="bar u"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`
   ).join('')+pager+'<div class="ua-raw-box" style="display:none">'+rawHtml+'</div>';
   const rawBox=box.querySelector('.ua-raw-box');
   box.querySelectorAll('.ua-row').forEach(el=>el.addEventListener('click',()=>{
@@ -11657,7 +11684,7 @@ function renderUADist(map,rawMap){
 
 function hmCell(v,max,title){
   const a=v?0.10+0.85*Math.pow(v/max,0.65):0;
-  const bg=v?`background:rgba(59,130,246,${a.toFixed(3)})`:'';
+  const bg=v?`background:rgba(245,158,11,${a.toFixed(3)})`:'';
   return `<div class="hm-cell" style="${bg}" title="${esc(title)}"></div>`;
 }
 let hourHeatDays=[];
@@ -11718,7 +11745,7 @@ function renderHourHeat(days){
   const narrow=chunk>0&&headCells.length>chunk;
   box.innerHTML=hmGrid(headCells,cells,rowLabel,chunk)
     +`<div class="hm-legend"${narrow?' style="margin-top:6px"':''}><span>少</span>`
-    +'<i style="background:rgba(59,130,246,.12)"></i><i style="background:rgba(59,130,246,.35)"></i><i style="background:rgba(59,130,246,.6)"></i><i style="background:rgba(59,130,246,.9)"></i>'
+    +'<i style="background:rgba(245,158,11,.15)"></i><i style="background:rgba(245,158,11,.35)"></i><i style="background:rgba(245,158,11,.6)"></i><i style="background:rgba(245,158,11,.9)"></i>'
     +`<span>多（峰值 ${max.toLocaleString()} ${unit}）</span></div>`;
 }
 let hourHeatRz=null;
