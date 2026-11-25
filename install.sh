@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.4.0"
+APP_VERSION="4.4.1"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -275,7 +275,7 @@ write_go_source() {
   cat > "$dir/main.go" <<'GO_SOURCE'
 package main
 
-// emby-proxy v4.4.0
+// emby-proxy v4.4.1
 //
 // 路径反代：把 /https://upstream/... 形式的请求转发到上游 Emby/Jellyfin。
 //
@@ -1658,15 +1658,24 @@ func parsePrefixRoute(line string) (prefixRoute, bool) {
 	return prefixRoute{prefix: prefix, target: u}, true
 }
 
-// upstreamAddr 返回实际上游地址（host 或 host:port），用于统计展示。
+// upstreamAddr 返回实际上游域名（不含端口），用于统计与实时流。
+// 同一域名的 :80 / :443 / 无端口记在一起。
 func upstreamAddr(u *url.URL) string {
 	if u == nil {
 		return ""
 	}
-	if u.Port() != "" {
-		return u.Host
-	}
 	return u.Hostname()
+}
+
+// hostOnly 去掉 host:port 里的端口，只留域名。已无端口的原样返回。
+func hostOnly(host string) string {
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil && h != "" {
+		return h
+	}
+	return host
 }
 
 // matchPrefixRoute 用最长前缀匹配请求路径，命中则拼出上游 URL（保留查询串由调用方处理）。
@@ -2380,18 +2389,21 @@ var (
 )
 
 // iptablesCmd 执行一条 iptables/ip6tables 命令，3 秒超时。
+// stderr 丢弃：规则不存在时的 "Bad rule" 是预期结果，不该刷进日志。
 func iptablesCmd(bin string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stderr = io.Discard
 	return cmd.Run()
 }
 
-// iptablesOut 执行 iptables 并返回标准输出。
+// iptablesOut 执行 iptables 并返回标准输出。stderr 同样丢弃。
 func iptablesOut(bin string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stderr = io.Discard
 	b, err := cmd.Output()
 	return string(b), err
 }
@@ -2447,7 +2459,7 @@ func deleteListedRules(bin string, lines []string, extra ...string) int {
 // removeAllPortJumps 循环清掉所有指向计数链的跳转和本服务的 connmark，直到没有残留。
 // 旧版本删规则时链名写重了，重启会叠规则；这里多轮删除，安装/更新/启动都会先清干净。
 func removeAllPortJumps(bin string) {
-	for pass := 0; pass < 12; pass++ {
+	for pass := 0; pass < 6; pass++ {
 		removed := 0
 		for _, dir := range []string{"INPUT", "OUTPUT"} {
 			out, err := iptablesOut(bin, "-S", dir)
@@ -4592,7 +4604,7 @@ func startStatsWorker() {
 				}
 				d.Hours[hour]++
 				if ev.Host != "" {
-					d.Hosts[ev.Host]++
+					d.Hosts[hostOnly(ev.Host)]++
 				}
 				if ev.UAClass != "" {
 					d.UAClass[ev.UAClass]++
@@ -6824,7 +6836,7 @@ func pwaManifestJSON() []byte {
 	m := map[string]any{
 		"name":             "Emby Proxy 管理后台",
 		"short_name":       "Emby Proxy",
-		"description":      "Emby 路径反代 v4.4.0 管理控制台",
+		"description":      "Emby 路径反代 v4.4.1 管理控制台",
 		"start_url":        "/admin/splash",
 		"scope":            "/admin/",
 		"display":          "standalone",
@@ -7023,7 +7035,7 @@ func diskUsage(path string) (diskSpace, error) {
 	}, nil
 }
 
-const appVersionStr = "4.4.0"
+const appVersionStr = "4.4.1"
 
 func activeSessionCount() int {
 	now := time.Now()
@@ -10054,12 +10066,17 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .filter{border:0;background:transparent;color:var(--t2);padding:8px 16px;border-radius:8px;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;transition:all .2s ease}
 .filter:hover{color:var(--t)}
 .filter.on{background:#ffffff;color:var(--pd);font-weight:600;box-shadow:0 2px 4px rgba(0,0,0,.05),0 1px 2px rgba(0,0,0,.05)}
-.dr{display:flex;align-items:center;gap:12px;padding:10px 0;flex-wrap:nowrap}
-.dn{width:110px;flex-shrink:0;display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden}
+.dr{display:flex;align-items:center;gap:12px;padding:8px 10px;margin:0 -10px;border-radius:10px;flex-wrap:nowrap;transition:background .15s}
+.dr:hover{background:#f8fafc}
+.dn{width:128px;flex-shrink:0;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden}
 .dn .tx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dn.m{font-family:var(--mono);font-size:12px}
-.bar{flex:1;height:8px;background:#f1f5f9;border-radius:99px;overflow:hidden;min-width:50px}
-.bar>i{display:block;height:100%;border-radius:99px;transition:width .4s ease-out}
+.dn.m{font-family:var(--mono);font-size:12.5px}
+.rk{width:18px;height:18px;border-radius:6px;background:#f1f5f9;color:var(--t3);font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.rk.t1{background:#fef3c7;color:#b45309}
+.rk.t2{background:#e2e8f0;color:#475569}
+.rk.t3{background:#ffedd5;color:#c2410c}
+.bar{flex:1;height:9px;background:#f1f5f9;border-radius:99px;overflow:hidden;min-width:50px}
+.bar>i{display:block;height:100%;border-radius:99px;transition:width .45s cubic-bezier(.2,.8,.2,1)}
 .bar.i>i{background:#3b82f6}
 .bar.t>i{background:#10b981}
 .bar.u>i{background:#8b5cf6}
@@ -10079,14 +10096,26 @@ body{background:var(--bg);color:var(--t);font:14px/1.5 -apple-system,"Segoe UI",
 .pager button:hover:not(:disabled){background:var(--p);color:#fff;border-color:var(--p)}
 .pager button:disabled{opacity:.45;cursor:not-allowed}
 .pager .pg-info{min-width:60px;text-align:center;font-variant-numeric:tabular-nums}
+.date-box{display:none;align-items:center;gap:8px;flex-wrap:wrap}
+.date-box.on{display:flex}
+.date-box input[type=date]{width:auto;padding:8px 10px;font-size:13px}
+.date-box .to{color:var(--t3);font-size:13px}
+.stc.rx::before{background:#f59e0b}
+.stc.tx::before{background:#8b5cf6}
+.stc.rx .sl{color:#d97706}
+.stc.tx .sl{color:#7c3aed}
+.emp span{display:block;margin-top:4px;font-size:12.5px;color:var(--t3)}
+.row{padding:18px 0}
 
 .dbt{width:74px;flex-shrink:0;text-align:right;font-size:11.5px;color:var(--t3);font-weight:normal;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--bd);-webkit-overflow-scrolling:touch}
+.table-wrap{overflow-x:auto;border-radius:12px;border:1px solid var(--bd);-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;text-align:left;min-width:600px}
-th{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:12.5px;font-weight:600;color:var(--t2);background:#f8fafc;white-space:nowrap}
+th{padding:12px 16px;border-bottom:1px solid var(--bd);font-size:12px;font-weight:650;color:var(--t3);background:#f8fafc;white-space:nowrap;letter-spacing:.02em;text-transform:none}
 td{padding:14px 16px;border-bottom:1px solid var(--bd);font-size:13.5px;color:var(--t2)}
 tbody tr:last-child td{border-bottom:0}
 tbody tr:hover td{background:#f8fafc}
+tbody tr:nth-child(even) td{background:#fcfdfe}
+tbody tr:hover td{background:#f1f5f9}
 .cell-v{display:inline}
 td[data-label="访问路径"] .cell-v{display:inline-block;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 .mo{position:fixed;inset:0;z-index:1000;display:none;background:rgba(15,23,42,.5);padding:20px;overflow-y:auto;backdrop-filter:blur(4px)}
@@ -10282,6 +10311,10 @@ html[data-theme="dark"] .mbox{background:var(--card)}
 html[data-theme="dark"] .mh,html[data-theme="dark"] .kv,html[data-theme="dark"] .kvr{border-color:var(--bd)}
 html[data-theme="dark"] .mcl,html[data-theme="dark"] .mmb{background:#17243a;color:var(--t2)}
 html[data-theme="dark"] .bar{background:#1b2a42}
+html[data-theme="dark"] .dr:hover{background:#152033}
+html[data-theme="dark"] .rk{background:#1b2a42;color:#94a3b8}
+html[data-theme="dark"] tbody tr:nth-child(even) td{background:#0e1726}
+html[data-theme="dark"] tbody tr:hover td{background:#152033}
 html[data-theme="dark"] .nav-i:hover{background:#17243a;color:var(--t)}
 html[data-theme="dark"] .nav-i.on{background:var(--ps);color:#9ec5ff}
 html[data-theme="dark"] tr{border-color:var(--bd)}
@@ -10399,10 +10432,10 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <button class="filter" data-r="all">全部</button>
     <button class="filter" data-r="custom">自定义</button>
   </div>
-  <div id="ovCustomBox" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
-    <input type="date" id="ovFrom" class="inp m" style="width:auto;padding:8px 10px;font-size:13px">
-    <span style="color:var(--t3)">至</span>
-    <input type="date" id="ovTo" class="inp m" style="width:auto;padding:8px 10px;font-size:13px">
+  <div id="ovCustomBox" class="date-box">
+    <input type="date" id="ovFrom" class="inp m">
+    <span class="to">至</span>
+    <input type="date" id="ovTo" class="inp m">
     <button class="btn b s" id="ovApplyCustom" type="button">应用</button>
   </div>
 </div>
@@ -10447,10 +10480,10 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
     <button class="filter" data-r="all">全部</button>
     <button class="filter" data-r="custom">自定义</button>
   </div>
-  <div id="tfCustomBox" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
-    <input type="date" id="tfFrom" class="inp m" style="width:auto;padding:8px 10px;font-size:13px">
-    <span style="color:var(--t3)">至</span>
-    <input type="date" id="tfTo" class="inp m" style="width:auto;padding:8px 10px;font-size:13px">
+  <div id="tfCustomBox" class="date-box">
+    <input type="date" id="tfFrom" class="inp m">
+    <span class="to">至</span>
+    <input type="date" id="tfTo" class="inp m">
     <button class="btn b s" id="tfApplyCustom" type="button">应用</button>
   </div>
 </div>
@@ -10477,7 +10510,7 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 </div>
 <div class="card" style="margin-top:0">
 <div class="ch"><div><h2 class="ct" id="tfHostTitle">上游主机趋势</h2><div class="cd" id="tfHostDesc">筛选区间内访问最多的上游</div></div></div>
-<div style="position:relative;height:240px"><canvas id="hostChart"></canvas></div><div id="hostPager"></div>
+<div style="position:relative;height:320px"><canvas id="hostChart"></canvas></div><div id="hostPager"></div>
 </div>
 <div class="g2" style="margin-top:22px">
 <div class="card accent-ip"><div class="ch"><div><h2 class="ct">请求 IP 排行</h2><div class="cd">按请求次数汇总（不再统计流量字节）</div></div></div><div id="ipDist"></div></div>
@@ -10492,8 +10525,8 @@ html[data-theme="dark"] .bk-ic-c{color:#fbbf24}
 <div class="sg" style="margin-bottom:18px">
   <div class="stc b"><div class="sl">当前并发</div><div class="sv" id="rtConc">-</div><div class="ss">正在处理的请求</div></div>
   <div class="stc g"><div class="sl">每秒请求</div><div class="sv" id="rtRps">-</div><div class="ss">最近 1 秒</div></div>
-  <div class="stc" style="box-shadow: inset 4px 0 0 #f59e0b"><div class="sl" style="color:#f59e0b">↓ 下行</div><div class="sv" id="rtRx">-</div><div class="ss">从上游接收的速率</div></div>
-  <div class="stc" style="box-shadow: inset 4px 0 0 #8b5cf6"><div class="sl" style="color:#8b5cf6">↑ 上行</div><div class="sv" id="rtTx">-</div><div class="ss">发送给用户的速率</div></div>
+  <div class="stc rx"><div class="sl">↓ 下行</div><div class="sv" id="rtRx">-</div><div class="ss">从上游接收的速率</div></div>
+  <div class="stc tx"><div class="sl">↑ 上行</div><div class="sv" id="rtTx">-</div><div class="ss">发送给用户的速率</div></div>
 </div>
 <div class="card">
 <div class="ch"><div><h2 class="ct">实时请求流</h2><div class="cd" id="rtStatus">进入页面才开始收集，退出即清空</div></div></div>
@@ -11359,7 +11392,7 @@ function buildTrafficView(trend){
     Object.entries(d.ips||{}).forEach(([k,v])=>{ipMap[k]=(ipMap[k]||0)+v});
     Object.entries(d.countries||{}).forEach(([k,v])=>{ctryMap[k]=(ctryMap[k]||0)+v});
     Object.entries(d.provinces||{}).forEach(([k,v])=>{provMap[k]=(provMap[k]||0)+v});
-    Object.entries(d.hosts||{}).forEach(([k,v])=>{hostMap[k]=(hostMap[k]||0)+v});
+    Object.entries(d.hosts||{}).forEach(([k,v])=>{const h=String(k).replace(/:\d+$/,''); hostMap[h]=(hostMap[h]||0)+v});
     Object.entries(d.ua_class||{}).forEach(([k,v])=>{uaMap[k]=(uaMap[k]||0)+v});
     Object.entries(d.ua_raw||{}).forEach(([k,v])=>{uaRawMap[k]=(uaRawMap[k]||0)+v});
   });
@@ -11542,10 +11575,10 @@ function renderHostChart(hostTop){
   if(hostPage<1) hostPage=1;
   const start=(hostPage-1)*HOST_PAGE_SIZE;
   const pageData=hostTop.slice(start,start+HOST_PAGE_SIZE);
-  const labels=pageData.map(([h])=>h.length>22?h.slice(0,20)+'…':h);
+  const labels=pageData.map(([h])=>h);
   const data=pageData.map(([,n])=>n);
   if(!labels.length){labels.push('暂无数据');data.push(0)}
-  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.75)',hoverBackgroundColor:'#8b5cf6',borderRadius:4,maxBarThickness:22}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{borderDash:[4,4]},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:true,maxTicksLimit:10,font:{size:11}}}}}};
+  const cfg={type:'bar',data:{labels,datasets:[{label:'请求',data,backgroundColor:'rgba(139,92,246,0.72)',hoverBackgroundColor:'#7c3aed',borderRadius:6,borderSkipped:false,maxBarThickness:18}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,layout:{padding:{left:4,right:8}},plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>pageData[items[0].dataIndex]?.[0]||'',label:c=>'请求：'+Number(c.parsed.x||0).toLocaleString()}}},scales:{x:{beginAtZero:true,grid:{color:'rgba(148,163,184,.25)',borderDash:[3,3]},ticks:{precision:0,font:{size:11}}},y:{grid:{display:false},ticks:{autoSkip:false,font:{size:12,family:'Consolas,monospace'},color:'#334155'}}}}};
   hostChart=upsertChart(hostChart,cv,cfg);
   if(pager){
     if(totalPages<=1){pager.innerHTML='';return}
@@ -11571,8 +11604,9 @@ function renderIP(map,bytesMap,totalUnique,topN){
   const start=(ipPage-1)*IP_PAGE_SIZE;
   const rows=all.slice(start,start+IP_PAGE_SIZE);
   const max=all[0][1]||1;
-  let html=rows.map(([ip,n])=>{
-    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`;
+  let html=rows.map(([ip,n],i)=>{
+    const rank=start+i+1;
+    return `<div class="dr ip-row" data-ip="${esc(ip)}" style="cursor:pointer" title="点击查看详情"><span class="rk ${rank<=3?'t'+rank:''}">${rank}</span><span class="dn m"><span class="tx" style="color:var(--pd)">${esc(ip)}</span></span><div class="bar i"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>次</span></span></div>`;
   }).join('');
   const moreNote=(totalUnique||all.length)>all.length?`<div style="margin-top:6px;font-size:12px;color:var(--t3);text-align:center">当前展示 Top ${all.length} · 共 ${Number(totalUnique).toLocaleString()} 个 IP</div>`:'';
   const pager=totalPages>1?`<div class="pager"><button type="button" data-act="prev" ${ipPage<=1?'disabled':''}>上一页</button><span class="pg-info">${ipPage} / ${totalPages}</span><button type="button" data-act="next" ${ipPage>=totalPages?'disabled':''}>下一页</button></div>`:'';
@@ -11600,12 +11634,13 @@ function renderRegion(map,totalUnique,topN,provMap){
   const rows=all.slice(start,start+PAGE);
   const total=all.reduce((s,r)=>s+r[1],0)||1,max=all[0][1]||1;
   const hasProv=provMap&&Object.keys(provMap).length>0;
-  let html=rows.map(([code,n])=>{
+  let html=rows.map(([code,n],i)=>{
     const nm=countryLabel(code);
+    const rank=start+i+1;
     const isCN=code==='CN'&&hasProv;
     const clickable=isCN?' style="cursor:pointer" title="点击展开/收起省份统计" data-cn="1"':'';
     const arrow=isCN?' <span class="cn-arrow" style="font-size:11px;color:var(--t3);margin-left:4px">▸</span>':'';
-    return `<div class="dr"${clickable}><span class="dn" title="${nm}"><img class="flg" src="/admin/api/flag/${code.toLowerCase()}" onerror="this.style.display='none'"> <span class="tx">${nm}</span>${arrow}</span><div class="bar t"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
+    return `<div class="dr"${clickable}><span class="rk ${rank<=3?'t'+rank:''}">${rank}</span><span class="dn" title="${nm}"><img class="flg" src="/admin/api/flag/${code.toLowerCase()}" onerror="this.style.display='none'"> <span class="tx">${nm}</span>${arrow}</span><div class="bar t"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
   }).join('');
   if(hasProv){
     const pRows=Object.entries(provMap).sort((a,b)=>b[1]-a[1]);
@@ -11663,9 +11698,10 @@ function renderUADist(map,rawMap){
       ${raws.map(([u,n])=>`<div class="ua-raw-i"><span class="ua-raw-n">${n.toLocaleString()}</span><span class="ua-raw-u" title="${esc(u)}">${esc(u)}</span></div>`).join('')}
     </div>`:'<div class="ua-raw"><div class="ua-raw-h">暂无原始 UA 采样（仅 v3.1.2 起的新数据）</div></div>';
   const pager=totalPages>1?`<div class="pager"><button type="button" data-act="prev" ${uaPage<=1?'disabled':''}>上一页</button><span class="pg-info">${uaPage} / ${totalPages}</span><button type="button" data-act="next" ${uaPage>=totalPages?'disabled':''}>下一页</button></div>`:'';
-  box.innerHTML=rows.map(([name,n])=>
-    `<div class="dr ua-row" data-cls="${esc(name)}" style="cursor:pointer" title="点击查看原始 UA 采样"><span class="dn"><span class="tx">${esc(name)}</span></span><div class="bar u"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`
-  ).join('')+pager+'<div class="ua-raw-box" style="display:none">'+rawHtml+'</div>';
+  box.innerHTML=rows.map(([name,n],i)=>{
+    const rank=(uaPage-1)*10+i+1;
+    return `<div class="dr ua-row" data-cls="${esc(name)}" style="cursor:pointer" title="点击查看原始 UA 采样"><span class="rk ${rank<=3?'t'+rank:''}">${rank}</span><span class="dn"><span class="tx">${esc(name)}</span></span><div class="bar u"><i style="width:${(n/max*100).toFixed(1)}%"></i></div><span class="dv">${n.toLocaleString()}<span>${(n/total*100).toFixed(0)}%</span></span></div>`;
+  }).join('')+pager+'<div class="ua-raw-box" style="display:none">'+rawHtml+'</div>';
   const rawBox=box.querySelector('.ua-raw-box');
   box.querySelectorAll('.ua-row').forEach(el=>el.addEventListener('click',()=>{
     if(!rawBox)return;
@@ -12766,15 +12802,16 @@ print_access_info() {
 setup_journal_limit() {
   local conf_dir="/etc/systemd/journald.conf.d"
   local conf_file="${conf_dir}/size.conf"
-  if [[ ! -f "$conf_file" ]]; then
-    mkdir -p "$conf_dir"
-    cat > "$conf_file" <<'EOF'
+  mkdir -p "$conf_dir"
+  cat > "$conf_file" <<'EOF'
 [Journal]
-SystemMaxUse=200M
+SystemMaxUse=100M
+SystemMaxFileSize=20M
+MaxRetentionSec=7day
+MaxFileSec=1day
 EOF
-    systemctl restart systemd-journald >/dev/null 2>&1 || true
-    info "已配置系统日志限制 (SystemMaxUse=200M)"
-  fi
+  systemctl restart systemd-journald >/dev/null 2>&1 || true
+  info "已配置系统日志：最多 100MB，保留 7 天"
 }
 
 
