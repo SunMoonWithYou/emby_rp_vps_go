@@ -12826,14 +12826,14 @@ clean_acct_rules() {
         [[ "$line" == -A\ * ]] || continue
         if [[ "$line" == *-j\ EMBY_PROXY_IN || "$line" == *-j\ EMBY_PROXY_OUT ]]; then
           # shellcheck disable=SC2086
-          if "$bin" -D ${line#-A }; then changed=1; fi
+          if "$bin" -D ${line#-A } >/dev/null 2>&1; then changed=1; fi
         fi
       done < <("$bin" -S INPUT 2>/dev/null; "$bin" -S OUTPUT 2>/dev/null)
       while IFS= read -r line; do
         [[ "$line" == -A\ * ]] || continue
         if [[ "$line" == *CONNMARK* && "$line" == *0x1001* ]]; then
           # shellcheck disable=SC2086
-          if "$bin" -t mangle -D ${line#-A }; then changed=1; fi
+          if "$bin" -t mangle -D ${line#-A } >/dev/null 2>&1; then changed=1; fi
         fi
       done < <("$bin" -t mangle -S INPUT 2>/dev/null; "$bin" -t mangle -S OUTPUT 2>/dev/null)
       [[ "$changed" == 0 ]] && break
