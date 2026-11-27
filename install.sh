@@ -6,7 +6,7 @@
 #       sudo bash install.sh update   # 仅更新二进制
 set -euo pipefail
 
-APP_VERSION="4.4.1"
+APP_VERSION="4.4.2"
 
 # ---------- 安装路径与服务 ----------
 SERVICE_NAME="emby-proxy"                              # systemd 服务名
@@ -847,6 +847,19 @@ func parseTarget(r *http.Request) (*url.URL, error) {
 // isUnsafeResolvedIP 拒绝不可路由或高风险的特殊地址；RFC1918/ULA 私网地址允许，
 // 以兼容内网 Emby。显式 IP 目标可使用 loopback（例如同机 Emby），域名解析到
 // loopback 则拒绝，避免普通域名通过 DNS Rebinding 指向本机服务。
+// 启动时解析一次，避免每个上游 IP 都 ParseCIDR。
+var unsafeV4Nets = func() []*net.IPNet {
+	cidrs := []string{"100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "240.0.0.0/4"}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
 func isUnsafeResolvedIP(ip net.IP, allowLoopback bool) bool {
 	if ip == nil {
 		return true
@@ -864,10 +877,8 @@ func isUnsafeResolvedIP(ip net.IP, allowLoopback bool) bool {
 		return true
 	}
 	if v4 := ip.To4(); v4 != nil {
-		// 共享地址空间、协议分配网段、基准测试网段及保留地址不作为域名上游。
-		for _, cidr := range []string{"100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "240.0.0.0/4"} {
-			_, network, err := net.ParseCIDR(cidr)
-			if err == nil && network.Contains(v4) {
+		for _, n := range unsafeV4Nets {
+			if n.Contains(v4) {
 				return true
 			}
 		}
@@ -1152,6 +1163,8 @@ type compiledACL struct {
 	uaBlockKeywords []string         // 原始黑名单关键字（展示用）
 	whitelist       []whitelistEntry // 预编译的上游白名单，避免每请求重复解析规则字符串
 	prefixRoutes    []prefixRoute    // 前缀路由，按前缀长度降序（最长优先）
+	hostExact       map[string]struct{} // 访问域名守卫：精确匹配（已规范化）
+	hostWild        []string            // 访问域名守卫：通配后缀（不含 *.）
 }
 
 var aclPtr atomic.Pointer[compiledACL]
@@ -1206,6 +1219,26 @@ func rebuildACL(c *Config) {
 	sort.Slice(a.prefixRoutes, func(i, j int) bool {
 		return len(a.prefixRoutes[i].prefix) > len(a.prefixRoutes[j].prefix)
 	})
+	// 访问域名白名单预编译，避免每请求重复 ToLower / 规范化
+	a.hostExact = map[string]struct{}{}
+	for _, w := range c.AllowedHosts {
+		w = strings.ToLower(strings.TrimSpace(w))
+		if i := strings.IndexAny(w, "#;"); i >= 0 {
+			w = strings.TrimSpace(w[:i])
+		}
+		w = normalizeWhitelistEntry(w)
+		if w == "" {
+			continue
+		}
+		if strings.HasPrefix(w, "*.") {
+			suf := strings.TrimPrefix(w, "*.")
+			if suf != "" {
+				a.hostWild = append(a.hostWild, suf)
+			}
+			continue
+		}
+		a.hostExact[w] = struct{}{}
+	}
 	aclPtr.Store(a)
 }
 
@@ -1290,6 +1323,7 @@ func (a *compiledACL) matchWhitelist(targetHost, targetPath string) bool {
 // 客户端归类：优先识别已知播放器，否则回退到白名单关键字。
 // 相同 UA 短缓存，避免每个请求都跑正则。
 var uaClassCache sync.Map // ua -> string
+var uaClassCacheSize atomic.Int32
 
 func uaClassOfEx(ua string) string {
 	if ua == "" {
@@ -1304,11 +1338,10 @@ func uaClassOfEx(ua string) string {
 			cls = k
 		}
 	}
-	// 简单限制缓存规模
-	n := 0
-	uaClassCache.Range(func(_, _ any) bool { n++; return n < 512 })
-	if n < 512 {
+	// 原子计数限制规模，避免每次 miss 都 Range 整张表
+	if uaClassCacheSize.Load() < 1024 {
 		uaClassCache.Store(ua, cls)
+		uaClassCacheSize.Add(1)
 	}
 	return cls
 }
@@ -1342,8 +1375,28 @@ func uaBlockedACL(a *compiledACL, ua string) bool {
 	if a == nil || len(a.uaBlockNeedles) == 0 {
 		return false
 	}
-	low := strings.ToLower(ua)
+	return uaBlockedACLLow(a, strings.ToLower(ua))
+}
+
+// uaBlockedACLLow 使用已转小写的 UA，避免同一请求重复 ToLower。
+func uaBlockedACLLow(a *compiledACL, low string) bool {
+	if a == nil || len(a.uaBlockNeedles) == 0 {
+		return false
+	}
 	for _, n := range a.uaBlockNeedles {
+		if strings.Contains(low, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// uaAllowedACLLow 使用已转小写的 UA。
+func uaAllowedACLLow(a *compiledACL, low string) bool {
+	if a == nil || len(a.uaNeedles) == 0 {
+		return true
+	}
+	for _, n := range a.uaNeedles {
 		if strings.Contains(low, n) {
 			return true
 		}
@@ -1831,13 +1884,29 @@ func hostAllowed(list []string, host string) bool {
 // accessHostAllowed 访问域名守卫。
 // HostGuardOn 关闭时直接放行。
 // 开启后：禁止用 IP / localhost 直连；AllowedHosts 非空时还必须命中白名单。
+func (a *compiledACL) hostAllowed(host string) bool {
+	if a == nil {
+		return false
+	}
+	if _, ok := a.hostExact[host]; ok {
+		return true
+	}
+	for _, suf := range a.hostWild {
+		if host == suf || strings.HasSuffix(host, "."+suf) {
+			return true
+		}
+	}
+	return false
+}
+
 func accessHostAllowed(c *Config, r *http.Request) (bool, string) {
 	if c == nil || !c.HostGuardOn {
 		return true, ""
 	}
 	h := requestAccessHost(r)
-	if len(c.AllowedHosts) > 0 {
-		if hostAllowed(c.AllowedHosts, h) {
+	acl := currentACL()
+	if len(acl.hostExact) > 0 || len(acl.hostWild) > 0 {
+		if acl.hostAllowed(h) {
 			return true, ""
 		}
 		if isBareHost(h) {
@@ -2095,7 +2164,7 @@ const ipLiveIdleExpire = 10 * time.Minute // 无流量超过此时长则从 map 
 
 // 累加某个 IP 的实时上下行字节（供后台瞬时速率）。
 func addIPLive(ip string, up, down int64) {
-	if ip == "" || (up == 0 && down == 0) {
+	if ip == "" || (up == 0 && down == 0) || liveClients.Load() == 0 {
 		return
 	}
 	v, _ := ipLiveRates.LoadOrStore(ip, &ipLiveRate{})
@@ -5167,6 +5236,7 @@ func normalizeProvince(s string) string {
 
 // countryOf：相关逻辑处理。带短缓存，同一 IP 不重复查库。
 var countryCache sync.Map // ip -> country code
+var countryCacheSize atomic.Int32
 
 func countryOf(ipStr string) string {
 	ipStr = strings.TrimSpace(ipStr)
@@ -5184,10 +5254,9 @@ func countryOf(ipStr string) string {
 	if len(cc) == 0 || cc == "ZZ" {
 		cc = "??"
 	}
-	n := 0
-	countryCache.Range(func(_, _ any) bool { n++; return n < 2048 })
-	if n < 2048 {
+	if countryCacheSize.Load() < 4096 {
 		countryCache.Store(ipStr, cc)
+		countryCacheSize.Add(1)
 	}
 	return cc
 }
@@ -6681,26 +6750,28 @@ func (s *switchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.RoundTrip(r)
 }
 
-// bufferPool：固定 64KB 缓冲区复用，降低视频转发时的 GC 压力。
+// bufferPool：固定 128KB 缓冲区复用，降低视频转发时的 GC 压力。
 type bufferPool struct{ pool sync.Pool }
+
+const proxyBufSize = 128 * 1024
 
 func (b *bufferPool) Get() []byte {
 	if v := b.pool.Get(); v != nil {
 		return v.([]byte)
 	}
-	return make([]byte, 128*1024)
+	return make([]byte, proxyBufSize)
 }
 
 func (b *bufferPool) Put(p []byte) {
-	if cap(p) >= 128*1024 {
+	if cap(p) >= proxyBufSize {
 		// 归还时裁到固定长度，避免池里出现过大的切片
-		b.pool.Put(p[:128*1024])
+		b.pool.Put(p[:proxyBufSize])
 	}
 }
 
 var proxyBufPool = &bufferPool{
 	pool: sync.Pool{
-		New: func() any { return make([]byte, 128*1024) },
+		New: func() any { return make([]byte, proxyBufSize) },
 	},
 }
 
@@ -6754,11 +6825,10 @@ func buildProxy(tr *switchTransport) *httputil.ReverseProxy {
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 			pr.Out.Host = t.Host
 			outIP := getClientIP(pr.In)
-			pr.Out.Header.Del("X-Forwarded-For")
-			pr.Out.Header.Del("X-Real-IP")
-			pr.Out.Header.Del("Forwarded")
+			// Set 会覆盖同名头，无需先 Del
 			pr.Out.Header.Set("X-Forwarded-For", outIP)
 			pr.Out.Header.Set("X-Real-IP", outIP)
+			pr.Out.Header.Del("Forwarded")
 			if pr.In.TLS == nil {
 				pr.Out.Header.Set("X-Forwarded-Proto", "http")
 			} else {
@@ -8189,31 +8259,34 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 				errPageCtx{Code: "ban", Label: "IP 在黑名单中"})
 			return
 		}
-		// 判定链 ③ UA 黑名单（优先于白名单）
-		if uaBlockedACL(acl, r.UserAgent()) {
-			if blockedRateLimited(ip) {
-				dropOrMinimal429(w)
+		// 判定链 ③④ UA：黑/白名单都为空时整段跳过；否则只 ToLower 一次
+		uaRaw := r.UserAgent()
+		if len(acl.uaBlockNeedles) > 0 || len(acl.uaNeedles) > 0 {
+			uaLow := strings.ToLower(uaRaw)
+			if len(acl.uaBlockNeedles) > 0 && uaBlockedACLLow(acl, uaLow) {
+				if blockedRateLimited(ip) {
+					dropOrMinimal429(w)
+					return
+				}
+				reqB, respB := estimateBlockedBytes(r)
+				recordBlocked(ip, country, r.URL.RequestURI(), "ua_block", uaRaw, r.Host, reqB, respB)
+				serveError(w, r, http.StatusForbidden, "客户端已被禁止",
+					"当前客户端的 User-Agent 命中了 UA 黑名单，请求被拒绝。",
+					errPageCtx{Code: "ua_block", Label: "User-Agent 在黑名单中"})
 				return
 			}
-			reqB, respB := estimateBlockedBytes(r)
-			recordBlocked(ip, country, r.URL.RequestURI(), "ua_block", r.UserAgent(), r.Host, reqB, respB)
-			serveError(w, r, http.StatusForbidden, "客户端已被禁止",
-				"当前客户端的 User-Agent 命中了 UA 黑名单，请求被拒绝。",
-				errPageCtx{Code: "ua_block", Label: "User-Agent 在黑名单中"})
-			return
-		}
-		// 判定链 ④ UA 白名单
-		if !uaAllowedACL(acl, r.UserAgent()) {
-			if blockedRateLimited(ip) {
-				dropOrMinimal429(w)
+			if len(acl.uaNeedles) > 0 && !uaAllowedACLLow(acl, uaLow) {
+				if blockedRateLimited(ip) {
+					dropOrMinimal429(w)
+					return
+				}
+				reqB, respB := estimateBlockedBytes(r)
+				recordBlocked(ip, country, r.URL.RequestURI(), "ua", uaRaw, r.Host, reqB, respB)
+				serveError(w, r, http.StatusForbidden, "客户端不被允许",
+					"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求被拒绝。",
+					errPageCtx{Code: "ua", Label: "User-Agent 不在允许列表"})
 				return
 			}
-			reqB, respB := estimateBlockedBytes(r)
-			recordBlocked(ip, country, r.URL.RequestURI(), "ua", r.UserAgent(), r.Host, reqB, respB)
-			serveError(w, r, http.StatusForbidden, "客户端不被允许",
-				"当前客户端的 User-Agent 未命中 UA 白名单关键字，请求被拒绝。",
-				errPageCtx{Code: "ua", Label: "User-Agent 不在允许列表"})
-			return
 		}
 		// 判定链 ④ 地区限制
 		if c.ChinaOnly && country != "CN" && country != "LO" && country != "PV" {
@@ -8272,11 +8345,9 @@ func runServer(port int, adminUser, adminPass, dbFile string) {
 
 		concurrent.Add(1)
 		defer concurrent.Add(-1)
-		rb := &reqBytes{ip: ip}
 		ctx := context.WithValue(r.Context(), targetCtxKey{}, target)
 		ctx = context.WithValue(ctx, targetResolutionCtxKey{}, resolution)
-		ctx = withReqBytes(ctx, rb)
-		// 纯转发：不包装 ResponseWriter / Body，避免逐块计数影响播放流畅度。
+		// 纯转发：不包装 ResponseWriter / Body，也不挂 reqBytes，避免无用分配。
 		// 实时速率由网卡采样提供；请求次数仍由 recordRequestStart 统计。
 		proxy.ServeHTTP(w, r.WithContext(ctx))
 		pushLiveEvent(ip, country, upHost, upPath, r.UserAgent())
